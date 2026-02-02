@@ -1,0 +1,11 @@
+{
+  "scripts": {
+    "dev": "vite"
+  },
+  "dependencies": {
+    "maplibre-gl": "^5.17.0"
+  },
+  "devDependencies": {
+    "vite": "^7.3.1"
+  }
+}
