@@ -1,0 +1,4 @@
+body,html,#map{height:100%;margin:0;padding:0}
+#map{position:absolute;left:250px;right:0;top:0;bottom:0}
+#sidebar{position:absolute;left:0;top:0;bottom:0;width:240px;background:#fff;padding:12px;overflow:auto;border-right:1px solid #ddd}
+.layer-item{margin-bottom:8px}
