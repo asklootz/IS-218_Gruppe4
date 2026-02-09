@@ -1,26 +1,12 @@
-version: '3.8'
 services:
-  db:
-    image: postgis/postgis:15-3.3
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: example
-      POSTGRES_DB: gis
-    volumes:
-      - ./db/init:/docker-entrypoint-initdb.d
-    ports:
-      - "5432:5432"
-
   backend:
     build: ./backend
     environment:
-      PGHOST: db
-      PGUSER: postgres
-      PGPASSWORD: example
-      PGDATABASE: gis
-      PGPORT: 5432
-    depends_on:
-      - db
+      # Supabase connection (provided)
+      DATABASE_URL: "postgresql://postgres.rtoedavwkyicvokbcxkr:OIJlRB7WHB2AMg@aws-1-eu-central-1.pooler.supabase.com:5432/postgres?pool_mode=session"
+      DB_SSL: "true"
+      PGUSER: "postgres.rtoedavwkyicvokbcxkr"
+      PGPASSWORD: "OIJlRB7WHB2AMg"
     ports:
       - "3000:3000"
 
