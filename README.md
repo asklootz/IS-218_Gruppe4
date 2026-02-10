@@ -1,4 +1,5 @@
-# Map Layers Viewer
+# IS-218_Gruppe4
+## Map Layers Viewer
 
 This is a minimal example web app that shows an OpenStreetMap base map (via MapLibre GL JS) and loads geometry layers from a PostGIS database (seeded on startup).
 
@@ -24,4 +25,3 @@ docker-compose up --build
 Notes:
 - The backend will use `DATABASE_URL` when present. If your provider requires SSL (Supabase typically does), set `DB_SSL=true` so the connection uses TLS.
 - If you want to run a local PostGIS for development, you can re-add a DB service in `docker-compose.yml` or run PostGIS separately.
-# IS-218_Gruppe4
