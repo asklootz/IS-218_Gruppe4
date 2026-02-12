@@ -233,10 +233,15 @@ async function addLayerToMap(name) {
 }
 
 function removeLayerFromMap(name) {
-  const layerId = `layer_${name}`;
-  const srcId = `src_${name}`;
-  if (map.getLayer(layerId)) map.removeLayer(layerId);
-  if (map.getSource(srcId)) map.removeSource(srcId);
+  const idSafe = name.replace(/[^a-zA-Z0-9_]/g, '_');
+  const layerId = `layer_${idSafe}`;
+  const srcId = `src_${idSafe}`;
+  if (map.getLayer(layerId)) {
+    try { map.removeLayer(layerId); } catch (e) { console.warn('removeLayer failed', e && e.message); }
+  }
+  if (map.getSource(srcId)) {
+    try { map.removeSource(srcId); } catch (e) { console.warn('removeSource failed', e && e.message); }
+  }
 }
 
 // Load Turf.js for bbox calculation
