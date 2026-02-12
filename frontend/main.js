@@ -32,22 +32,20 @@ let tablesByName = new Map();
 
 async function loadLayers() {
   console.debug && console.debug('loadLayers: start');
-  // Fetch all spatial tables across schemas
   const r = await fetch(backendBase + 'spatial');
   const data = await r.json();
   console.debug && console.debug('loadLayers: fetched data', data && (data.tables || []).length);
   const container = document.getElementById('layers');
-  if (!container) return; // defensive: avoid exceptions if DOM missing
+  if (!container) return;
   container.innerHTML = '';
   const tables = data.tables || [];
   console.debug && console.debug('loadLayers: tables sample', tables[0]);
   availableTables = tables;
   tablesByName.clear();
 
-  // Preserve checked state for controls so user selections survive refresh
   const previouslyChecked = new Set();
   document.querySelectorAll('#layers input[type=checkbox]').forEach(cb => { if (cb.checked) previouslyChecked.add(cb.id); });
-  // Group tables by schema and build collapsible sections
+
   const schemas = {};
   for (const t of tables) {
     const s = t.schema || 'public';
@@ -65,7 +63,6 @@ async function loadLayers() {
     const summary = document.createElement('summary');
     summary.innerText = `${schema} (${list.length})`;
 
-    // per-schema buttons
     const btnShow = document.createElement('button');
     btnShow.type = 'button';
     btnShow.innerText = 'Show all';
@@ -111,7 +108,6 @@ async function loadLayers() {
       div.appendChild(label);
       inner.appendChild(div);
 
-      // restore previous checked state
       if (previouslyChecked.has(id)) {
         input.checked = true;
         if (!input.disabled) await addLayerToMap(full);
@@ -123,8 +119,6 @@ async function loadLayers() {
   }
 }
 
-// Compatibility: some older frontend code expects a global loadSchemaSelector()
-// Provide a safe implementation that only runs if a target element exists.
 async function loadSchemaSelector() {
   try {
     const targetIdCandidates = ['schemaSelector', 'schema', 'schema-list', 'schemas'];
@@ -133,9 +127,8 @@ async function loadSchemaSelector() {
       el = document.getElementById(id);
       if (el) break;
     }
-    if (!el) return; // nothing to do in modern UI
+    if (!el) return;
 
-    // fetch legacy endpoint if available
     const res = await fetch(backendBase + 'geom-schemas');
     if (!res.ok) {
       el.innerHTML = '<option value="">(no schemas)</option>';
@@ -155,10 +148,8 @@ async function loadSchemaSelector() {
   }
 }
 
-// Add a small log so we can see when the legacy selector runs
 console.debug && console.debug('frontend/main.js loaded');
 
-// Show all geometry-enabled layers
 async function showAllLayers() {
   for (const t of availableTables) {
     const full = `${t.schema}.${t.table}`;
@@ -169,7 +160,6 @@ async function showAllLayers() {
   }
 }
 
-// Hide all loaded layers
 function hideAllLayers() {
   for (const t of availableTables) {
     const full = `${t.schema}.${t.table}`;
@@ -180,7 +170,6 @@ function hideAllLayers() {
   }
 }
 
-// Show all tables in a schema
 async function showSchema(schema) {
   for (const t of availableTables) {
     if (t.schema !== schema) continue;
@@ -192,7 +181,6 @@ async function showSchema(schema) {
   }
 }
 
-// Hide all tables in a schema
 function hideSchema(schema) {
   for (const t of availableTables) {
     if (t.schema !== schema) continue;
@@ -204,12 +192,12 @@ function hideSchema(schema) {
   }
 }
 
-// attach buttons after DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
   const showBtn = document.getElementById('showAll');
   const hideBtn = document.getElementById('hideAll');
   if (showBtn) showBtn.addEventListener('click', () => { showAllLayers(); });
   if (hideBtn) hideBtn.addEventListener('click', () => { hideAllLayers(); });
+
   try {
     if (typeof loadSchemaSelector === 'function') {
       loadSchemaSelector().catch(err => console.warn('loadSchemaSelector failed', err));
@@ -217,7 +205,7 @@ document.addEventListener('DOMContentLoaded', () => {
   } catch (e) {
     console.warn('loadSchemaSelector call error', e && e.message);
   }
-  // Ensure layer list is loaded immediately (don't rely only on turf script load)
+
   loadLayers().catch(err => console.warn('initial loadLayers failed', err));
 });
 
@@ -281,7 +269,49 @@ async function addLayerToMap(name) {
         paint: { 'fill-color': '#00aa55', 'fill-opacity': 0.4 },
       };
     }
+
     map.addLayer(layer);
+
+    // ---------------------------------------------------------
+    // >>> POPUP START
+    // ---------------------------------------------------------
+
+    const layerId = layer.id;
+
+    if (!map.__registered) map.__registered = {};
+    if (!map.__registered[layerId]) {
+      map.__registered[layerId] = true;
+
+      map.on("click", layerId, (e) => {
+        if (!e.features || !e.features.length) return;
+
+        const props = e.features[0].properties;
+
+        let html = "<h3>Objektinfo</h3><table>";
+        for (const key in props) {
+          html += `<tr><td><strong>${key}</strong></td><td>${props[key]}</td></tr>`;
+        }
+        html += "</table>";
+
+        new maplibregl.Popup()
+          .setLngLat(e.lngLat)
+          .setHTML(html)
+          .addTo(map);
+      });
+
+      map.on("mouseenter", layerId, () => {
+        map.getCanvas().style.cursor = "pointer";
+      });
+
+      map.on("mouseleave", layerId, () => {
+        map.getCanvas().style.cursor = "";
+      });
+    }
+
+    // ---------------------------------------------------------
+    // >>> POPUP SLUTT
+    // ---------------------------------------------------------
+
     let bbox = null;
     try {
       if (typeof turf !== 'undefined' && turf && typeof turf.bbox === 'function') bbox = turf.bbox(geojson);
@@ -306,13 +336,11 @@ function removeLayerFromMap(name) {
   }
 }
 
-// Load Turf.js for bbox calculation
 const turfScript = document.createElement('script');
 turfScript.src = 'https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js';
 turfScript.onload = () => loadLayers();
 document.head.appendChild(turfScript);
 
-// Poll for changes so new schemas/tables are detected automatically
 setInterval(() => {
   loadLayers().catch(err => console.error('Failed to refresh layers', err));
 }, 30000);
