@@ -1,7 +1,6 @@
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 
-// When running locally with docker-compose, the backend is reachable on localhost:3000
 const backendBase = 'http://localhost:3000/';
 
 const map = new maplibregl.Map({
@@ -27,7 +26,7 @@ const map = new maplibregl.Map({
   zoom: 10,
 });
 
-// Holder styr på hvilke lag som har event-handlers registrert
+// Track registered events
 const registeredEvents = new Set();
 
 async function loadLayers() {
@@ -69,7 +68,6 @@ async function addLayerToMap(name) {
     if (!r.ok) throw new Error('Failed to load layer');
     const geojson = await r.json();
 
-    // Håndter tomme lag
     if (!geojson.features || geojson.features.length === 0) {
       alert(`Layer "${name}" is empty`);
       return;
@@ -82,9 +80,7 @@ async function addLayerToMap(name) {
       map.addSource(srcId, { type: 'geojson', data: geojson });
     }
 
-    // Bestem lagtype
-    const first = geojson.features[0];
-    const geomType = first?.geometry?.type || 'Point';
+    const geomType = geojson.features[0].geometry.type;
 
     let layer = null;
     if (geomType.includes('Point')) {
@@ -112,13 +108,16 @@ async function addLayerToMap(name) {
 
     if (!map.getLayer(layerId)) {
       map.addLayer(layer);
+      map.moveLayer(layerId); // ensure layer is on top
     }
 
-    // Registrer event-handlers kun én gang
+    // Register events once
     if (!registeredEvents.has(layerId)) {
       registeredEvents.add(layerId);
 
       map.on('click', layerId, (e) => {
+        if (!e.features || !e.features.length) return;
+
         const props = e.features[0].properties;
 
         let html = '<h3>Objektinfo</h3><table>';
@@ -142,7 +141,7 @@ async function addLayerToMap(name) {
       });
     }
 
-    // Zoom til lagets utstrekning
+    // Fit to bounds
     const bbox = turf.bbox(geojson);
     map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 20 });
 
@@ -155,14 +154,9 @@ function removeLayerFromMap(name) {
   const layerId = `layer_${name}`;
   const srcId = `src_${name}`;
 
-  if (map.getLayer(layerId)) {
-    map.removeLayer(layerId);
-  }
-  if (map.getSource(srcId)) {
-    map.removeSource(srcId);
-  }
+  if (map.getLayer(layerId)) map.removeLayer(layerId);
+  if (map.getSource(srcId)) map.removeSource(srcId);
 
-  // Fjern event-handlers
   if (registeredEvents.has(layerId)) {
     map.off('click', layerId);
     map.off('mouseenter', layerId);
@@ -171,7 +165,7 @@ function removeLayerFromMap(name) {
   }
 }
 
-// Load Turf.js for bbox calculation
+// Load Turf.js
 const turfScript = document.createElement('script');
 turfScript.src = 'https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js';
 turfScript.onload = () => loadLayers();
