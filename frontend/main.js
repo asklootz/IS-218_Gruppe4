@@ -47,41 +47,79 @@ async function loadLayers() {
   // Preserve checked state for controls so user selections survive refresh
   const previouslyChecked = new Set();
   document.querySelectorAll('#layers input[type=checkbox]').forEach(cb => { if (cb.checked) previouslyChecked.add(cb.id); });
-
-  // Build controls for each table
+  // Group tables by schema and build collapsible sections
+  const schemas = {};
   for (const t of tables) {
+    const s = t.schema || 'public';
+    schemas[s] = schemas[s] || [];
+    schemas[s].push(t);
     const full = `${t.schema}.${t.table}`;
     tablesByName.set(full, t);
-    const idSafe = full.replace(/[^a-zA-Z0-9_]/g, '_');
-    const id = `chk_${idSafe}`;
-    const div = document.createElement('div');
-    div.className = 'layer-item';
-    const input = document.createElement('input');
-    input.type = 'checkbox';
-    input.id = id;
-    const hasGeom = Array.isArray(t.geom_columns) && t.geom_columns.length > 0 && Array.isArray(t.rows);
-    input.disabled = !hasGeom;
-    input.onchange = async (e) => {
-      if (e.target.checked) {
-        await addLayerToMap(full);
-      } else {
-        removeLayerFromMap(full);
-      }
-    };
-    const label = document.createElement('label');
-    label.htmlFor = id;
-    label.innerText = full + (hasGeom ? '' : ' (no geometry)');
-    div.appendChild(input);
-    div.appendChild(label);
-    container.appendChild(div);
-    // restore previous checked state
-    if (previouslyChecked.has(id)) {
-      const cb = document.getElementById(id);
-      if (cb && !cb.disabled) {
-        cb.checked = true;
-        await addLayerToMap(full);
+  }
+
+  const schemaNames = Object.keys(schemas).sort((a,b) => a.localeCompare(b));
+  for (const schema of schemaNames) {
+    const list = schemas[schema];
+    const details = document.createElement('details');
+    details.className = 'schema-block';
+    const summary = document.createElement('summary');
+    summary.innerText = `${schema} (${list.length})`;
+
+    // per-schema buttons
+    const btnShow = document.createElement('button');
+    btnShow.type = 'button';
+    btnShow.innerText = 'Show all';
+    btnShow.style.marginLeft = '8px';
+    btnShow.addEventListener('click', (e) => { e.stopPropagation(); showSchema(schema); });
+
+    const btnHide = document.createElement('button');
+    btnHide.type = 'button';
+    btnHide.innerText = 'Hide all';
+    btnHide.style.marginLeft = '4px';
+    btnHide.addEventListener('click', (e) => { e.stopPropagation(); hideSchema(schema); });
+
+    summary.appendChild(btnShow);
+    summary.appendChild(btnHide);
+    details.appendChild(summary);
+
+    const inner = document.createElement('div');
+    inner.style.paddingLeft = '10px';
+    inner.style.marginBottom = '8px';
+
+    for (const t of list) {
+      const full = `${t.schema}.${t.table}`;
+      const idSafe = full.replace(/[^a-zA-Z0-9_]/g, '_');
+      const id = `chk_${idSafe}`;
+      const div = document.createElement('div');
+      div.className = 'layer-item';
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.id = id;
+      const hasGeom = Array.isArray(t.geom_columns) && t.geom_columns.length > 0 && Array.isArray(t.rows);
+      input.disabled = !hasGeom;
+      input.onchange = async (e) => {
+        if (e.target.checked) {
+          await addLayerToMap(full);
+        } else {
+          removeLayerFromMap(full);
+        }
+      };
+      const label = document.createElement('label');
+      label.htmlFor = id;
+      label.innerText = t.table + (hasGeom ? '' : ' (no geometry)');
+      div.appendChild(input);
+      div.appendChild(label);
+      inner.appendChild(div);
+
+      // restore previous checked state
+      if (previouslyChecked.has(id)) {
+        input.checked = true;
+        if (!input.disabled) await addLayerToMap(full);
       }
     }
+
+    details.appendChild(inner);
+    container.appendChild(details);
   }
 }
 
@@ -134,6 +172,30 @@ async function showAllLayers() {
 // Hide all loaded layers
 function hideAllLayers() {
   for (const t of availableTables) {
+    const full = `${t.schema}.${t.table}`;
+    const idSafe = full.replace(/[^a-zA-Z0-9_]/g, '_');
+    const chk = document.getElementById(`chk_${idSafe}`);
+    if (chk && chk.checked) chk.checked = false;
+    removeLayerFromMap(full);
+  }
+}
+
+// Show all tables in a schema
+async function showSchema(schema) {
+  for (const t of availableTables) {
+    if (t.schema !== schema) continue;
+    const full = `${t.schema}.${t.table}`;
+    const idSafe = full.replace(/[^a-zA-Z0-9_]/g, '_');
+    const chk = document.getElementById(`chk_${idSafe}`);
+    if (chk && !chk.checked) chk.checked = true;
+    await addLayerToMap(full);
+  }
+}
+
+// Hide all tables in a schema
+function hideSchema(schema) {
+  for (const t of availableTables) {
+    if (t.schema !== schema) continue;
     const full = `${t.schema}.${t.table}`;
     const idSafe = full.replace(/[^a-zA-Z0-9_]/g, '_');
     const chk = document.getElementById(`chk_${idSafe}`);
