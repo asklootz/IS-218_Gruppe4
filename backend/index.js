@@ -37,6 +37,9 @@ if (process.env.DATABASE_URL) {
 
 const pool = new Pool(poolConfig);
 
+// Helper to safely quote identifiers
+function quoteIdent(s) { return '"' + String(s).replace(/"/g, '""') + '"'; }
+
 app.get('/layers', async (req, res) => {
   try {
     // Try geometry_columns first
@@ -144,6 +147,97 @@ app.get('/layers/:name', async (req, res) => {
     }
   } catch (err) {
     console.error('[REQ ERROR] processing /layers/:name', { name, err: err && err.stack });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Return all tables (across schemas) that have geometry/geography columns
+// For each table return only an id (primary key or ctid) and the spatial columns
+app.get('/spatial', async (req, res) => {
+  const limit = Number(req.query.limit) || 500;
+  try {
+    // Find all tables that have geometry/geography typed columns
+    const tablesQ = await pool.query(
+      `SELECT table_schema, table_name, coalesce(array_to_json(array_agg(column_name)), '[]') AS geom_columns
+       FROM information_schema.columns
+       WHERE udt_name IN ('geometry','geography')
+       GROUP BY table_schema, table_name
+       ORDER BY table_schema, table_name`
+    );
+
+    const tables = tablesQ.rows;
+
+    // For each table, fetch primary key if available and then select only pk/ctid and geom cols
+    const results = [];
+    for (const t of tables) {
+      const schema = t.table_schema;
+      const table = t.table_name;
+      const geomCols = t.geom_columns || [];
+
+      // find primary key column for this table (if any)
+      const pkQ = await pool.query(
+        `SELECT kcu.column_name FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1 AND tc.table_name = $2 LIMIT 1`,
+        [schema, table]
+      );
+      const pkCol = pkQ.rowCount > 0 ? pkQ.rows[0].column_name : null;
+
+      // Build select list: id (pk or ctid) plus each geom column as GeoJSON
+      const selectParts = [];
+      if (pkCol) {
+        selectParts.push(`${quoteIdent(pkCol)} as id`);
+      } else {
+        selectParts.push(`ctid::text as id`);
+      }
+      geomCols.forEach((gc, i) => {
+        // alias safe name
+        const alias = gc.replace(/[^a-zA-Z0-9_]/g, '_');
+        selectParts.push(`ST_AsGeoJSON(ST_Transform(${quoteIdent(gc)}, 4326))::json AS ${quoteIdent(alias)}`);
+      });
+
+      const ident = `${quoteIdent(schema)}.${quoteIdent(table)}`;
+      const q = `SELECT ${selectParts.join(', ')} FROM ${ident} LIMIT $1`;
+
+      try {
+        const r = await pool.query(q, [limit]);
+        results.push({ schema, table, geom_columns: geomCols, rows: r.rows });
+      } catch (err) {
+        // if a table is inaccessible or transform fails, include error message instead of rows
+        results.push({ schema, table, geom_columns: geomCols, error: err.message });
+      }
+    }
+
+    // Log a brief summary for debugging
+    try {
+      console.log('[SPATIAL] tables found:', results.length);
+      if (results.length > 0) {
+        const sample = results[0];
+        console.log('[SPATIAL] sample:', { schema: sample.schema, table: sample.table, geom_columns: sample.geom_columns, rows: (sample.rows||[]).length });
+      }
+    } catch (e) {
+      console.error('Failed to log spatial summary', e && e.message);
+    }
+
+    res.json({ tables: results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Legacy endpoint used by some frontends/tools: list schemas that contain spatial tables
+app.get('/geom-schemas', async (req, res) => {
+  try {
+    const q = `SELECT table_schema, array_agg(table_name ORDER BY table_name) AS tables
+               FROM (
+                 SELECT table_schema, table_name
+                 FROM information_schema.columns
+                 WHERE udt_name IN ('geometry','geography')
+                 GROUP BY table_schema, table_name
+               ) x
+               GROUP BY table_schema
+               ORDER BY table_schema`;
+    const r = await pool.query(q);
+    res.json({ schemas: r.rows });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
