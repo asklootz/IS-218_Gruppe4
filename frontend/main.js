@@ -1,3 +1,221 @@
+// --- Sidebar Toggle ---
+function setupSidebarToggle() {
+  const sidebar = document.getElementById('sidebar');
+  const sidebarToggle = document.getElementById('sidebarToggle');
+  const sidebarShowBtn = document.getElementById('sidebarShowBtn');
+  const mapDiv = document.getElementById('map');
+  if (sidebar && sidebarToggle && sidebarShowBtn && mapDiv) {
+    sidebarToggle.onclick = () => {
+      sidebar.classList.add('hide');
+      mapDiv.classList.add('sidebar-hidden');
+      sidebarShowBtn.style.display = 'block';
+    };
+    sidebarShowBtn.onclick = () => {
+      sidebar.classList.remove('hide');
+      mapDiv.classList.remove('sidebar-hidden');
+      sidebarShowBtn.style.display = 'none';
+    };
+  }
+}
+window.addEventListener('DOMContentLoaded', setupSidebarToggle);
+// --- Dark Mode Toggle ---
+window.addEventListener('DOMContentLoaded', () => {
+  const darkModeToggle = document.getElementById('darkModeToggle');
+  // Persist dark mode preference
+  const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const saved = localStorage.getItem('darkMode');
+  if ((saved === 'dark') || (!saved && prefersDark)) {
+    document.body.classList.remove('light-mode');
+  } else if (saved === 'light') {
+    document.body.classList.add('light-mode');
+  }
+  if (darkModeToggle) {
+    darkModeToggle.onclick = () => {
+      document.body.classList.toggle('light-mode');
+      localStorage.setItem('darkMode', document.body.classList.contains('light-mode') ? 'light' : 'dark');
+    };
+  }
+});
+// --- WMS Tree Menu ---
+async function fetchWmsCapabilities(baseUrl) {
+  const url = `${baseUrl}?service=WMS&request=GetCapabilities`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('Failed to fetch WMS capabilities');
+  return await res.text();
+}
+
+function parseWmsCapabilities(xmlStr) {
+  const parser = new DOMParser();
+  const xml = parser.parseFromString(xmlStr, 'application/xml');
+  const layers = [];
+  function walkLayer(node) {
+    const name = node.querySelector('Name')?.textContent;
+    const title = node.querySelector('Title')?.textContent;
+    const children = Array.from(node.querySelectorAll(':scope > Layer'));
+    const layerObj = { name, title, children: [] };
+    children.forEach(child => layerObj.children.push(walkLayer(child)));
+    return layerObj;
+  }
+  const rootLayers = xml.querySelectorAll('Layer');
+  rootLayers.forEach(layer => layers.push(walkLayer(layer)));
+  return layers;
+}
+
+function renderWmsTreeMenu(layers, container, onSelect) {
+  container.innerHTML = '';
+  function renderNode(layer, parentEl, depth = 0) {
+    const div = document.createElement('div');
+    div.style.marginLeft = `${depth * 12}px`;
+    const label = document.createElement('label');
+    label.innerText = layer.title || layer.name || '(unnamed)';
+    if (layer.name) {
+      const btn = document.createElement('button');
+      btn.innerText = 'Select';
+      btn.style.marginLeft = '6px';
+      btn.onclick = () => onSelect(layer);
+      label.appendChild(btn);
+    }
+    div.appendChild(label);
+    parentEl.appendChild(div);
+    layer.children.forEach(child => renderNode(child, div, depth + 1));
+  }
+  layers.forEach(layer => renderNode(layer, container));
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  const wmsTreeMenuContainer = document.getElementById('wmsTreeMenuContainer');
+  const wmsUrlInput = document.getElementById('wms_base_url');
+  const wmsLayersInput = document.getElementById('wms_layers');
+  const showWmsLayersBtn = document.getElementById('showWmsLayersBtn');
+  const addWmsLayerBtn = document.getElementById('addWmsLayerBtn');
+  if (wmsTreeMenuContainer && wmsUrlInput && wmsLayersInput && showWmsLayersBtn && addWmsLayerBtn) {
+    showWmsLayersBtn.onclick = async () => {
+      try {
+        const baseUrl = wmsUrlInput.value.trim();
+        if (!baseUrl) return alert('Enter WMS base URL');
+        wmsTreeMenuContainer.innerHTML = 'Loading...';
+        const xml = await fetchWmsCapabilities(baseUrl);
+        const layers = parseWmsCapabilities(xml);
+        renderWmsTreeMenu(layers, wmsTreeMenuContainer, layer => {
+          wmsLayersInput.value = layer.name;
+        });
+      } catch (err) {
+        wmsTreeMenuContainer.innerHTML = 'Failed to load layers.';
+      }
+    };
+    addWmsLayerBtn.onclick = () => {
+      const baseUrl = wmsUrlInput.value.trim();
+      const layerName = wmsLayersInput.value.trim();
+      if (!baseUrl || !layerName) return alert('Please provide both WMS URL and layer name');
+      // Add to UI and map
+      const id = encodeURIComponent(layerName);
+      const title = layerName;
+      const tileUrlTemplate = `${baseUrl}?service=WMS&request=GetMap&layers=${layerName}&styles=&format=image/png&transparent=true&version=1.1.1&width=256&height=256&srs=EPSG:3857&bbox={bbox-epsg-3857}`;
+      addWmsToUI(id, title, tileUrlTemplate);
+    };
+  }
+});
+// --- App Link Management ---
+function renderAppLinks() {
+  const listDiv = document.getElementById('appLinksList');
+  if (!listDiv) return;
+  const links = JSON.parse(localStorage.getItem('appLinks') || '[]');
+  listDiv.innerHTML = '';
+  links.forEach((url, idx) => {
+    const a = document.createElement('a');
+    a.href = url;
+    a.innerText = url;
+    a.target = '_blank';
+    a.style.display = 'block';
+    a.style.marginBottom = '2px';
+    // Remove button
+    const btn = document.createElement('button');
+    btn.innerText = '✕';
+    btn.title = 'Remove link';
+    btn.style.marginLeft = '6px';
+    btn.onclick = () => {
+      links.splice(idx, 1);
+      localStorage.setItem('appLinks', JSON.stringify(links));
+      renderAppLinks();
+    };
+    const wrapper = document.createElement('div');
+    wrapper.style.display = 'flex';
+    wrapper.style.alignItems = 'center';
+    wrapper.appendChild(a);
+    wrapper.appendChild(btn);
+    listDiv.appendChild(wrapper);
+  });
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  const addAppLinkBtn = document.getElementById('addAppLinkBtn');
+  const appLinkInput = document.getElementById('appLinkInput');
+  if (addAppLinkBtn && appLinkInput) {
+    addAppLinkBtn.onclick = () => {
+      const url = appLinkInput.value.trim();
+      if (!url) return;
+      let links = JSON.parse(localStorage.getItem('appLinks') || '[]');
+      if (!links.includes(url)) {
+        links.push(url);
+        localStorage.setItem('appLinks', JSON.stringify(links));
+        renderAppLinks();
+      }
+      appLinkInput.value = '';
+    };
+    renderAppLinks();
+  }
+});
+
+// --- Save/Load Chosen Layers ---
+function getChosenLayerIds() {
+  return Array.from(document.querySelectorAll('#layers input[type=checkbox]'))
+    .filter(cb => cb.checked)
+    .map(cb => cb.id);
+}
+
+function setChosenLayerIds(ids) {
+  document.querySelectorAll('#layers input[type=checkbox]').forEach(cb => {
+    cb.checked = ids.includes(cb.id);
+    cb.dispatchEvent(new Event('change'));
+  });
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  const saveBtn = document.getElementById('saveLayersBtn');
+  const loadBtn = document.getElementById('loadLayersBtn');
+  const loadInput = document.getElementById('loadLayersInput');
+  if (saveBtn) {
+    saveBtn.onclick = () => {
+      const ids = getChosenLayerIds();
+      const blob = new Blob([JSON.stringify(ids)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'chosen_layers.json';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }, 100);
+    };
+  }
+  if (loadBtn && loadInput) {
+    loadBtn.onclick = () => loadInput.click();
+    loadInput.onchange = (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (evt) => {
+        try {
+          const ids = JSON.parse(evt.target.result);
+          if (Array.isArray(ids)) setChosenLayerIds(ids);
+        } catch (err) { alert('Invalid file'); }
+      };
+      reader.readAsText(file);
+    };
+  }
+});
 // Backend base URL
 const backendBase = 'http://localhost:3000/';
 
@@ -29,6 +247,81 @@ let availableTables = []; // array of { schema, table, geom_columns, rows }
 
 // Map of fullName -> table object for quick lookup
 let tablesByName = new Map();
+
+import { saveWmsConnections, loadWmsConnections, removeWmsConnection } from './wmsStorage.js';
+// WMS layers tracked locally and persisted
+let wmsLayers = loadWmsConnections();
+
+function addWmsToUI(id, title, tileUrlTemplate) {
+  const container = document.getElementById('layers');
+  if (!container) return;
+  const div = document.createElement('div');
+  div.className = 'layer-item';
+  div.style.display = 'flex';
+  div.style.alignItems = 'center';
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.id = `wms_${id}`;
+  input.style.marginRight = '6px';
+  input.onchange = async (e) => {
+    if (e.target.checked) {
+      const srcId = `src_wms_${id}`;
+      if (!map.getSource(srcId)) {
+        map.addSource(srcId, { type: 'raster', tiles: [tileUrlTemplate], tileSize: 256 });
+      }
+      if (!map.getLayer(`layer_wms_${id}`)) {
+        map.addLayer({ id: `layer_wms_${id}`, type: 'raster', source: srcId });
+      }
+    } else {
+      const layerId = `layer_wms_${id}`;
+      const srcId = `src_wms_${id}`;
+      try { if (map.getLayer(layerId)) map.removeLayer(layerId); } catch (e) {}
+      try { if (map.getSource(srcId)) map.removeSource(srcId); } catch (e) {}
+    }
+  };
+  const label = document.createElement('label');
+  label.htmlFor = input.id;
+  label.innerText = title;
+  label.style.flex = '1';
+  // Remove button
+  const btnRemove = document.createElement('button');
+  btnRemove.innerText = '✕';
+  btnRemove.title = 'Remove WMS connection';
+  btnRemove.style.marginLeft = '6px';
+  btnRemove.style.background = 'none';
+  btnRemove.style.border = 'none';
+  btnRemove.style.cursor = 'pointer';
+  btnRemove.onclick = () => {
+    wmsLayers = removeWmsConnection(id);
+    saveWmsConnections(wmsLayers);
+    renderWmsConnections();
+  };
+  div.appendChild(input);
+  div.appendChild(label);
+  div.appendChild(btnRemove);
+  container.insertBefore(div, container.firstChild);
+}
+
+function renderWmsConnections(sortBy = 'recent') {
+  // Remove all WMS UI entries first
+  const container = document.getElementById('layers');
+  if (!container) return;
+  // Remove only WMS entries (by id prefix)
+  Array.from(container.children).forEach(child => {
+    if (child.querySelector && child.querySelector('input[id^="wms_"]')) {
+      container.removeChild(child);
+    }
+  });
+  let sorted = [...wmsLayers];
+  if (sortBy === 'name') {
+    sorted.sort((a, b) => (a.layers || a.base || '').localeCompare(b.layers || b.base || ''));
+  } else if (sortBy === 'recent') {
+    sorted.sort((a, b) => b.id.localeCompare(a.id));
+  }
+  for (const wms of sorted) {
+    addWmsToUI(wms.id, wms.layers || wms.base, wms.tileTemplate);
+  }
+}
 
 async function loadLayers() {
   console.debug && console.debug('loadLayers: start');
@@ -219,6 +512,83 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   // Ensure layer list is loaded immediately (don't rely only on turf script load)
   loadLayers().catch(err => console.warn('initial loadLayers failed', err));
+  // insert WMS form above layers
+  try {
+    const sidebar = document.getElementById('sidebar');
+    if (sidebar) {
+      const wmsDiv = document.createElement('div');
+      wmsDiv.style.marginBottom = '8px';
+      const inpUrl = document.createElement('input');
+      inpUrl.placeholder = 'WMS base URL (e.g. https://srv/.../wms)';
+      inpUrl.style.width = '100%';
+      inpUrl.id = 'wms_base_url';
+      const inpLayers = document.createElement('input');
+      inpLayers.placeholder = 'WMS layers param (comma separated)';
+      inpLayers.style.width = '100%';
+      inpLayers.id = 'wms_layers';
+      const selVersion = document.createElement('select');
+      selVersion.id = 'wms_version';
+      ['1.1.1','1.3.0'].forEach(v => { const o = document.createElement('option'); o.value=v; o.text=v; selVersion.appendChild(o); });
+      selVersion.style.width = '100%';
+      const selCrs = document.createElement('select');
+      selCrs.id = 'wms_crs';
+      ['EPSG:4326','EPSG:3857'].forEach(v => { const o = document.createElement('option'); o.value=v; o.text=v; selCrs.appendChild(o); });
+      selCrs.style.width = '100%';
+      const selFormat = document.createElement('select');
+      selFormat.id = 'wms_format';
+      ['image/png','image/jpeg'].forEach(v => { const o = document.createElement('option'); o.value=v; o.text=v; selFormat.appendChild(o); });
+      selFormat.style.width = '100%';
+      const btn = document.createElement('button');
+      btn.innerText = 'Add WMS';
+      btn.type = 'button';
+      btn.style.marginTop = '4px';
+      // Use the locally created input/select variables rather than querying the DOM
+      btn.addEventListener('click', () => {
+        try {
+          const base = (inpUrl && inpUrl.value) ? inpUrl.value.trim() : '';
+          const layers = (inpLayers && inpLayers.value) ? inpLayers.value.trim() : '';
+          const version = (selVersion && selVersion.value) ? selVersion.value : '1.3.0';
+          const crs = (selCrs && selCrs.value) ? selCrs.value : 'EPSG:3857';
+          const format = (selFormat && selFormat.value) ? selFormat.value : 'image/png';
+          if (!base) return alert('Enter WMS base URL');
+          const id = String(Date.now());
+          // strip query string from provided base if user pasted a GetCapabilities URL
+          const baseClean = base.split('?')[0];
+          // tile proxy route on backend (use absolute backendBase so requests go to backend port)
+          const tileTemplate = `${backendBase}wms/tile/{z}/{x}/{y}?wms=${encodeURIComponent(baseClean)}&layers=${encodeURIComponent(layers)}&version=${encodeURIComponent(version)}&crs=${encodeURIComponent(crs)}&format=${encodeURIComponent(format)}`;
+          wmsLayers.push({ id, base, layers, tileTemplate });
+          saveWmsConnections(wmsLayers);
+          renderWmsConnections();
+        } catch (e) {
+          console.warn('Add WMS failed', e && e.message);
+        }
+      });
+      // Sorting dropdown
+      const sortSelect = document.createElement('select');
+      sortSelect.id = 'wms_sort';
+      sortSelect.style.width = '100%';
+      [
+        { value: 'recent', text: 'Sort: Most Recent' },
+        { value: 'name', text: 'Sort: Name' },
+      ].forEach(opt => {
+        const o = document.createElement('option');
+        o.value = opt.value;
+        o.text = opt.text;
+        sortSelect.appendChild(o);
+      });
+      sortSelect.onchange = () => renderWmsConnections(sortSelect.value);
+
+      wmsDiv.appendChild(inpUrl);
+      wmsDiv.appendChild(inpLayers);
+      wmsDiv.appendChild(sortSelect);
+      wmsDiv.appendChild(btn);
+      // insert before layers container
+      const layersEl = document.getElementById('layers');
+      sidebar.insertBefore(wmsDiv, layersEl);
+      // Render saved WMS connections on load
+      renderWmsConnections();
+    }
+  } catch (e) { console.warn('add WMS form failed', e && e.message); }
 });
 
 async function addLayerToMap(name) {

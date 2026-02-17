@@ -242,6 +242,86 @@ app.get('/geom-schemas', async (req, res) => {
   }
 });
 
+// Proxy WMS GetMap requests into XYZ tiles: /wms/tile/:z/:x/:y?wms=<base>&layers=<layers>&format=...
+// Converts tile z/x/y to WGS84 bbox and forwards the request to the WMS server (VERSION=1.1.1, SRS=EPSG:4326)
+const http = require('http');
+const https = require('https');
+
+function tile2bbox(z, x, y, options) {
+  // options: { crs: 'EPSG:4326'|'EPSG:3857', version: '1.1.1'|'1.3.0' }
+  const n = Math.pow(2, z);
+  const lon_left = x / n * 360.0 - 180.0;
+  const lon_right = (x + 1) / n * 360.0 - 180.0;
+  const lat_rad_top = Math.atan(Math.sinh(Math.PI * (1 - 2 * y / n)));
+  const lat_rad_bottom = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + 1) / n)));
+  const lat_top = lat_rad_top * 180.0 / Math.PI;
+  const lat_bottom = lat_rad_bottom * 180.0 / Math.PI;
+
+  const crs = options && options.crs ? options.crs : 'EPSG:4326';
+  const version = options && options.version ? options.version : '1.1.1';
+
+  if (crs === 'EPSG:3857') {
+    // convert lon/lat to WebMercator meters
+    function lonToX(lon) { return lon * 20037508.34 / 180.0; }
+    function latToY(lat) {
+      const rad = lat * Math.PI / 180.0;
+      return Math.log(Math.tan((Math.PI / 4) + (rad / 2))) * 20037508.34 / Math.PI;
+    }
+    const minx = lonToX(lon_left);
+    const maxx = lonToX(lon_right);
+    const miny = latToY(lat_bottom);
+    const maxy = latToY(lat_top);
+    return [minx, miny, maxx, maxy];
+  }
+
+  // default EPSG:4326
+  // For WMS 1.3.0 with EPSG:4326 the axis order is lat,lon (y,x)
+  if (version === '1.3.0') {
+    return [lat_bottom, lon_left, lat_top, lon_right];
+  }
+  return [lon_left, lat_bottom, lon_right, lat_top];
+}
+
+app.get('/wms/tile/:z/:x/:y', async (req, res) => {
+  try {
+    const { z, x, y } = req.params;
+    const base = req.query.wms;
+    if (!base) return res.status(400).send('missing wms param');
+    const layers = req.query.layers || req.query.LAYERS || '';
+    const format = req.query.format || req.query.FORMAT || 'image/png';
+    const width = req.query.width || 256;
+    const height = req.query.height || 256;
+
+    const version = req.query.version || req.query.VERSION || '1.1.1';
+    const crs = req.query.crs || req.query.CRS || req.query.srs || req.query.SRS || 'EPSG:4326';
+
+    const bboxArr = tile2bbox(Number(z), Number(x), Number(y), { crs, version });
+    const bboxStr = `${bboxArr[0]},${bboxArr[1]},${bboxArr[2]},${bboxArr[3]}`;
+
+    // Build WMS GetMap URL
+    const separator = base.includes('?') ? '&' : '?';
+    // choose parameter name for CRS based on WMS version
+    const crsParamName = (version === '1.3.0') ? 'CRS' : 'SRS';
+    const params = `SERVICE=WMS&REQUEST=GetMap&VERSION=${encodeURIComponent(version)}&FORMAT=${encodeURIComponent(format)}&TRANSPARENT=true&${crsParamName}=${encodeURIComponent(crs)}&BBOX=${encodeURIComponent(bboxStr)}&WIDTH=${width}&HEIGHT=${height}&LAYERS=${encodeURIComponent(layers)}`;
+    const finalUrl = base + separator + params;
+
+    const lib = finalUrl.startsWith('https') ? https : http;
+    const prox = lib.get(finalUrl, (proxRes) => {
+      res.statusCode = proxRes.statusCode || 200;
+      // copy content-type
+      if (proxRes.headers['content-type']) res.setHeader('Content-Type', proxRes.headers['content-type']);
+      // pipe
+      proxRes.pipe(res);
+    });
+    prox.on('error', (e) => {
+      console.error('WMS proxy error', e && e.message);
+      res.status(502).send('WMS proxy error');
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Inspect a table name: check information_schema and geometry_columns
 app.get('/inspect/:name', async (req, res) => {
   const name = req.params.name;
