@@ -191,12 +191,8 @@ async function addLayerToMap(name) {
     alert('Error loading layer: ' + err.message);
   }
 }
-
-map.on('click', (e) => {
-  new maplibregl.Popup()
-    .setLngLat(e.lngLat)
-    .setHTML("<b>Test popup</b>")
-    .addTo(map);
+map.on('load', () => {
+  loadLayers();
 });
 
 
