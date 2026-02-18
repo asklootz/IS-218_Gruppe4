@@ -192,5 +192,13 @@ async function addLayerToMap(name) {
   }
 }
 
+map.on('click', (e) => {
+  new maplibregl.Popup()
+    .setLngLat(e.lngLat)
+    .setHTML("<b>Test popup</b>")
+    .addTo(map);
+});
+
+
 
 // =========
