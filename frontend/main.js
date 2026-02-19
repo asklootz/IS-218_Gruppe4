@@ -686,3 +686,11 @@ document.head.appendChild(turfScript);
 setInterval(() => {
   loadLayers().catch(err => console.error('Failed to refresh layers', err));
 }, 30000);
+
+map.on('click', (e) => {
+  new maplibregl.Popup()
+    .setLngLat(e.lngLat)
+    .setHTML("<h3>Du klikket her!</h3>")
+    .addTo(map);
+});
+
