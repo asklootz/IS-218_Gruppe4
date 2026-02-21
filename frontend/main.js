@@ -689,10 +689,29 @@ setInterval(() => {
 
 map.on('load', () => {
   map.on('click', (e) => {
-    new maplibregl.Popup()
-      .setLngLat(e.lngLat)
-      .setHTML("<h3>Du klikket her!</h3>")
-      .addTo(map);
+  const features = map.queryRenderedFeatures(e.point, {
+    layers: map.getStyle().layers
+      .map(l => l.id)
+      .filter(id => id.startsWith('layer_'))
   });
+
+  if (!features.length) return;
+
+  const feature = features[0];
+  const props = feature.properties;
+
+  let html = "<h3>Informasjon</h3><ul>";
+
+  for (const key in props) {
+    html += `<li><strong>${key}:</strong> ${props[key]}</li>`;
+  }
+
+  html += "</ul>";
+
+  new maplibregl.Popup()
+    .setLngLat(e.lngLat)
+    .setHTML(html)
+    .addTo(map);
+});
 });
 
