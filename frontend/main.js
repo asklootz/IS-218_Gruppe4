@@ -715,3 +715,15 @@ map.on('load', () => {
 });
 });
 
+map.on('dblclick', async (e) => {
+  const lng = e.lngLat.lng;
+  const lat = e.lngLat.lat;
+
+  const res = await fetch(
+    `http://localhost:3000/firestations/near?lng=${lng}&lat=${lat}&distance=2000`
+  );
+
+  const data = await res.json();
+
+  console.log("Funnet:", data);
+});
