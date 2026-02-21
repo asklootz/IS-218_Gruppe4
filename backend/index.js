@@ -222,44 +222,7 @@ app.get('/spatial', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-//*---------
-app.get('/firestations/near', async (req, res) => {
-  const { lng, lat, distance } = req.query;
 
-  if (!lng || !lat || !distance) {
-    return res.status(400).json({ error: 'lng, lat and distance required' });
-  }
-
-  try {
-    const result = await pool.query(`
-      SELECT 
-        id,
-        ST_AsGeoJSON(geom)::json AS geometry,
-        to_jsonb(t) - 'geom' AS properties
-      FROM brannstasjoner t
-      WHERE ST_DWithin(
-        geom::geography,
-        ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
-        $3
-      )
-    `, [lng, lat, distance]);
-
-    const geojson = {
-      type: "FeatureCollection",
-      features: result.rows.map(row => ({
-        type: "Feature",
-        geometry: row.geometry,
-        properties: row.properties
-      }))
-    };
-
-    res.json(geojson);
-
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-//*---------
 
 // Legacy endpoint used by some frontends/tools: list schemas that contain spatial tables
 app.get('/geom-schemas', async (req, res) => {
