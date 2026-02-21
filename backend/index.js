@@ -54,99 +54,61 @@ app.get('/layers', async (req, res) => {
   }
 });
 
+//----
+// for å kjøre romlige spørringer:
 app.get('/layers/:name', async (req, res) => {
   const name = req.params.name;
+
   try {
-    console.log(`[REQ] GET /layers/${name} from ${req.ip || req.headers['x-forwarded-for'] || (req.connection && req.connection.remoteAddress)}`);
+
     // Support schema-qualified names like schema.table
     let schema = 'public';
     let table = name;
+
     if (name.includes('.')) {
       const parts = name.split('.');
       schema = parts[0];
       table = parts[1];
     }
 
-    // check geometry_columns for the given schema.table to discover geometry column
-    const geomRow = await pool.query(
-      `SELECT f_geometry_column FROM public.geometry_columns WHERE f_table_schema = $1 AND f_table_name = $2 LIMIT 1`,
-      [schema, table]
-    );
-    if (geomRow.rowCount === 0) {
-      // try to find a geometry typed column via information_schema
-      const geomFind = await pool.query(
-        `SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND udt_name = 'geometry' LIMIT 1`,
-        [schema, table]
-      );
-      if (geomFind.rowCount === 0) {
-        return res.status(404).json({ error: 'Layer not found or has no geometry' });
-      }
-      geomCol = geomFind.rows[0].column_name;
-    } else {
-      var geomCol = geomRow.rows[0].f_geometry_column;
-    }
-
-    // Try to discover a primary key column
-    const pk = await pool.query(
-      `SELECT kcu.column_name FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1 AND tc.table_name = $2 LIMIT 1`,
-      [schema, table]
-    );
-    let idCol = null;
-    if (pk.rowCount > 0) {
-      idCol = pk.rows[0].column_name;
-    } else {
-      // fallback: look for common id-like column names
-      const candidates = await pool.query(
-        `SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND (column_name = 'id' OR column_name LIKE '%_id') LIMIT 1`,
-        [schema, table]
-      );
-      if (candidates.rowCount > 0) idCol = candidates.rows[0].column_name;
-    }
-
-    // quote identifiers to avoid SQL injection
-    function quoteIdent(s) { return '"' + s.replace(/"/g, '""') + '"'; }
-    const ident = `${quoteIdent(schema)}.${quoteIdent(table)}`;
-    const geomIdent = quoteIdent(geomCol);
-    const propRemove = `'${geomCol}'`;
-
-    // Always include the row's CTID under a safe alias so we can fallback to it
-    // reduce row limit to avoid large transfer / DB load when loading many layers
-    const innerSelect = `SELECT *, ctid as __ctid FROM ${ident} LIMIT 500`;
-    const idLeft = idCol ? `${quoteIdent('t')}.${quoteIdent(idCol)}` : `t.__ctid`;
-
-    const q = `SELECT json_build_object(
-      'type', 'FeatureCollection',
-      'features', coalesce(json_agg(feature), '[]'::json)
-    ) as geojson
-    FROM (
+    // Bygg SQL (GeoJSON)
+    const q = `
       SELECT json_build_object(
-        'type','Feature',
-        'id', COALESCE((${idLeft})::text, t.__ctid::text),
-        'geometry', ST_AsGeoJSON(ST_Transform(${quoteIdent('t')}.${geomIdent}, 4326))::json,
-        'properties', to_jsonb(t) - ${propRemove}
-      ) as feature
-      FROM (${innerSelect}) t
-    ) as features;`;
-    // Log the SQL being executed (truncated)
+        'type', 'FeatureCollection',
+        'features', json_agg(
+          json_build_object(
+            'type', 'Feature',
+            'geometry', ST_AsGeoJSON(geom)::json,
+            'properties', to_jsonb(row) - 'geom'
+          )
+        )
+      ) AS geojson
+      FROM ${schema}.${table} row;
+    `;
+
+    // Log SQL
     try {
-      console.log('[SQL] Executing for', `${schema}.${table}`, 'geom=', geomCol, 'id=', idCol);
-      console.log('[SQL] Query start:', q.slice(0, 1000));
-    } catch (e) {
-      console.error('Failed to log SQL', e && e.message);
+      console.log('[SQL] Executing for', `${schema}.${table}`);
+      console.log('[SQL] Query start:', q.slice(0, 500));
+    } catch (logErr) {
+      console.error('Failed to log SQL', logErr && logErr.message);
     }
 
+    // Kjør SQL
     try {
       const result = await pool.query(q);
       res.json(result.rows[0].geojson);
     } catch (sqlErr) {
-      console.error('[SQL ERROR] while querying', `${schema}.${table}`, sqlErr && sqlErr.stack);
+      console.error('[SQL ERROR]', sqlErr && sqlErr.stack);
       return res.status(500).json({ error: sqlErr.message });
     }
+
   } catch (err) {
-    console.error('[REQ ERROR] processing /layers/:name', { name, err: err && err.stack });
+    console.error('[REQ ERROR] processing /layers/:name', err && err.stack);
     res.status(500).json({ error: err.message });
   }
 });
+//----
 
 // Inspect a table name: check information_schema and geometry_columns
 app.get('/inspect/:name', async (req, res) => {
@@ -203,9 +165,55 @@ async function testDbConnection() {
   }
 }
 
+//Romlig SQL som viser objekter innen 500m
+app.get('/analysis/near', async (req, res) => {
+    const { table, lon, lat, distance } = req.query;
+
+    try {
+        const query = `
+      SELECT *
+      FROM ${table}
+      WHERE ST_DWithin(
+        geom::geography,
+        ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+        $3
+      )
+    `;
+
+        const result = await pool.query(query, [lon, lat, distance]);
+        res.json(result.rows);
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Database error' });
+    }
+});
+
+//romlig SQL for å søke i database 
+app.get('/analysis/search', async (req, res) => {
+    const { table, field, value } = req.query;
+
+    try {
+        const query = `
+      SELECT *
+      FROM ${table}
+      WHERE ${field} ILIKE $1
+    `;
+
+        const result = await pool.query(query, [`%${value}%`]);
+        res.json(result.rows);
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Database error' });
+    }
+});
+
+
 const port = process.env.PORT || 3000;
 testDbConnection().then(() => {
   app.listen(port, () => {
     console.log('Backend listening on', port);
   });
 });
+
