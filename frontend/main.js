@@ -689,28 +689,20 @@ setInterval(() => {
 
 map.on('load', () => {
   map.on('click', (e) => {
-  const features = map.queryRenderedFeatures(e.point, {
-    layers: map.getStyle().layers
-      .map(l => l.id)
-      .filter(id => id.startsWith('layer_'))
-  });
+
+  const features = map.queryRenderedFeatures(e.point);
 
   if (!features.length) return;
 
-  const feature = features[0];
-  const props = feature.properties;
+  const feature = features.find(f => f.layer.id.startsWith('layer_'));
 
-  let html = "<h3>Informasjon</h3><ul>";
+  if (!feature) return;
 
-  for (const key in props) {
-    html += `<li><strong>${key}:</strong> ${props[key]}</li>`;
-  }
-
-  html += "</ul>";
+  const id = feature.properties?.id ?? "Ingen ID";
 
   new maplibregl.Popup()
     .setLngLat(e.lngLat)
-    .setHTML(html)
+    .setHTML(`<h3>ID: ${id}</h3>`)
     .addTo(map);
 });
 });
