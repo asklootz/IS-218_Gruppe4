@@ -682,6 +682,9 @@ app.get('/analysis/fylke-outline', async (req, res) => {
     `;
 
     const r = await pool.query(q, [fylkeName, cfg.geomColumn]);
+    if (!r.rows.length) {
+      return res.json({ type: 'FeatureCollection', features: [] });
+    }
     res.json(r.rows[0].geojson);
   } catch (err) {
     console.error('fylke-outline failed', err && err.message);
@@ -762,6 +765,9 @@ app.get('/analysis/brannstasjoner-in-fylke', async (req, res) => {
     `;
 
     const r = await pool.query(q, [fylkeName, brannCfg.brannGeomColumn]);
+    if (!r.rows.length) {
+      return res.json({ type: 'FeatureCollection', features: [] });
+    }
     res.json(r.rows[0].geojson);
   } catch (err) {
     console.error('brannstasjoner-in-fylke failed', err && err.message);
