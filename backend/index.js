@@ -165,7 +165,7 @@ async function testDbConnection() {
   }
 }
 
-//Romlig SQL som viser objekter innen 500m
+//Romlig SQL som viser objekter innen 1km
 app.get('/analysis/near', async (req, res) => {
     const { table, lon, lat, distance } = req.query;
 
@@ -174,10 +174,12 @@ app.get('/analysis/near', async (req, res) => {
       SELECT *
       FROM ${table}
       WHERE ST_DWithin(
-        geom::geography,
-        ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
-        $3
-      )
+        posisjon,
+        ST_Transform(
+        ST_SetSRID(ST_MakePoint(10.75, 59.91), 4326),
+        25833
+      ),
+      1000  
     `;
 
         const result = await pool.query(query, [lon, lat, distance]);
