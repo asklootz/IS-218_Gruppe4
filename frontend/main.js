@@ -688,22 +688,48 @@ setInterval(() => {
 }, 30000);
 
 map.on('load', () => {
-  map.on('click', (e) => {
+  map.on('click', async (e) => {
+    const features = map.queryRenderedFeatures(e.point);
+    if (!features.length) return;
 
-  const features = map.queryRenderedFeatures(e.point);
+    const feature = features.find(f => f.layer.id.startsWith('layer_'));
+    if (!feature) return;
 
-  if (!features.length) return;
+    // Extract table name from layer id
+    const layerId = feature.layer.id;
+    const table = layerId.replace(/^layer_/, '').replace(/_/g, '.');
 
-  const feature = features.find(f => f.layer.id.startsWith('layer_'));
+    // Fetch full feature data from backend using the table and ID
+    const id = feature.properties?.id;
+    if (!id) return;
 
-  if (!feature) return;
+    try {
+      const response = await fetch(`${backendBase}feature/${encodeURIComponent(table)}/${encodeURIComponent(id)}`);
+      if (!response.ok) throw new Error('Failed to fetch feature data');
+      const fullFeature = await response.json();
 
-  const id = feature.properties?.id ?? "Ingen ID";
+      // Build popup HTML from specific columns (adjust as needed; here showing all properties except geometry)
+      let popupHTML = '<h3>Feature Details</h3>';
+      for (const [key, value] of Object.entries(fullFeature.properties || {})) {
+        if (key !== 'geometry') {  // Skip geometry if present
+          popupHTML += `<p><strong>${key}:</strong> ${value ?? 'N/A'}</p>`;
+        }
+      }
 
-  new maplibregl.Popup()
-    .setLngLat(e.lngLat)
-    .setHTML(`<h3>ID: ${id}</h3>`)
-    .addTo(map);
-});
+      new maplibregl.Popup()
+        .setLngLat(e.lngLat)
+        .setHTML(popupHTML)
+        .addTo(map);
+    } catch (error) {
+      console.error('Error fetching feature data:', error);
+      // Fallback to basic popup if fetch fails
+      const id = feature.properties?.objid ?? "Ingen ID";
+      const plasser = feature.properties?.plasser ?? "Ingen plasser";
+      new maplibregl.Popup()
+        .setLngLat(e.lngLat)
+        .setHTML(`<h3>ID: ${id}</h3><br><h3>Plasser: ${plasser}</h3>`)
+        .addTo(map);
+    }
+  });
 });
 
