@@ -40,6 +40,12 @@ const pool = new Pool(poolConfig);
 // Helper to safely quote identifiers
 function quoteIdent(s) { return '"' + String(s).replace(/"/g, '""') + '"'; }
 
+async function getFirstGeomColumn(schema, table) {
+  const q = `SELECT f_geometry_column FROM public.geometry_columns WHERE f_table_schema = $1 AND f_table_name = $2 LIMIT 1`;
+  const r = await pool.query(q, [schema, table]);
+  return r.rowCount > 0 ? r.rows[0].f_geometry_column : null;
+}
+
 app.get('/layers', async (req, res) => {
   try {
     // Try geometry_columns first
@@ -363,6 +369,41 @@ app.get('/analysis/near', async (req, res) => {
         console.error(err);
         res.status(500).json({ error: 'Database error' });
     }
+});
+
+// Filter tilfluktsrom by minimum plasser and return GeoJSON
+app.get('/analysis/tilfluktsrom-min', async (req, res) => {
+  const minPlasser = Number(req.query.min_plasser) || 500;
+  const schema = 'tilfluktsromoffentlige';
+  const table = 'tilfluktsrom';
+
+  try {
+    const geomCol = await getFirstGeomColumn(schema, table);
+    if (!geomCol) {
+      return res.status(404).json({ error: 'Geometry column not found for tilfluktsrom' });
+    }
+
+    const q = `
+      SELECT json_build_object(
+        'type', 'FeatureCollection',
+        'features', COALESCE(json_agg(
+          json_build_object(
+            'type', 'Feature',
+            'geometry', ST_AsGeoJSON(ST_Transform(${quoteIdent(geomCol)}, 4326))::json,
+            'properties', to_jsonb(row) - $2
+          )
+        ), '[]'::json)
+      ) AS geojson
+      FROM ${quoteIdent(schema)}.${quoteIdent(table)} row
+      WHERE plasser >= $1;
+    `;
+
+    const result = await pool.query(q, [minPlasser, geomCol]);
+    res.json(result.rows[0].geojson);
+  } catch (err) {
+    console.error('tilfluktsrom-min failed', err && err.message);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 //romlig SQL for å søke i database 

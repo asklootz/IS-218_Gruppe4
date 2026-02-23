@@ -475,6 +475,8 @@ function hideAllLayers() {
 
 // Show all tables in a schema
 async function showSchema(schema) {
+  const hasTilfluktsrom = availableTables.some(t => t.schema === schema && String(t.table).toLowerCase() === 'tilfluktsrom');
+  if (hasTilfluktsrom) removeFilteredTilfluktsromLayer();
   for (const t of availableTables) {
     if (t.schema !== schema) continue;
     const full = `${t.schema}.${t.table}`;
@@ -501,8 +503,10 @@ function hideSchema(schema) {
 document.addEventListener('DOMContentLoaded', () => {
   const showBtn = document.getElementById('showAll');
   const hideBtn = document.getElementById('hideAll');
+  const filterTilfluktsromBtn = document.getElementById('filterTilfluktsrom500Btn');
   if (showBtn) showBtn.addEventListener('click', () => { showAllLayers(); });
   if (hideBtn) hideBtn.addEventListener('click', () => { hideAllLayers(); });
+  if (filterTilfluktsromBtn) filterTilfluktsromBtn.addEventListener('click', () => { showTilfluktsromMinPlasser(500); });
   try {
     if (typeof loadSchemaSelector === 'function') {
       loadSchemaSelector().catch(err => console.warn('loadSchemaSelector failed', err));
@@ -673,6 +677,83 @@ function removeLayerFromMap(name) {
   }
   if (map.getSource(srcId)) {
     try { map.removeSource(srcId); } catch (e) { console.warn('removeSource failed', e && e.message); }
+  }
+}
+
+function removeFilteredTilfluktsromLayer() {
+  const layerId = 'layer_tilfluktsrom_min_500';
+  const srcId = 'src_tilfluktsrom_min_500';
+  if (map.getLayer(layerId)) {
+    try { map.removeLayer(layerId); } catch (e) { console.warn('remove filtered layer failed', e && e.message); }
+  }
+  if (map.getSource(srcId)) {
+    try { map.removeSource(srcId); } catch (e) { console.warn('remove filtered source failed', e && e.message); }
+  }
+}
+
+async function showTilfluktsromMinPlasser(minPlasser) {
+  try {
+    const tilfluktsromTables = availableTables
+      .filter(t => String(t.table).toLowerCase() === 'tilfluktsrom')
+      .map(t => `${t.schema}.${t.table}`);
+
+    for (const full of tilfluktsromTables) {
+      const idSafe = full.replace(/[^a-zA-Z0-9_]/g, '_');
+      const checkbox = document.getElementById(`chk_${idSafe}`);
+      if (checkbox) checkbox.checked = false;
+      removeLayerFromMap(full);
+    }
+    removeFilteredTilfluktsromLayer();
+
+    const url = `${backendBase}analysis/tilfluktsrom-min?min_plasser=${encodeURIComponent(minPlasser)}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('Failed to load tilfluktsrom filter');
+    const geojson = await res.json();
+    const features = (geojson && geojson.features) ? geojson.features : [];
+    if (features.length === 0) {
+      alert('No tilfluktsrom found for the selected filter.');
+      return;
+    }
+
+    const srcId = 'src_tilfluktsrom_min_500';
+    const layerId = 'layer_tilfluktsrom_min_500';
+    map.addSource(srcId, { type: 'geojson', data: geojson });
+
+    const geomType = (features[0].geometry && features[0].geometry.type) || 'Point';
+    let layer = null;
+    if (geomType === 'Point' || geomType === 'MultiPoint') {
+      layer = {
+        id: layerId,
+        type: 'circle',
+        source: srcId,
+        paint: { 'circle-radius': 7, 'circle-color': '#ff6b6b' },
+      };
+    } else if (geomType === 'LineString' || geomType === 'MultiLineString') {
+      layer = {
+        id: layerId,
+        type: 'line',
+        source: srcId,
+        paint: { 'line-color': '#ff6b6b', 'line-width': 2 },
+      };
+    } else {
+      layer = {
+        id: layerId,
+        type: 'fill',
+        source: srcId,
+        paint: { 'fill-color': '#ff6b6b', 'fill-opacity': 0.45 },
+      };
+    }
+    map.addLayer(layer);
+
+    let bbox = null;
+    try {
+      if (typeof turf !== 'undefined' && turf && typeof turf.bbox === 'function') bbox = turf.bbox(geojson);
+    } catch (e) {
+      console.warn('turf.bbox failed', e && e.message);
+    }
+    if (bbox) map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 20 });
+  } catch (err) {
+    alert('Error loading filtered tilfluktsrom: ' + err.message);
   }
 }
 
