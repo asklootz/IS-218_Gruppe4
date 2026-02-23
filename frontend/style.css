@@ -16,6 +16,7 @@ body, html, #map {
 	top: 0;
 	bottom: 0;
 	background: #23272f;
+	transition: left 0.25s cubic-bezier(.4,2,.6,1);
 }
 
 #sidebar {
@@ -177,16 +178,6 @@ body.light-mode input[type="text"] {
 }
 body.light-mode input[type="text"]:focus {
 	border: 1.5px solid #0077ff;
-}
-
-#map {
-	position: absolute;
-	left: 270px;
-	right: 0;
-	top: 0;
-	bottom: 0;
-	background: #23272f;
-	transition: left 0.25s cubic-bezier(.4,2,.6,1);
 }
 
 #sidebar.hide {
