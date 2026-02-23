@@ -4,10 +4,9 @@
 Dette er et minimalt web-eksempel som viser et OpenStreetMap kartbase (via MapLibre GL JS) og henter geometri lag fra en PostGIS database.
 Web applikasjonen viser brannstasjoner i valgte fylker og tilgjeneglighet på plasser i tilfluktsrom.
 
-Tjenestene kjøres med Docker Compose. Som standard starter ikke dette prosjektet en lokal PostGIS-container – i stedet kobler backend-systemet seg til en database levert via `DATABASE_URL` (nyttig for Supabase eller andre Postgres-instanser i skyen).
-
+Tjenestene kjøres med Docker Compose. 
 Tjenester:
-- `backend`: Node/Express API that exposes `/layers` and `/layers/:name` returning GeoJSON
+- `backend`: Node/Express API that exposes `/layers` and `/layers/:name` returning GeoJSON from PostGIS Supabase server
 - `frontend`: statisk nettsted betjent av nginx med MapLibre-kart og lagkontroller
 
 ## Quick start with a Supabase (or remote Postgres) database:
@@ -28,10 +27,19 @@ docker compose up --build -d
 
 - MapLibre GL JS (via CDN)
 - JavaScript (ES6)
-- HTML / CSS
+- HTML5 / CSS3
 - GeoJSON (lokale filer)
+- Turf.js
+- DOMParser
 - OGC API / WFS (GeoNorge)
 - OpenStreetMap (bakgrunnskart)
+- Node.js + Express.js
+- PostgreSQL/PostGIS via Supabase
+- pg (postgres client)
+- CORS Middleware
+- Docker compose
+- WMS tile
+- GeoJSON
 
 ## Datakatalog
 
@@ -40,6 +48,8 @@ docker compose up --build -d
 | Tilfluktsrom | GeoNorge | PostGIS | Hentet via Supabase |
 | Brannstasjoner | GeoNorge | PostGIS | Hentet via Supabase |
 | Administrative enheter | GeoNorge | PostGIS | Hentet via Supabase |
+
+Med mulighet for å selv vise WMS lag som legges inn av bruker
 
 ## Arkitekturskisse
 
