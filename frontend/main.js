@@ -738,7 +738,7 @@ async function addLayerToMap(name) {
     if (features.length === 0) throw new Error('No geometry rows for table: ' + name);
 
     const geojson = { type: 'FeatureCollection', features };
-    const idSafe = name.replace(/[^a-zA-Z0-9_]/g, '_');
+    const idSafe = encodeURIComponent(name);
     const srcId = `src_${idSafe}`;
     if (map.getSource(srcId)) return;
     map.addSource(srcId, { type: 'geojson', data: geojson });
@@ -853,3 +853,50 @@ document.head.appendChild(turfScript);
 setInterval(() => {
   loadLayers().catch(err => console.error('Failed to refresh layers', err));
 }, 30000);
+
+map.on('load', () => {
+  map.on('click', async (e) => {
+    const features = map.queryRenderedFeatures(e.point);
+    if (!features.length) return;
+
+    const feature = features.find(f => f.layer.id.startsWith('layer_'));
+    if (!feature) return;
+
+    // Extract table name from layer id
+    const layerId = feature.layer.id;
+    const table = layerId.replace(/^layer_/, '').replace(/_/g, '.');
+
+    // Fetch full feature data from backend using the table and ID
+    const id = feature.properties?.id;
+    if (!id) return;
+
+    try {
+      const response = await fetch(`${backendBase}feature/${encodeURIComponent(table)}/${encodeURIComponent(id)}`);
+      if (!response.ok) throw new Error('Failed to fetch feature data');
+      const fullFeature = await response.json();
+
+      // Build popup HTML from specific columns (adjust as needed; here showing all properties except geometry)
+      let popupHTML = '<h3>Feature Details</h3>';
+      for (const [key, value] of Object.entries(fullFeature.properties || {})) {
+        if (key !== 'geometry') {  // Skip geometry if present
+          popupHTML += `<p><strong>${key}:</strong> ${value ?? 'N/A'}</p>`;
+        }
+      }
+
+      new maplibregl.Popup()
+        .setLngLat(e.lngLat)
+        .setHTML(popupHTML)
+        .addTo(map);
+    } catch (error) {
+      console.error('Error fetching feature data:', error);
+      // Fallback to basic popup if fetch fails
+      const id = feature.properties?.objid ?? "Ingen ID";
+      const plasser = feature.properties?.plasser ?? "Ingen plasser";
+      new maplibregl.Popup()
+        .setLngLat(e.lngLat)
+        .setHTML(`<h3>ID: ${id}</h3><br><h3>Plasser: ${plasser}</h3>`)
+        .addTo(map);
+    }
+  });
+});
+

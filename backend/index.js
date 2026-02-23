@@ -238,6 +238,7 @@ app.get('/spatial', async (req, res) => {
   }
 });
 
+
 // Legacy endpoint used by some frontends/tools: list schemas that contain spatial tables
 app.get('/geom-schemas', async (req, res) => {
   try {
@@ -353,6 +354,82 @@ app.get('/inspect/:name', async (req, res) => {
 
     res.json({ tables: tables.rows, geometry_columns: geoms.rows });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get a single feature by table and id
+app.get('/feature/:table/:id', async (req, res) => {
+  const { table, id } = req.params;
+  try {
+    let schema = 'public';
+    let tbl = table;
+    if (table.includes('.')) {
+      const parts = table.split('.');
+      schema = parts[0];
+      tbl = parts[1];
+    }
+
+    // Find geometry column
+    const geomRow = await pool.query(
+      `SELECT f_geometry_column FROM public.geometry_columns WHERE f_table_schema = $1 AND f_table_name = $2 LIMIT 1`,
+      [schema, tbl]
+    );
+    if (geomRow.rowCount === 0) {
+      const geomFind = await pool.query(
+        `SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND udt_name = 'geometry' LIMIT 1`,
+        [schema, tbl]
+      );
+      if (geomFind.rowCount === 0) {
+        return res.status(404).json({ error: 'Table not found or has no geometry' });
+      }
+      var geomCol = geomFind.rows[0].column_name;
+    } else {
+      var geomCol = geomRow.rows[0].f_geometry_column;
+    }
+
+    // Find primary key
+    const pk = await pool.query(
+      `SELECT kcu.column_name FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1 AND tc.table_name = $2 LIMIT 1`,
+      [schema, tbl]
+    );
+    let idCol = null;
+    if (pk.rowCount > 0) {
+      idCol = pk.rows[0].column_name;
+    }
+
+    const ident = `${quoteIdent(schema)}.${quoteIdent(tbl)}`;
+    const geomIdent = quoteIdent(geomCol);
+
+    let whereClause;
+    if (idCol) {
+      whereClause = `${quoteIdent(idCol)} = $1`;
+    } else {
+      whereClause = `ctid = $1`;
+    }
+
+    const q = `SELECT *, ST_AsGeoJSON(ST_Transform(${geomIdent}, 4326))::json AS geometry_json FROM ${ident} WHERE ${whereClause} LIMIT 1`;
+
+    const result = await pool.query(q, [id]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Feature not found' });
+    }
+
+    const row = result.rows[0];
+    const properties = { ...row };
+    delete properties[geomCol];
+    delete properties.geometry_json;
+
+    const feature = {
+      type: 'Feature',
+      id: id,
+      geometry: row.geometry_json,
+      properties: properties
+    };
+
+    res.json(feature);
+  } catch (err) {
+    console.error('Error fetching feature:', err);
     res.status(500).json({ error: err.message });
   }
 });
