@@ -52,6 +52,9 @@ inn som sources i MapLibre, mens eksterne datasett hentes via OGC API (WFS).
 Dataene visualiseres som layers i kartet og gjøres interaktive med klikkbare
 popups og datadrevet styling.
 
+<img width="671" height="242" alt="diagram" src="https://github.com/user-attachments/assets/cd79ab0e-498b-4884-b368-9add472ad8c2" />
+
+
 ## Refleksjon
 
 - Kartløsningen kan skaleres bedre ved bruk av vector tiles
