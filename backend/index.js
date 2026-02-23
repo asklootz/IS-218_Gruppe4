@@ -172,11 +172,11 @@ app.get('/analysis/near', async (req, res) => {
     try {
         const query = `
       SELECT *
-      FROM ${table}
+      FROM ${tilfluktsromoffentlige.tilfluktsrom}
       WHERE ST_DWithin(
         posisjon,
         ST_Transform(
-        ST_SetSRID(ST_MakePoint(10.75, 59.91), 4326),
+        ST_SetSRID(ST_MakePoint(10.75, 59.91), 4326)::geography,
         25833
       ),
       1000  
