@@ -262,9 +262,16 @@ import { saveWmsConnections, loadWmsConnections, removeWmsConnection } from './w
 let wmsLayers = loadWmsConnections();
 
 // ==== Datadrevet styling: oppsett per tabell (bruk "schema.table" som nøkkel) ===
+// For hver tabell:
+//   - `field` må være navnet på en eksisterende (helst numerisk) kolonne i tabellen.
+//     For `brannstasjoner.brannstasjon` er det typisk et id- eller målefelt, f.eks. "objid".
+//     Feltnavnet er det samme som brukes i databasen / kolonnelista (case-sensitive).
+//     Hvis feltnavnet ikke finnes eller ikke er numerisk, vil den datadrevne stylingen
+//     for denne tabellen ikke fungere som forventet (klasser/farger kan falle tilbake
+//     til standardoppsett eller ikke vises).
 const styleByTable = {
   'brannstasjoner.brannstasjon': {
-    field: 'objid',        // <- bytt til riktig feltnavn om nødvendig
+    field: 'objid',
     title: 'Brannstasjon ID',
     breaks: [50, 150, 250],   // 0–50 / 50–150 / 150–250 / 250+
     palette: 'reds'
