@@ -11,19 +11,13 @@ Tjenester:
 
 ## Quick start with a Supabase (or remote Postgres) database:
 
-1. Angi tilkoblingsstrengen din i miljøet, for eksempel (PowerShell):
+1. Oppstart av appen i Docker-miljø (PowerShell):
 
 ```powershell
-$env:DATABASE_URL = "postgresql://postgres:yourpassword@dbhost:5432/yourdb"
-$env:DB_SSL = "true"   # set to "false" if SSL is not required
-docker-compose up --build
+docker compose up --build -d
 ```
 
 2. Åpne frontend på: http://localhost:8080
-
-Merknader:
-- Backend-systemet vil bruke `DATABASE_URL` når det er tilgjengelig. Hvis leverandøren din krever SSL (Supabase gjør vanligvis det), sett `DB_SSL=true` slik at tilkoblingen bruker TLS.
-- Hvis du vil kjøre en lokal PostGIS for utvikling, kan du legge til en DB-tjeneste på nytt i `docker-compose.yml` eller kjøre PostGIS separat.
 
 ### Demo av system
 
@@ -42,8 +36,9 @@ Merknader:
 
 | Datasett | Kilde | Format | Bearbeiding |
 |--------|------|--------|------------|
-| Grøntområder | QGIS | GeoJSON | Klippet og eksportert |
-| Kommunegrenser | GeoNorge | WFS | Hentet direkte via API |
+| Tilfluktsrom | GeoNorge | PostGIS | Hentet via Supabase |
+| Brannstasjoner | GeoNorge | PostGIS | Hentet via Supabase |
+| Administrative enheter | GeoNorge | PostGIS | Hentet via Supabase |
 
 ## Arkitekturskisse
 
@@ -52,7 +47,7 @@ inn som sources i MapLibre, mens eksterne datasett hentes via OGC API (WFS).
 Dataene visualiseres som layers i kartet og gjøres interaktive med klikkbare
 popups og datadrevet styling.
 
-<img width="671" height="242" alt="diagram" src="https://github.com/user-attachments/assets/cd79ab0e-498b-4884-b368-9add472ad8c2" />
+<img width="571" height="242" alt="diagram" src="https://github.com/user-attachments/assets/cd79ab0e-498b-4884-b368-9add472ad8c2" />
 
 
 ## Refleksjon
