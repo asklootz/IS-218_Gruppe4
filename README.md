@@ -2,6 +2,7 @@
 ## TLDR
 
 Dette er et minimalt web-eksempel som viser et OpenStreetMap kartbase (via MapLibre GL JS) og henter geometri lag fra en PostGIS database.
+Web applikasjonen viser brannstasjoner i valgte fylker og tilgjeneglighet på plasser i tilfluktsrom.
 
 Tjenestene kjøres med Docker Compose. Som standard starter ikke dette prosjektet en lokal PostGIS-container – i stedet kobler backend-systemet seg til en database levert via `DATABASE_URL` (nyttig for Supabase eller andre Postgres-instanser i skyen).
 
