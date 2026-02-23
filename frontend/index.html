@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Map Layers Viewer</title>
+    <title>Beredskapskart</title>
     <link href="https://unpkg.com/maplibre-gl@2.4.0/dist/maplibre-gl.css" rel="stylesheet" />
     <link rel="stylesheet" href="style.css" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -24,6 +24,12 @@
           <button id="showAll">Show All</button>
           <button id="hideAll">Hide All</button>
           <button id="filterTilfluktsrom500Btn">Tilfluktsrom 500+</button>
+        </div>
+        <div class="sidebar-group">
+          <label for="fylkeSelect" style="font-size:0.98rem;margin-bottom:2px;">Fylke filter (brannstasjoner)</label>
+          <select id="fylkeSelect"></select>
+          <button id="fylkeApplyBtn">Show brannstasjoner in fylke</button>
+          <button id="fylkeClearBtn">Clear fylke filter</button>
         </div>
         <div class="sidebar-group">
           <button id="saveLayersBtn">💾 Save Layers</button>
