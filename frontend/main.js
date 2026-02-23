@@ -17,9 +17,18 @@ function setupSidebarToggle() {
     };
   }
 }
-window.addEventListener('DOMContentLoaded', setupSidebarToggle);
+
+function onDomReady(fn) {
+  if (document.readyState === 'loading') {
+    window.addEventListener('DOMContentLoaded', fn);
+  } else {
+    fn();
+  }
+}
+
+onDomReady(setupSidebarToggle);
 // --- Dark Mode Toggle ---
-window.addEventListener('DOMContentLoaded', () => {
+onDomReady(() => {
   const darkModeToggle = document.getElementById('darkModeToggle');
   // Persist dark mode preference
   const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
