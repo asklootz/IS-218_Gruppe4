@@ -114,7 +114,17 @@ app.get('/layers/:name', async (req, res) => {
 
     // Always include the row's CTID under a safe alias so we can fallback to it
     // reduce row limit to avoid large transfer / DB load when loading many layers
-    const innerSelect = `SELECT *, ctid as __ctid FROM ${ident} LIMIT 500`;
+    const DEFAULT_ROW_LIMIT = 500;
+    const MIN_ROW_LIMIT = 1;
+    const MAX_ROW_LIMIT = 5000;
+    let rowLimit = DEFAULT_ROW_LIMIT;
+    if (process.env.ROW_LIMIT) {
+      const parsed = Number.parseInt(process.env.ROW_LIMIT, 10);
+      if (Number.isFinite(parsed) && parsed >= MIN_ROW_LIMIT && parsed <= MAX_ROW_LIMIT) {
+        rowLimit = parsed;
+      }
+    }
+    const innerSelect = `SELECT *, ctid as __ctid FROM ${ident} LIMIT ${rowLimit}`;
     const idLeft = idCol ? `${quoteIdent('t')}.${quoteIdent(idCol)}` : `t.__ctid`;
 
     const q = `SELECT json_build_object(
