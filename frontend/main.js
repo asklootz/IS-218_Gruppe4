@@ -622,7 +622,7 @@ async function addLayerToMap(name) {
     if (features.length === 0) throw new Error('No geometry rows for table: ' + name);
 
     const geojson = { type: 'FeatureCollection', features };
-    const idSafe = name.replace(/\./g, '_');
+    const idSafe = encodeURIComponent(name);
     const srcId = `src_${idSafe}`;
     if (map.getSource(srcId)) return;
     map.addSource(srcId, { type: 'geojson', data: geojson });
