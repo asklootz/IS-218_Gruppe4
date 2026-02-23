@@ -11,7 +11,7 @@ Tjenester:
 
 ## Quick start with a Supabase (or remote Postgres) database:
 
-1. Set your connection string in the environment, for example (PowerShell):
+1. Angi tilkoblingsstrengen din i miljøet, for eksempel (PowerShell):
 
 ```powershell
 $env:DATABASE_URL = "postgresql://postgres:yourpassword@dbhost:5432/yourdb"
@@ -19,11 +19,11 @@ $env:DB_SSL = "true"   # set to "false" if SSL is not required
 docker-compose up --build
 ```
 
-2. Open the frontend at http://localhost:8080
+2. Åpne frontend på: http://localhost:8080
 
-Notes:
-- The backend will use `DATABASE_URL` when present. If your provider requires SSL (Supabase typically does), set `DB_SSL=true` so the connection uses TLS.
-- If you want to run a local PostGIS for development, you can re-add a DB service in `docker-compose.yml` or run PostGIS separately.
+Merknader:
+- Backend-systemet vil bruke `DATABASE_URL` når det er tilgjengelig. Hvis leverandøren din krever SSL (Supabase gjør vanligvis det), sett `DB_SSL=true` slik at tilkoblingen bruker TLS.
+- Hvis du vil kjøre en lokal PostGIS for utvikling, kan du legge til en DB-tjeneste på nytt i `docker-compose.yml` eller kjøre PostGIS separat.
 
 ### Demo av system
 
