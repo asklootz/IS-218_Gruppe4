@@ -181,13 +181,28 @@ app.get('/spatial', async (req, res) => {
       );
       const pkCol = pkQ.rowCount > 0 ? pkQ.rows[0].column_name : null;
 
-      // Build select list: id (pk or ctid) plus each geom column as GeoJSON
+      // Fetch all columns to include in the data (needed for color gradients)
+      const allColsQ = await pool.query(
+        `SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position`,
+        [schema, table]
+      );
+      const allCols = allColsQ.rows.map(r => r.column_name);
+
+      // Build select list: id (pk or ctid) + all non-geometry columns + each geom column as GeoJSON
       const selectParts = [];
       if (pkCol) {
         selectParts.push(`${quoteIdent(pkCol)} as id`);
       } else {
         selectParts.push(`ctid::text as id`);
       }
+
+      // Add all non-geometry columns
+      allCols.forEach(col => {
+        if (col === pkCol || geomCols.includes(col)) return; // skip pk and geom cols (handle separately)
+        selectParts.push(`${quoteIdent(col)}`);
+      });
+
+      // Add geometry columns as GeoJSON
       geomCols.forEach((gc, i) => {
         // alias safe name
         const alias = gc.replace(/[^a-zA-Z0-9_]/g, '_');

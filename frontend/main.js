@@ -252,6 +252,105 @@ import { saveWmsConnections, loadWmsConnections, removeWmsConnection } from './w
 // WMS layers tracked locally and persisted
 let wmsLayers = loadWmsConnections();
 
+// ==== Datadrevet styling: oppsett per tabell (bruk "schema.table" som nøkkel) ===
+const styleByTable = {
+  'brannstasjoner.brannstasjon': {
+    field: 'objid',        // <- bytt til riktig feltnavn om nødvendig
+    title: 'Brannstasjon ID',
+    breaks: [50, 150, 250],   // 0–50 / 50–150 / 150–250 / 250+
+    palette: 'reds'
+  },
+};
+
+// Enkle paletter (lys -> mørk)
+function getRamp(palette, steps = 4) {
+  const ramps = {
+    reds:    ['#fee5d9','#fcae91','#fb6a4a','#cb181d','#99000d'],
+    blues:   ['#eff3ff','#bdd7e7','#6baed6','#3182bd','#08519c'],
+    greens:  ['#edf8e9','#bae4b3','#74c476','#238b45','#005a32'],
+    purples: ['#f2e5ff','#d5bdfc','#b58af6','#8a4de0','#5b21b6']
+  };
+  const r = ramps[palette] || ramps['blues'];
+  return r.slice(0, Math.max(3, Math.min(steps, r.length)));
+}
+
+// Kvantil-beregning (k = 4 -> kvartiler). Returnerer [Q1,Q2,Q3] for k=4
+function quantileBreaks(values, k = 4) {
+  if (!Array.isArray(values) || values.length === 0) return null;
+  const arr = values.filter(Number.isFinite).sort((a,b)=>a-b);
+  if (arr.length === 0) return null;
+  const q = [];
+  for (let i = 1; i < k; i++) {
+    const pos = (arr.length - 1) * (i / k);
+    const base = Math.floor(pos);
+    const rest = pos - base;
+    const val = rest ? arr[base] * (1 - rest) + arr[base + 1] * rest : arr[base];
+    q.push(val);
+  }
+  return q; // k-1 terskler
+}
+
+// MapLibre expressions
+function buildColorExpression(field, breaks, colors) {
+  return [
+    'interpolate', ['linear'], ['to-number', ['coalesce', ['get', field], 0]],
+    0, colors[0],
+    breaks[0], colors[1],
+    breaks[1], colors[2],
+    breaks[2], colors[3]
+  ];
+}
+function buildRadiusExpression(field, breaks, rMin = 5, rMax = 14) {
+  return [
+    'interpolate', ['linear'], ['to-number', ['coalesce', ['get', field], 0]],
+    0, rMin,
+    breaks[0], rMin + (rMax - rMin) * 0.3,
+    breaks[1], rMin + (rMax - rMin) * 0.6,
+    breaks[2], rMax
+  ];
+}
+
+// Legenda – opprett container hvis den ikke finnes
+function ensureGlobalLegendContainer() {
+  let el = document.getElementById('legend');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'legend';
+    el.className = 'legend';
+    document.body.appendChild(el);
+  }
+  return el;
+}
+function renderLegend(title, breaks, colors) {
+  const el = ensureGlobalLegendContainer();
+  const ranges = [
+    `0–${Math.round(breaks[0])}`,
+    `${Math.round(breaks[0])}–${Math.round(breaks[1])}`,
+    `${Math.round(breaks[1])}–${Math.round(breaks[2])}`,
+    `${Math.round(breaks[2])}+`
+  ];
+  el.innerHTML = `
+    <h4>${title}</h4>
+    ${ranges.map((txt,i)=>`
+      <div class="item">
+        <span class="swatch" style="background:${colors[i]}"></span>
+        <span>${txt}</span>
+      </div>`).join('')}
+  `;
+}
+// Skjul legenda hvis ingen av de konfigurerte lagene er synlige
+function hideLegendIfNoStyledLayers() {
+  const keys = Object.keys(styleByTable);
+  const anyVisible = keys.some(k => {
+    const safe = k.replace(/[^a-zA-Z0-9_]/g, '_');
+    return !!map.getLayer(`layer_${safe}`);
+  });
+  if (!anyVisible) {
+    const el = document.getElementById('legend');
+    if (el) el.remove();
+  }
+}
+
 function addWmsToUI(id, title, tileUrlTemplate) {
   const container = document.getElementById('layers');
   if (!container) return;
@@ -388,7 +487,7 @@ async function loadLayers() {
       const input = document.createElement('input');
       input.type = 'checkbox';
       input.id = id;
-      const hasGeom = Array.isArray(t.geom_columns) && t.geom_columns.length > 0 && Array.isArray(t.rows);
+      const hasGeom = Array.isArray(t.geom_columns) && t.geom_columns.length > 0 && (Array.isArray(t.rows) || (typeof t.rows === 'number' && t.rows > 0));
       input.disabled = !hasGeom;
       input.onchange = async (e) => {
         if (e.target.checked) {
@@ -584,7 +683,16 @@ document.addEventListener('DOMContentLoaded', () => {
       wmsDiv.appendChild(btn);
       // insert before layers container
       const layersEl = document.getElementById('layers');
-      sidebar.insertBefore(wmsDiv, layersEl);
+      if (layersEl && layersEl.parentNode) {
+        try {
+          layersEl.parentNode.insertBefore(wmsDiv, layersEl);
+        } catch (e) {
+          console.warn('insertBefore failed, appending to sidebar instead', e && e.message);
+          sidebar.appendChild(wmsDiv);
+        }
+      } else {
+        sidebar.appendChild(wmsDiv);
+      }
       // Render saved WMS connections on load
       renderWmsConnections();
     }
@@ -596,6 +704,8 @@ async function addLayerToMap(name) {
     const tbl = tablesByName.get(name);
     if (!tbl) throw new Error('Table not found: ' + name);
     const rows = tbl.rows || [];
+
+    // Bygg GeoJSON Features fra rows (samme logikk som før)
     const features = [];
     for (const r of rows) {
       let geom = null;
@@ -604,7 +714,7 @@ async function addLayerToMap(name) {
         if (k === 'id') continue;
         let val = r[k];
         if (typeof val === 'string') {
-          try { val = JSON.parse(val); } catch (e) { }
+          try { val = JSON.parse(val); } catch (e) { /* ignore parse errors */ }
         }
         if (val && typeof val === 'object' && typeof val.type === 'string') {
           geom = val;
@@ -615,50 +725,107 @@ async function addLayerToMap(name) {
       if (!geom) continue;
       const props = Object.assign({}, r);
       delete props[geomKey];
-      const feature = { type: 'Feature', id: r.id ? String(r.id) : undefined, geometry: geom, properties: props };
+      delete props['id'];  // Don't duplicate id in properties
+      const feature = {
+        type: 'Feature',
+        id: r.id ? String(r.id) : undefined,
+        geometry: geom,
+        properties: props
+      };
       features.push(feature);
     }
 
     if (features.length === 0) throw new Error('No geometry rows for table: ' + name);
 
     const geojson = { type: 'FeatureCollection', features };
-    const idSafe = name.replace(/\./g, '_');
+    const idSafe = name.replace(/[^a-zA-Z0-9_]/g, '_');
     const srcId = `src_${idSafe}`;
     if (map.getSource(srcId)) return;
     map.addSource(srcId, { type: 'geojson', data: geojson });
 
     const geomType = (features[0].geometry && features[0].geometry.type) || 'Point';
     let layer = null;
+
     if (geomType === 'Point' || geomType === 'MultiPoint') {
-      layer = {
-        id: `layer_${idSafe}`,
-        type: 'circle',
-        source: srcId,
-        paint: { 'circle-radius': 6, 'circle-color': '#007cbf' },
-      };
+      // DATADREVET styling hvis tabellen er konfigurert
+      const cfg = styleByTable[name];
+      console.log(`[Layer] ${name}: config =`, cfg);
+      if (cfg && cfg.field && features[0].properties && (cfg.field in features[0].properties)) {
+        console.log(`[Layer] ${name}: Using color gradients for field "${cfg.field}"`);
+        // breaks: enten faste fra cfg.breaks eller kvantiler fra data
+        let breaks = Array.isArray(cfg.breaks) && cfg.breaks.length >= 3 ? cfg.breaks : null;
+
+        if (!breaks && cfg.quantiles) {
+          const values = features.map(f => Number(f.properties[cfg.field])).filter(Number.isFinite);
+          const qb = quantileBreaks(values, cfg.quantiles);
+          if (qb && qb.length >= 3) breaks = [qb[0], qb[1], qb[2]];
+        }
+        if (!breaks) breaks = [200, 400, 700]; // fallback hvis lite data / ikke konfigurert
+
+        const colors = getRamp(cfg.palette || 'reds', 4);
+        const colorExpr  = buildColorExpression(cfg.field, breaks, colors);
+        const radiusExpr = buildRadiusExpression(cfg.field, breaks, 5, 14);
+
+        layer = {
+          id: `layer_${idSafe}`,
+          type: 'circle',
+          source: srcId,
+          paint: {
+            'circle-color': colorExpr,
+            'circle-radius': radiusExpr,
+            'circle-stroke-width': 1,
+            'circle-stroke-color': '#333',
+            'circle-opacity': 0.9
+          }
+        };
+
+        // Oppdater legenda med samme terskler/farger
+        renderLegend(cfg.title || cfg.field, breaks, colors);
+
+      } else {
+        // Fallback: enkel blå sirkel hvis ikke konfigurert eller feltet mangler
+        console.log(`[Layer] ${name}: Using DEFAULT blue styling (config missing or field "${cfg?.field}" not in properties)`);
+        layer = {
+          id: `layer_${idSafe}`,
+          type: 'circle',
+          source: srcId,
+          paint: { 'circle-radius': 6, 'circle-color': '#007cbf' }
+        };
+      }
+
     } else if (geomType === 'LineString' || geomType === 'MultiLineString') {
       layer = {
         id: `layer_${idSafe}`,
         type: 'line',
         source: srcId,
-        paint: { 'line-color': '#ff6600', 'line-width': 2 },
+        paint: { 'line-color': '#ff6600', 'line-width': 2 }
       };
+
     } else {
+      // Polygoner – enkel fyll (kan utvides til choropleth med samme mal)
       layer = {
         id: `layer_${idSafe}`,
         type: 'fill',
         source: srcId,
-        paint: { 'fill-color': '#00aa55', 'fill-opacity': 0.4 },
+        paint: { 'fill-color': '#00aa55', 'fill-opacity': 0.4 }
       };
     }
+
     map.addLayer(layer);
+
+    // Fit til lagets bbox
     let bbox = null;
     try {
-      if (typeof turf !== 'undefined' && turf && typeof turf.bbox === 'function') bbox = turf.bbox(geojson);
+      if (typeof turf !== 'undefined' && turf && typeof turf.bbox === 'function') {
+        bbox = turf.bbox(geojson);
+      }
     } catch (e) {
       console.warn('turf.bbox failed', e && e.message);
     }
-    if (bbox) map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 20 });
+    if (bbox) {
+      map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 20 });
+    }
+
   } catch (err) {
     alert('Error loading layer: ' + err.message);
   }
