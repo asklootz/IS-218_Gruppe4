@@ -219,6 +219,21 @@ window.addEventListener('DOMContentLoaded', () => {
 // Backend base URL
 const backendBase = 'http://localhost:3000/';
 
+const fylkeFilterConfig = {
+  nameSchema: 'fylker',
+  nameTable: 'administrativenhetnavn',
+  nameColumn: 'navn',
+  geomSchema: 'fylker',
+  geomTable: 'fylke',
+  geomColumn: 'omrade',
+  geomNameColumn: 'fylkesnavn',
+  nameMatchMode: 'contains',
+  joinColumn: 'id',
+  brannSchema: 'brannstasjoner',
+  brannTable: 'brannstasjon',
+  brannGeomColumn: 'posisjon',
+};
+
 const map = new maplibregl.Map({
   container: 'map',
   style: {
@@ -475,6 +490,8 @@ function hideAllLayers() {
 
 // Show all tables in a schema
 async function showSchema(schema) {
+  const hasTilfluktsrom = availableTables.some(t => t.schema === schema && String(t.table).toLowerCase() === 'tilfluktsrom');
+  if (hasTilfluktsrom) removeFilteredTilfluktsromLayer();
   for (const t of availableTables) {
     if (t.schema !== schema) continue;
     const full = `${t.schema}.${t.table}`;
@@ -497,12 +514,175 @@ function hideSchema(schema) {
   }
 }
 
+function buildFylkeQueryParams() {
+  const p = new URLSearchParams();
+  p.set('name_schema', fylkeFilterConfig.nameSchema);
+  p.set('name_table', fylkeFilterConfig.nameTable);
+  p.set('name_col', fylkeFilterConfig.nameColumn);
+  p.set('geom_schema', fylkeFilterConfig.geomSchema);
+  p.set('geom_table', fylkeFilterConfig.geomTable);
+  p.set('geom_col', fylkeFilterConfig.geomColumn);
+  if (fylkeFilterConfig.geomNameColumn) {
+    p.set('geom_name_col', fylkeFilterConfig.geomNameColumn);
+  }
+  if (fylkeFilterConfig.nameMatchMode) {
+    p.set('name_match', fylkeFilterConfig.nameMatchMode);
+  }
+  p.set('join_col', fylkeFilterConfig.joinColumn);
+  p.set('brann_schema', fylkeFilterConfig.brannSchema);
+  p.set('brann_table', fylkeFilterConfig.brannTable);
+  p.set('brann_geom_col', fylkeFilterConfig.brannGeomColumn);
+  return p;
+}
+
+function removeFylkeFilterLayers() {
+  const outlineFillId = 'layer_fylke_outline_fill';
+  const outlineLineId = 'layer_fylke_outline_line';
+  const outlineSrcId = 'src_fylke_outline';
+  const brannLayerId = 'layer_brannstasjoner_fylke';
+  const brannSrcId = 'src_brannstasjoner_fylke';
+
+  if (map.getLayer(outlineFillId)) {
+    try { map.removeLayer(outlineFillId); } catch (e) { console.warn('remove outline fill failed', e && e.message); }
+  }
+  if (map.getLayer(outlineLineId)) {
+    try { map.removeLayer(outlineLineId); } catch (e) { console.warn('remove outline line failed', e && e.message); }
+  }
+  if (map.getSource(outlineSrcId)) {
+    try { map.removeSource(outlineSrcId); } catch (e) { console.warn('remove outline source failed', e && e.message); }
+  }
+  if (map.getLayer(brannLayerId)) {
+    try { map.removeLayer(brannLayerId); } catch (e) { console.warn('remove brann layer failed', e && e.message); }
+  }
+  if (map.getSource(brannSrcId)) {
+    try { map.removeSource(brannSrcId); } catch (e) { console.warn('remove brann source failed', e && e.message); }
+  }
+}
+
+function hideBrannstasjonBaseLayers() {
+  const brannTables = availableTables
+    .filter(t => String(t.table).toLowerCase() === String(fylkeFilterConfig.brannTable).toLowerCase());
+
+  for (const t of brannTables) {
+    const full = `${t.schema}.${t.table}`;
+    const idSafe = full.replace(/[^a-zA-Z0-9_]/g, '_');
+    const checkbox = document.getElementById(`chk_${idSafe}`);
+    if (checkbox) checkbox.checked = false;
+    removeLayerFromMap(full);
+  }
+}
+
+async function loadFylkeOptions() {
+  const select = document.getElementById('fylkeSelect');
+  if (!select) return;
+  select.innerHTML = '';
+  const params = buildFylkeQueryParams();
+  const url = `${backendBase}analysis/fylke-list?${params.toString()}`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('Failed to load fylker list');
+    const data = await res.json();
+    const names = Array.isArray(data.names) ? data.names : [];
+    if (names.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.text = '(no fylker)';
+      select.appendChild(opt);
+      return;
+    }
+    for (const name of names) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.text = name;
+      select.appendChild(opt);
+    }
+  } catch (err) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.text = 'Failed to load fylker';
+    select.appendChild(opt);
+    console.warn('load fylker failed', err && err.message);
+  }
+}
+
+async function applyFylkeFilter() {
+  const select = document.getElementById('fylkeSelect');
+  if (!select || !select.value) return;
+
+  hideBrannstasjonBaseLayers();
+  removeFylkeFilterLayers();
+
+  const params = buildFylkeQueryParams();
+  params.set('fylke_name', select.value);
+
+  const outlineUrl = `${backendBase}analysis/fylke-outline?${params.toString()}`;
+  const brannUrl = `${backendBase}analysis/brannstasjoner-in-fylke?${params.toString()}`;
+
+  try {
+    const [outlineRes, brannRes] = await Promise.all([fetch(outlineUrl), fetch(brannUrl)]);
+    if (!outlineRes.ok) throw new Error('Failed to load fylke outline');
+    if (!brannRes.ok) throw new Error('Failed to load brannstasjoner');
+
+    const outlineGeo = await outlineRes.json();
+    const brannGeo = await brannRes.json();
+
+    const outlineFeatures = (outlineGeo && outlineGeo.features) ? outlineGeo.features : [];
+    if (outlineFeatures.length === 0) {
+      alert('No fylke geometry found for the selected name.');
+      return;
+    }
+
+    map.addSource('src_fylke_outline', { type: 'geojson', data: outlineGeo });
+    map.addLayer({
+      id: 'layer_fylke_outline_fill',
+      type: 'fill',
+      source: 'src_fylke_outline',
+      paint: { 'fill-color': '#ffd166', 'fill-opacity': 0.08 },
+    });
+    map.addLayer({
+      id: 'layer_fylke_outline_line',
+      type: 'line',
+      source: 'src_fylke_outline',
+      paint: { 'line-color': '#ffd166', 'line-width': 2 },
+    });
+
+    const brannFeatures = (brannGeo && brannGeo.features) ? brannGeo.features : [];
+    map.addSource('src_brannstasjoner_fylke', { type: 'geojson', data: brannGeo });
+    map.addLayer({
+      id: 'layer_brannstasjoner_fylke',
+      type: 'circle',
+      source: 'src_brannstasjoner_fylke',
+      paint: { 'circle-radius': 6, 'circle-color': '#ef476f' },
+    });
+
+    let bbox = null;
+    try {
+      if (typeof turf !== 'undefined' && turf && typeof turf.bbox === 'function') bbox = turf.bbox(outlineGeo);
+    } catch (e) {
+      console.warn('turf.bbox failed', e && e.message);
+    }
+    if (bbox) map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 20 });
+
+    if (brannFeatures.length === 0) {
+      alert('No brannstasjoner found inside this fylke.');
+    }
+  } catch (err) {
+    alert('Error applying fylke filter: ' + err.message);
+  }
+}
+
 // attach buttons after DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
   const showBtn = document.getElementById('showAll');
   const hideBtn = document.getElementById('hideAll');
+  const filterTilfluktsromBtn = document.getElementById('filterTilfluktsrom500Btn');
+  const fylkeApplyBtn = document.getElementById('fylkeApplyBtn');
+  const fylkeClearBtn = document.getElementById('fylkeClearBtn');
   if (showBtn) showBtn.addEventListener('click', () => { showAllLayers(); });
   if (hideBtn) hideBtn.addEventListener('click', () => { hideAllLayers(); });
+  if (filterTilfluktsromBtn) filterTilfluktsromBtn.addEventListener('click', () => { showTilfluktsromMinPlasser(500); });
+  if (fylkeApplyBtn) fylkeApplyBtn.addEventListener('click', () => { applyFylkeFilter(); });
+  if (fylkeClearBtn) fylkeClearBtn.addEventListener('click', () => { removeFylkeFilterLayers(); });
   try {
     if (typeof loadSchemaSelector === 'function') {
       loadSchemaSelector().catch(err => console.warn('loadSchemaSelector failed', err));
@@ -512,6 +692,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   // Ensure layer list is loaded immediately (don't rely only on turf script load)
   loadLayers().catch(err => console.warn('initial loadLayers failed', err));
+  loadFylkeOptions().catch(err => console.warn('load fylke options failed', err && err.message));
   // insert WMS form above layers
   try {
     const sidebar = document.getElementById('sidebar');
@@ -673,6 +854,83 @@ function removeLayerFromMap(name) {
   }
   if (map.getSource(srcId)) {
     try { map.removeSource(srcId); } catch (e) { console.warn('removeSource failed', e && e.message); }
+  }
+}
+
+function removeFilteredTilfluktsromLayer() {
+  const layerId = 'layer_tilfluktsrom_min_500';
+  const srcId = 'src_tilfluktsrom_min_500';
+  if (map.getLayer(layerId)) {
+    try { map.removeLayer(layerId); } catch (e) { console.warn('remove filtered layer failed', e && e.message); }
+  }
+  if (map.getSource(srcId)) {
+    try { map.removeSource(srcId); } catch (e) { console.warn('remove filtered source failed', e && e.message); }
+  }
+}
+
+async function showTilfluktsromMinPlasser(minPlasser) {
+  try {
+    const tilfluktsromTables = availableTables
+      .filter(t => String(t.table).toLowerCase() === 'tilfluktsrom')
+      .map(t => `${t.schema}.${t.table}`);
+
+    for (const full of tilfluktsromTables) {
+      const idSafe = full.replace(/[^a-zA-Z0-9_]/g, '_');
+      const checkbox = document.getElementById(`chk_${idSafe}`);
+      if (checkbox) checkbox.checked = false;
+      removeLayerFromMap(full);
+    }
+    removeFilteredTilfluktsromLayer();
+
+    const url = `${backendBase}analysis/tilfluktsrom-min?min_plasser=${encodeURIComponent(minPlasser)}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('Failed to load tilfluktsrom filter');
+    const geojson = await res.json();
+    const features = (geojson && geojson.features) ? geojson.features : [];
+    if (features.length === 0) {
+      alert('No tilfluktsrom found for the selected filter.');
+      return;
+    }
+
+    const srcId = 'src_tilfluktsrom_min_500';
+    const layerId = 'layer_tilfluktsrom_min_500';
+    map.addSource(srcId, { type: 'geojson', data: geojson });
+
+    const geomType = (features[0].geometry && features[0].geometry.type) || 'Point';
+    let layer = null;
+    if (geomType === 'Point' || geomType === 'MultiPoint') {
+      layer = {
+        id: layerId,
+        type: 'circle',
+        source: srcId,
+        paint: { 'circle-radius': 7, 'circle-color': '#22c55e' },
+      };
+    } else if (geomType === 'LineString' || geomType === 'MultiLineString') {
+      layer = {
+        id: layerId,
+        type: 'line',
+        source: srcId,
+        paint: { 'line-color': '#ff6b6b', 'line-width': 2 },
+      };
+    } else {
+      layer = {
+        id: layerId,
+        type: 'fill',
+        source: srcId,
+        paint: { 'fill-color': '#ff6b6b', 'fill-opacity': 0.45 },
+      };
+    }
+    map.addLayer(layer);
+
+    let bbox = null;
+    try {
+      if (typeof turf !== 'undefined' && turf && typeof turf.bbox === 'function') bbox = turf.bbox(geojson);
+    } catch (e) {
+      console.warn('turf.bbox failed', e && e.message);
+    }
+    if (bbox) map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 20 });
+  } catch (err) {
+    alert('Error loading filtered tilfluktsrom: ' + err.message);
   }
 }
 
