@@ -1,48 +1,56 @@
-# IS-218_Gruppe4
-## Map Layers Viewer
+# Gruppe 4 "Beredskapskart"
+## TLDR
 
-This is a minimal example web app that shows an OpenStreetMap base map (via MapLibre GL JS) and loads geometry layers from a PostGIS database (seeded on startup).
+Dette er et minimalt web-eksempel som viser et OpenStreetMap kartbase (via MapLibre GL JS) og henter geometri lag fra en PostGIS database.
+Web applikasjonen viser brannstasjoner i valgte fylker og tilgjeneglighet på plasser i tilfluktsrom.
 
+Tjenestene kjøres med Docker Compose. 
+Tjenester:
+- `backend`: Node/Express API that exposes `/layers` and `/layers/:name` returning GeoJSON from PostGIS Supabase server
+- `frontend`: statisk nettsted betjent av nginx med MapLibre-kart og lagkontroller
 
-Services are run with Docker Compose. By default this project no longer starts a local PostGIS container — instead the backend connects to a database provided via `DATABASE_URL` (useful for Supabase or other cloud Postgres instances).
+## Quick start with a Supabase (or remote Postgres) database:
 
-Services:
-- `backend`: Node/Express API that exposes `/layers` and `/layers/:name` returning GeoJSON
-- `frontend`: static site served by nginx with MapLibre map and layer controls
-
-Quick start with a Supabase (or remote Postgres) database:
-
-1. Set your connection string in the environment, for example (PowerShell):
+1. Oppstart av appen i Docker-miljø (PowerShell):
 
 ```powershell
-$env:DATABASE_URL = "postgresql://postgres:yourpassword@dbhost:5432/yourdb"
-$env:DB_SSL = "true"   # set to "false" if SSL is not required
-docker-compose up --build
+docker compose up --build -d
 ```
 
-2. Open the frontend at http://localhost:8080
+2. Åpne frontend på: http://localhost:8080
 
-Notes:
-- The backend will use `DATABASE_URL` when present. If your provider requires SSL (Supabase typically does), set `DB_SSL=true` so the connection uses TLS.
-- If you want to run a local PostGIS for development, you can re-add a DB service in `docker-compose.yml` or run PostGIS separately.
-# IS-218_Gruppe4
-# IS-218_Gruppe4
+### Demo av system
+
+Link til youtobe video:
+https://youtu.be/Z0XaCP_wVek
 
 ## Teknisk stack
 
 - MapLibre GL JS (via CDN)
 - JavaScript (ES6)
-- HTML / CSS
+- HTML5 / CSS3
 - GeoJSON (lokale filer)
+- Turf.js
+- DOMParser
 - OGC API / WFS (GeoNorge)
 - OpenStreetMap (bakgrunnskart)
+- Node.js + Express.js
+- PostgreSQL/PostGIS via Supabase
+- pg (postgres client)
+- CORS Middleware
+- Docker compose
+- WMS tile
+- GeoJSON
 
 ## Datakatalog
 
 | Datasett | Kilde | Format | Bearbeiding |
 |--------|------|--------|------------|
-| Grøntområder | QGIS | GeoJSON | Klippet og eksportert |
-| Kommunegrenser | GeoNorge | WFS | Hentet direkte via API |
+| Tilfluktsrom | GeoNorge | PostGIS | Hentet via Supabase |
+| Brannstasjoner | GeoNorge | PostGIS | Hentet via Supabase |
+| Administrative enheter | GeoNorge | PostGIS | Hentet via Supabase |
+
+Med mulighet for å selv vise WMS lag som legges inn av bruker
 
 ## Arkitekturskisse
 
@@ -51,11 +59,12 @@ inn som sources i MapLibre, mens eksterne datasett hentes via OGC API (WFS).
 Dataene visualiseres som layers i kartet og gjøres interaktive med klikkbare
 popups og datadrevet styling.
 
+<img width="571" height="242" alt="diagram" src="https://github.com/user-attachments/assets/cd79ab0e-498b-4884-b368-9add472ad8c2" />
+
+
 ## Refleksjon
 
 - Kartløsningen kan skaleres bedre ved bruk av vector tiles
 - Brukergrensesnittet kan forbedres med tydeligere kontroller
 - Mer avansert romlig filtrering kan gi bedre analyse
 - Avhengighet av eksterne API-er kan påvirke stabilitet
-
-
