@@ -396,7 +396,7 @@ async function loadLayers() {
 
     for (const t of list) {
       const full = `${t.schema}.${t.table}`;
-      const idSafe = full.replace(/[^a-zA-Z0-9_]/g, '_');
+      const idSafe = encodeURIComponent(full);
       const id = `chk_${idSafe}`;
       const div = document.createElement('div');
       div.className = 'layer-item';
@@ -481,11 +481,14 @@ async function showAllLayers() {
 function hideAllLayers() {
   for (const t of availableTables) {
     const full = `${t.schema}.${t.table}`;
-    const idSafe = full.replace(/[^a-zA-Z0-9_]/g, '_');
+    const idSafe = encodeURIComponent(full);
     const chk = document.getElementById(`chk_${idSafe}`);
     if (chk && chk.checked) chk.checked = false;
     removeLayerFromMap(full);
   }
+  // Also remove special filtered layers
+  removeFylkeFilterLayers();
+  removeFilteredTilfluktsromLayer();
 }
 
 // Show all tables in a schema
@@ -507,7 +510,7 @@ function hideSchema(schema) {
   for (const t of availableTables) {
     if (t.schema !== schema) continue;
     const full = `${t.schema}.${t.table}`;
-    const idSafe = full.replace(/[^a-zA-Z0-9_]/g, '_');
+    const idSafe = encodeURIComponent(full);
     const chk = document.getElementById(`chk_${idSafe}`);
     if (chk && chk.checked) chk.checked = false;
     removeLayerFromMap(full);
@@ -565,7 +568,7 @@ function hideBrannstasjonBaseLayers() {
 
   for (const t of brannTables) {
     const full = `${t.schema}.${t.table}`;
-    const idSafe = full.replace(/[^a-zA-Z0-9_]/g, '_');
+    const idSafe = encodeURIComponent(full);
     const checkbox = document.getElementById(`chk_${idSafe}`);
     if (checkbox) checkbox.checked = false;
     removeLayerFromMap(full);
@@ -846,7 +849,7 @@ async function addLayerToMap(name) {
 }
 
 function removeLayerFromMap(name) {
-  const idSafe = name.replace(/[^a-zA-Z0-9_]/g, '_');
+  const idSafe = encodeURIComponent(name);
   const layerId = `layer_${idSafe}`;
   const srcId = `src_${idSafe}`;
   if (map.getLayer(layerId)) {
@@ -875,7 +878,7 @@ async function showTilfluktsromMinPlasser(minPlasser) {
       .map(t => `${t.schema}.${t.table}`);
 
     for (const full of tilfluktsromTables) {
-      const idSafe = full.replace(/[^a-zA-Z0-9_]/g, '_');
+      const idSafe = encodeURIComponent(full);
       const checkbox = document.getElementById(`chk_${idSafe}`);
       if (checkbox) checkbox.checked = false;
       removeLayerFromMap(full);
