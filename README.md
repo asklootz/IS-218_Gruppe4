@@ -21,7 +21,7 @@ docker compose up --build -d
 
 ### Demo av system
 
-(GIF)
+
 
 ## Teknisk stack
 
