@@ -21,7 +21,8 @@ docker compose up --build -d
 
 ### Demo av system
 
-
+Link til youtobe video:
+https://youtu.be/Z0XaCP_wVek
 
 ## Teknisk stack
 
