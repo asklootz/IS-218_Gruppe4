@@ -1,4 +1,33 @@
 // --- Sidebar Toggle ---
+function getNoWrapMinZoom() {
+  const mapDiv = document.getElementById('map');
+  const width = (mapDiv && mapDiv.clientWidth) ? mapDiv.clientWidth : window.innerWidth;
+  const tileSize = 256;
+  // Keep one-world view wider than viewport to avoid black side gutters.
+  return Math.max(0, Math.log2(Math.max(1, width) / tileSize) + 0.1);
+}
+
+function enforceNoWrapViewport() {
+  const appMap = window.__appMap;
+  if (!appMap) return;
+  const minZoom = getNoWrapMinZoom();
+  appMap.setMinZoom(minZoom);
+  if (appMap.getZoom() < minZoom) appMap.setZoom(minZoom);
+}
+
+function scheduleMapResize() {
+  const appMap = window.__appMap;
+  if (!appMap) return;
+  requestAnimationFrame(() => {
+    appMap.resize();
+    enforceNoWrapViewport();
+  });
+  setTimeout(() => {
+    appMap.resize();
+    enforceNoWrapViewport();
+  }, 280);
+}
+
 function setupSidebarToggle() {
   const sidebar = document.getElementById('sidebar');
   const sidebarToggle = document.getElementById('sidebarToggle');
@@ -9,11 +38,13 @@ function setupSidebarToggle() {
       sidebar.classList.add('hide');
       mapDiv.classList.add('sidebar-hidden');
       sidebarShowBtn.style.display = 'block';
+      scheduleMapResize();
     };
     sidebarShowBtn.onclick = () => {
       sidebar.classList.remove('hide');
       mapDiv.classList.remove('sidebar-hidden');
       sidebarShowBtn.style.display = 'none';
+      scheduleMapResize();
     };
   }
 }
@@ -249,7 +280,16 @@ const map = new maplibregl.Map({
   },
   center: [10.75, 59.91],
   zoom: 10,
+  renderWorldCopies: false,
+  dragRotate: false,
+  touchZoomRotate: false,
 });
+window.__appMap = map;
+map.on('load', () => {
+  enforceNoWrapViewport();
+  scheduleMapResize();
+});
+window.addEventListener('resize', scheduleMapResize);
 
 // available tables/geomTables stored for global actions
 let availableTables = []; // array of { schema, table, geom_columns, rows }
@@ -472,23 +512,27 @@ async function loadLayers() {
     details.className = 'schema-block';
     const summary = document.createElement('summary');
     summary.innerText = `${schema} (${list.length})`;
+    details.appendChild(summary);
 
-    // per-schema buttons
+    // per-schema buttons - moved OUTSIDE summary for accessibility
+    const btnContainer = document.createElement('div');
+    btnContainer.style.display = 'flex';
+    btnContainer.style.gap = '4px';
+    btnContainer.style.marginTop = '8px';
+    
     const btnShow = document.createElement('button');
     btnShow.type = 'button';
     btnShow.innerText = 'Show all';
-    btnShow.style.marginLeft = '8px';
     btnShow.addEventListener('click', (e) => { e.stopPropagation(); showSchema(schema); });
 
     const btnHide = document.createElement('button');
     btnHide.type = 'button';
     btnHide.innerText = 'Hide all';
-    btnHide.style.marginLeft = '4px';
     btnHide.addEventListener('click', (e) => { e.stopPropagation(); hideSchema(schema); });
 
-    summary.appendChild(btnShow);
-    summary.appendChild(btnHide);
-    details.appendChild(summary);
+    btnContainer.appendChild(btnShow);
+    btnContainer.appendChild(btnHide);
+    details.appendChild(btnContainer);
 
     const inner = document.createElement('div');
     inner.style.paddingLeft = '10px';

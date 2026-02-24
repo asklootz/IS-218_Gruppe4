@@ -1,29 +1,49 @@
 
-body, html, #map {
-	height: 100%;
+:root {
+	--sidebar-width: 270px;
+}
+
+body, html {
 	margin: 0;
 	padding: 0;
+	height: 100%;
+	width: 100%;
+	overflow: hidden;
 	font-family: 'Inter', Arial, sans-serif;
 	background: #181a20;
 	color: #e0e0e0;
-	transition: background 0.2s, color 0.2s;
 }
 
 #map {
+<<<<<<< HEAD
 	position: absolute;
 	left: 270px;
 	right: 0;
+=======
+	position: fixed;
+>>>>>>> 401e529 (resolve duplicate map rendering and move secrets to .env)
 	top: 0;
+	left: var(--sidebar-width);
+	right: 0;
 	bottom: 0;
+	margin: 0;
+	padding: 0;
+	overflow: hidden;
+	transition: left 0.25s ease;
 	background: #23272f;
 }
 
+#map.sidebar-hidden {
+	left: 0;
+}
+
 #sidebar {
-	position: absolute;
+	position: fixed;
 	left: 0;
 	top: 0;
 	bottom: 0;
-	width: 270px;
+	width: var(--sidebar-width);
+	box-sizing: border-box;
 	max-width: 95vw;
 	min-width: 180px;
 	background: #23272f;
@@ -77,7 +97,7 @@ body, html, #map {
 	flex-direction: column;
 	gap: 8px;
 	margin-bottom: 0.5em;
-	width: 270px;
+	width: 100%;
 }
 button {
 	background: #282c34;
@@ -179,23 +199,9 @@ body.light-mode input[type="text"]:focus {
 	border: 1.5px solid #0077ff;
 }
 
-#map {
-	position: absolute;
-	left: 270px;
-	right: 0;
-	top: 0;
-	bottom: 0;
-	background: #23272f;
-	transition: left 0.25s cubic-bezier(.4,2,.6,1);
-}
-
 #sidebar.hide {
-	left: -280px;
+	left: calc(-1 * var(--sidebar-width));
 	box-shadow: none;
-}
-
-#map.sidebar-hidden {
-	left: 0;
 }
 
 #sidebarShowBtn {
@@ -204,7 +210,7 @@ body.light-mode input[type="text"]:focus {
 
 /* --- Legend (kart) --- */
 .legend {
-  position: absolute;
+  position: fixed;
   right: 20px;
   bottom: 20px;
   background: rgba(255,255,255,0.9);
@@ -228,9 +234,13 @@ body.light-mode input[type="text"]:focus {
   align-items: center;
   margin: 4px 0;
 }
-.legend .swatch {
+.legend .color {
   width: 18px;
   height: 18px;
   border-radius: 4px;
   border: 1px solid #888;
 }
+.legend .c1 { background: #fee5d9; }
+.legend .c2 { background: #fcae91; }
+.legend .c3 { background: #fb6a4a; }
+.legend .c4 { background: #cb181d; }

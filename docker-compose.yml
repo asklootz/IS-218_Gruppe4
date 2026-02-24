@@ -2,11 +2,13 @@ services:
   backend:
     build: ./backend
     environment:
-      # Supabase connection (provided)
-      DATABASE_URL: "postgresql://postgres.rtoedavwkyicvokbcxkr:OIJlRB7WHB2AMg@aws-1-eu-central-1.pooler.supabase.com:5432/postgres?pool_mode=session"
-      DB_SSL: "true"
-      PGUSER: "postgres.rtoedavwkyicvokbcxkr"
-      PGPASSWORD: "OIJlRB7WHB2AMg"
+      DATABASE_URL: "${DATABASE_URL}"
+      DB_SSL: "${DB_SSL:-true}"
+      PGHOST: "${PGHOST:-}"
+      PGPORT: "${PGPORT:-}"
+      PGDATABASE: "${PGDATABASE:-}"
+      PGUSER: "${PGUSER:-}"
+      PGPASSWORD: "${PGPASSWORD:-}"
     ports:
       - "3000:3000"
 
