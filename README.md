@@ -1,4 +1,5 @@
-# Map Layers Viewer
+# IS-218_Gruppe4
+## Map Layers Viewer
 
 This is a minimal example web app that shows an OpenStreetMap base map (via MapLibre GL JS) and loads geometry layers from a PostGIS database.
 

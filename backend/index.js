@@ -40,6 +40,58 @@ const pool = new Pool(poolConfig);
 // Helper to safely quote identifiers
 function quoteIdent(s) { return '"' + String(s).replace(/"/g, '""') + '"'; }
 
+async function resolveSchemaForTable(schema, table) {
+  const exact = await pool.query(
+    `SELECT table_schema FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2 LIMIT 1`,
+    [schema, table]
+  );
+  if (exact.rowCount > 0) return schema;
+
+  const anySchema = await pool.query(
+    `SELECT table_schema FROM information_schema.tables WHERE table_name = $1 ORDER BY table_schema LIMIT 1`,
+    [table]
+  );
+  if (anySchema.rowCount > 0) return anySchema.rows[0].table_schema;
+
+  throw new Error(`Table not found: ${schema}.${table}`);
+}
+
+async function assertColumnExists(schema, table, column) {
+  const r = await pool.query(
+    `SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = $3 LIMIT 1`,
+    [schema, table, column]
+  );
+  if (r.rowCount === 0) throw new Error(`Column not found: ${schema}.${table}.${column}`);
+}
+
+function getFylkeConfig(req) {
+  return {
+    nameSchema: req.query.name_schema || process.env.FYLKE_NAME_SCHEMA || 'fylker',
+    nameTable: req.query.name_table || process.env.FYLKE_NAME_TABLE || 'administrativenhetsnavn',
+    nameColumn: req.query.name_col || process.env.FYLKE_NAME_COL || 'navn',
+    geomSchema: req.query.geom_schema || process.env.FYLKE_GEOM_SCHEMA || 'fylker',
+    geomTable: req.query.geom_table || process.env.FYLKE_GEOM_TABLE || 'grense',
+    geomColumn: req.query.geom_col || process.env.FYLKE_GEOM_COL || 'grense',
+    joinColumn: req.query.join_col || process.env.FYLKE_JOIN_COL || 'id',
+    geomNameColumn: req.query.geom_name_col || process.env.FYLKE_GEOM_NAME_COL || null,
+    nameMatchMode: req.query.name_match || process.env.FYLKE_NAME_MATCH || 'join',
+  };
+}
+
+function getBrannConfig(req) {
+  return {
+    brannSchema: req.query.brann_schema || process.env.BRANN_SCHEMA || 'brannstasjoner',
+    brannTable: req.query.brann_table || process.env.BRANN_TABLE || 'brannstasjon',
+    brannGeomColumn: req.query.brann_geom_col || process.env.BRANN_GEOM_COL || 'posisjon',
+  };
+}
+
+async function getFirstGeomColumn(schema, table) {
+  const q = `SELECT f_geometry_column FROM public.geometry_columns WHERE f_table_schema = $1 AND f_table_name = $2 LIMIT 1`;
+  const r = await pool.query(q, [schema, table]);
+  return r.rowCount > 0 ? r.rows[0].f_geometry_column : null;
+}
+
 app.get('/layers', async (req, res) => {
   try {
     // Try geometry_columns first
@@ -57,13 +109,17 @@ app.get('/layers', async (req, res) => {
   }
 });
 
+//----
+// for å kjøre romlige spørringer:
 app.get('/layers/:name', async (req, res) => {
   const name = req.params.name;
+
   try {
-    console.log(`[REQ] GET /layers/${name} from ${req.ip || req.headers['x-forwarded-for'] || (req.connection && req.connection.remoteAddress)}`);
+
     // Support schema-qualified names like schema.table
     let schema = 'public';
     let table = name;
+
     if (name.includes('.')) {
       const parts = name.split('.');
       schema = parts[0];
@@ -133,33 +189,41 @@ app.get('/layers/:name', async (req, res) => {
     ) as geojson
     FROM (
       SELECT json_build_object(
-        'type','Feature',
-        'id', COALESCE((${idLeft})::text, t.__ctid::text),
-        'geometry', ST_AsGeoJSON(ST_Transform(${quoteIdent('t')}.${geomIdent}, 4326))::json,
-        'properties', to_jsonb(t) - ${propRemove}
-      ) as feature
-      FROM (${innerSelect}) t
-    ) as features;`;
-    // Log the SQL being executed (truncated)
+        'type', 'FeatureCollection',
+        'features', json_agg(
+          json_build_object(
+            'type', 'Feature',
+            'geometry', ST_AsGeoJSON(geom)::json,
+            'properties', to_jsonb(row) - 'geom'
+          )
+        )
+      ) AS geojson
+      FROM ${schema}.${table} row;
+    `;
+
+    // Log SQL
     try {
-      console.log('[SQL] Executing for', `${schema}.${table}`, 'geom=', geomCol, 'id=', idCol);
-      console.log('[SQL] Query start:', q.slice(0, 1000));
-    } catch (e) {
-      console.error('Failed to log SQL', e && e.message);
+      console.log('[SQL] Executing for', `${schema}.${table}`);
+      console.log('[SQL] Query start:', q.slice(0, 500));
+    } catch (logErr) {
+      console.error('Failed to log SQL', logErr && logErr.message);
     }
 
+    // Kjør SQL
     try {
       const result = await pool.query(q);
       res.json(result.rows[0].geojson);
     } catch (sqlErr) {
-      console.error('[SQL ERROR] while querying', `${schema}.${table}`, sqlErr && sqlErr.stack);
+      console.error('[SQL ERROR]', sqlErr && sqlErr.stack);
       return res.status(500).json({ error: sqlErr.message });
     }
+
   } catch (err) {
-    console.error('[REQ ERROR] processing /layers/:name', { name, err: err && err.stack });
+    console.error('[REQ ERROR] processing /layers/:name', err && err.stack);
     res.status(500).json({ error: err.message });
   }
 });
+//----
 
 // Return all tables (across schemas) that have geometry/geography columns
 // For each table return only an id (primary key or ctid) and the spatial columns
@@ -479,9 +543,332 @@ async function testDbConnection() {
   }
 }
 
+//Romlig SQL som viser objekter innen 1km
+app.get('/analysis/near', async (req, res) => {
+    const { table, lon, lat, distance } = req.query;
+
+    try {
+        const query = `
+      SELECT *
+      FROM ${tilfluktsromoffentlige.tilfluktsrom}
+      WHERE ST_DWithin(
+        posisjon,
+        ST_Transform(
+        ST_SetSRID(ST_MakePoint(10.75, 59.91), 4326)::geography,
+        25833
+      ),
+      1000  
+    `;
+
+        const result = await pool.query(query, [lon, lat, distance]);
+        res.json(result.rows);
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Database error' });
+    }
+});
+
+// Filter tilfluktsrom by minimum plasser and return GeoJSON
+app.get('/analysis/tilfluktsrom-min', async (req, res) => {
+  const minPlasser = Number(req.query.min_plasser) || 500;
+  const schema = 'tilfluktsromoffentlige';
+  const table = 'tilfluktsrom';
+
+  try {
+    const geomCol = await getFirstGeomColumn(schema, table);
+    if (!geomCol) {
+      return res.status(404).json({ error: 'Geometry column not found for tilfluktsrom' });
+    }
+
+    const q = `
+      SELECT json_build_object(
+        'type', 'FeatureCollection',
+        'features', COALESCE(json_agg(
+          json_build_object(
+            'type', 'Feature',
+            'geometry', ST_AsGeoJSON(ST_Transform(${quoteIdent(geomCol)}, 4326))::json,
+            'properties', to_jsonb(row) - $2
+          )
+        ), '[]'::json)
+      ) AS geojson
+      FROM ${quoteIdent(schema)}.${quoteIdent(table)} row
+      WHERE plasser >= $1;
+    `;
+
+    const result = await pool.query(q, [minPlasser, geomCol]);
+    res.json(result.rows[0].geojson);
+  } catch (err) {
+    console.error('tilfluktsrom-min failed', err && err.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// List fylker for dropdown
+app.get('/analysis/fylke-list', async (req, res) => {
+  const cfg = getFylkeConfig(req);
+  try {
+    const nameSchema = await resolveSchemaForTable(cfg.nameSchema, cfg.nameTable);
+    const geomSchema = await resolveSchemaForTable(cfg.geomSchema, cfg.geomTable);
+
+    await assertColumnExists(nameSchema, cfg.nameTable, cfg.nameColumn);
+    const isSameTable = (geomSchema === nameSchema && cfg.geomTable === cfg.nameTable);
+    const useNameMatch = cfg.nameMatchMode && cfg.nameMatchMode !== 'join';
+    if (!isSameTable) {
+      if (useNameMatch) {
+        if (!cfg.geomNameColumn) throw new Error('Missing geom_name_col for name matching');
+        await assertColumnExists(geomSchema, cfg.geomTable, cfg.geomNameColumn);
+      } else {
+        await assertColumnExists(nameSchema, cfg.nameTable, cfg.joinColumn);
+        await assertColumnExists(geomSchema, cfg.geomTable, cfg.joinColumn);
+      }
+    }
+
+    const nameIdent = `${quoteIdent(nameSchema)}.${quoteIdent(cfg.nameTable)}`;
+    let fromSql = `${nameIdent} n`;
+    if (!isSameTable) {
+      const geomIdent = `${quoteIdent(geomSchema)}.${quoteIdent(cfg.geomTable)}`;
+      if (useNameMatch) {
+        const nameExpr = `LOWER(n.${quoteIdent(cfg.nameColumn)})`;
+        const geomNameExpr = `LOWER(g.${quoteIdent(cfg.geomNameColumn)})`;
+        const matchSql = (cfg.nameMatchMode === 'equals')
+          ? `${geomNameExpr} = ${nameExpr}`
+          : `${geomNameExpr} LIKE '%' || ${nameExpr} || '%'`;
+        fromSql = `${nameIdent} n JOIN ${geomIdent} g ON ${matchSql}`;
+      } else {
+        fromSql = `${nameIdent} n JOIN ${geomIdent} g ON n.${quoteIdent(cfg.joinColumn)} = g.${quoteIdent(cfg.joinColumn)}`;
+      }
+    }
+
+    const q = `SELECT DISTINCT n.${quoteIdent(cfg.nameColumn)} AS name
+               FROM ${fromSql}
+               WHERE n.${quoteIdent(cfg.nameColumn)} IS NOT NULL
+               ORDER BY n.${quoteIdent(cfg.nameColumn)}`;
+    const r = await pool.query(q);
+    res.json({ names: r.rows.map(row => row.name) });
+  } catch (err) {
+    console.error('fylke-list failed', err && err.message);
+    res.status(500).json({ error: err.message || 'Database error' });
+  }
+});
+
+// Discover candidate tables for fylke configuration
+app.get('/analysis/fylke-discover', async (req, res) => {
+  try {
+    const nameCols = await pool.query(
+      `SELECT table_schema, table_name, array_agg(column_name ORDER BY column_name) AS columns
+       FROM information_schema.columns
+       WHERE column_name ILIKE 'navn'
+       GROUP BY table_schema, table_name
+       ORDER BY table_schema, table_name`
+    );
+
+    const geomCols = await pool.query(
+      `SELECT table_schema, table_name, array_agg(column_name ORDER BY column_name) AS geom_columns
+       FROM information_schema.columns
+       WHERE udt_name IN ('geometry','geography')
+       GROUP BY table_schema, table_name
+       ORDER BY table_schema, table_name`
+    );
+
+    const nameSet = new Map();
+    nameCols.rows.forEach(r => { nameSet.set(`${r.table_schema}.${r.table_name}`, r.columns); });
+
+    const geomSet = new Map();
+    geomCols.rows.forEach(r => { geomSet.set(`${r.table_schema}.${r.table_name}`, r.geom_columns); });
+
+    const tablesWithBoth = [];
+    for (const [key, cols] of nameSet.entries()) {
+      if (geomSet.has(key)) {
+        tablesWithBoth.push({
+          table: key,
+          name_columns: cols,
+          geom_columns: geomSet.get(key),
+        });
+      }
+    }
+
+    res.json({
+      name_tables: nameCols.rows,
+      geom_tables: geomCols.rows,
+      tables_with_both: tablesWithBoth,
+    });
+  } catch (err) {
+    console.error('fylke-discover failed', err && err.message);
+    res.status(500).json({ error: err.message || 'Database error' });
+  }
+});
+
+// Outline a fylke as GeoJSON
+app.get('/analysis/fylke-outline', async (req, res) => {
+  const fylkeName = req.query.fylke_name;
+  if (!fylkeName) return res.status(400).json({ error: 'Missing fylke_name' });
+  const cfg = getFylkeConfig(req);
+  try {
+    const nameSchema = await resolveSchemaForTable(cfg.nameSchema, cfg.nameTable);
+    const geomSchema = await resolveSchemaForTable(cfg.geomSchema, cfg.geomTable);
+
+    await assertColumnExists(nameSchema, cfg.nameTable, cfg.nameColumn);
+    await assertColumnExists(geomSchema, cfg.geomTable, cfg.geomColumn);
+    const isSameTable = (geomSchema === nameSchema && cfg.geomTable === cfg.nameTable);
+    const useNameMatch = cfg.nameMatchMode && cfg.nameMatchMode !== 'join';
+    if (!isSameTable) {
+      if (useNameMatch) {
+        if (!cfg.geomNameColumn) throw new Error('Missing geom_name_col for name matching');
+        await assertColumnExists(geomSchema, cfg.geomTable, cfg.geomNameColumn);
+      } else {
+        await assertColumnExists(nameSchema, cfg.nameTable, cfg.joinColumn);
+        await assertColumnExists(geomSchema, cfg.geomTable, cfg.joinColumn);
+      }
+    }
+
+    const nameIdent = `${quoteIdent(nameSchema)}.${quoteIdent(cfg.nameTable)}`;
+    const geomIdent = `${quoteIdent(geomSchema)}.${quoteIdent(cfg.geomTable)}`;
+    const nameCol = `n.${quoteIdent(cfg.nameColumn)}`;
+    const geomCol = `g.${quoteIdent(cfg.geomColumn)}`;
+
+    let fromSql = `${nameIdent} n`;
+    if (!isSameTable) {
+      if (useNameMatch) {
+        const nameExpr = `LOWER(n.${quoteIdent(cfg.nameColumn)})`;
+        const geomNameExpr = `LOWER(g.${quoteIdent(cfg.geomNameColumn)})`;
+        const matchSql = (cfg.nameMatchMode === 'equals')
+          ? `${geomNameExpr} = ${nameExpr}`
+          : `${geomNameExpr} LIKE '%' || ${nameExpr} || '%'`;
+        fromSql = `${nameIdent} n JOIN ${geomIdent} g ON ${matchSql}`;
+      } else {
+        fromSql = `${nameIdent} n JOIN ${geomIdent} g ON n.${quoteIdent(cfg.joinColumn)} = g.${quoteIdent(cfg.joinColumn)}`;
+      }
+    }
+
+    const q = `
+      SELECT json_build_object(
+        'type', 'FeatureCollection',
+        'features', COALESCE(json_agg(
+          json_build_object(
+            'type', 'Feature',
+            'geometry', ST_AsGeoJSON(ST_Transform(${geomCol}, 4326))::json,
+            'properties', to_jsonb(n) - $2
+          )
+        ), '[]'::json)
+      ) AS geojson
+      FROM ${fromSql}
+      WHERE ${nameCol} = $1;
+    `;
+
+    const r = await pool.query(q, [fylkeName, cfg.geomColumn]);
+    res.json(r.rows[0].geojson);
+  } catch (err) {
+    console.error('fylke-outline failed', err && err.message);
+    res.status(500).json({ error: err.message || 'Database error' });
+  }
+});
+
+// Return brannstasjoner inside a fylke
+app.get('/analysis/brannstasjoner-in-fylke', async (req, res) => {
+  const fylkeName = req.query.fylke_name;
+  if (!fylkeName) return res.status(400).json({ error: 'Missing fylke_name' });
+  const fylkeCfg = getFylkeConfig(req);
+  const brannCfg = getBrannConfig(req);
+
+  try {
+    const nameSchema = await resolveSchemaForTable(fylkeCfg.nameSchema, fylkeCfg.nameTable);
+    const geomSchema = await resolveSchemaForTable(fylkeCfg.geomSchema, fylkeCfg.geomTable);
+    const brannSchema = await resolveSchemaForTable(brannCfg.brannSchema, brannCfg.brannTable);
+
+    await assertColumnExists(nameSchema, fylkeCfg.nameTable, fylkeCfg.nameColumn);
+    await assertColumnExists(geomSchema, fylkeCfg.geomTable, fylkeCfg.geomColumn);
+    const isSameTable = (geomSchema === nameSchema && fylkeCfg.geomTable === fylkeCfg.nameTable);
+    const useNameMatch = fylkeCfg.nameMatchMode && fylkeCfg.nameMatchMode !== 'join';
+    if (!isSameTable) {
+      if (useNameMatch) {
+        if (!fylkeCfg.geomNameColumn) throw new Error('Missing geom_name_col for name matching');
+        await assertColumnExists(geomSchema, fylkeCfg.geomTable, fylkeCfg.geomNameColumn);
+      } else {
+        await assertColumnExists(nameSchema, fylkeCfg.nameTable, fylkeCfg.joinColumn);
+        await assertColumnExists(geomSchema, fylkeCfg.geomTable, fylkeCfg.joinColumn);
+      }
+    }
+    await assertColumnExists(brannSchema, brannCfg.brannTable, brannCfg.brannGeomColumn);
+
+    const nameIdent = `${quoteIdent(nameSchema)}.${quoteIdent(fylkeCfg.nameTable)}`;
+    const geomIdent = `${quoteIdent(geomSchema)}.${quoteIdent(fylkeCfg.geomTable)}`;
+    const nameCol = `n.${quoteIdent(fylkeCfg.nameColumn)}`;
+    const geomCol = `g.${quoteIdent(fylkeCfg.geomColumn)}`;
+
+    let fromSql = `${nameIdent} n`;
+    if (!isSameTable) {
+      if (useNameMatch) {
+        const nameExpr = `LOWER(n.${quoteIdent(fylkeCfg.nameColumn)})`;
+        const geomNameExpr = `LOWER(g.${quoteIdent(fylkeCfg.geomNameColumn)})`;
+        const matchSql = (fylkeCfg.nameMatchMode === 'equals')
+          ? `${geomNameExpr} = ${nameExpr}`
+          : `${geomNameExpr} LIKE '%' || ${nameExpr} || '%'`;
+        fromSql = `${nameIdent} n JOIN ${geomIdent} g ON ${matchSql}`;
+      } else {
+        fromSql = `${nameIdent} n JOIN ${geomIdent} g ON n.${quoteIdent(fylkeCfg.joinColumn)} = g.${quoteIdent(fylkeCfg.joinColumn)}`;
+      }
+    }
+
+    const brannIdent = `${quoteIdent(brannSchema)}.${quoteIdent(brannCfg.brannTable)}`;
+    const brannGeom = `b.${quoteIdent(brannCfg.brannGeomColumn)}`;
+
+    const q = `
+      WITH fylke AS (
+        SELECT ${geomCol} AS geom
+        FROM ${fromSql}
+        WHERE ${nameCol} = $1
+      )
+      SELECT json_build_object(
+        'type', 'FeatureCollection',
+        'features', COALESCE(json_agg(
+          json_build_object(
+            'type', 'Feature',
+            'geometry', ST_AsGeoJSON(ST_Transform(${brannGeom}, 4326))::json,
+            'properties', to_jsonb(b) - $2
+          )
+        ), '[]'::json)
+      ) AS geojson
+      FROM ${brannIdent} b
+      WHERE EXISTS (
+        SELECT 1 FROM fylke f
+        WHERE ST_Within(ST_Transform(${brannGeom}, 4326), ST_Transform(f.geom, 4326))
+      );
+    `;
+
+    const r = await pool.query(q, [fylkeName, brannCfg.brannGeomColumn]);
+    res.json(r.rows[0].geojson);
+  } catch (err) {
+    console.error('brannstasjoner-in-fylke failed', err && err.message);
+    res.status(500).json({ error: err.message || 'Database error' });
+  }
+});
+
+//romlig SQL for å søke i database 
+app.get('/analysis/search', async (req, res) => {
+    const { table, field, value } = req.query;
+
+    try {
+        const query = `
+      SELECT *
+      FROM ${table}
+      WHERE ${field} ILIKE $1
+    `;
+
+        const result = await pool.query(query, [`%${value}%`]);
+        res.json(result.rows);
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Database error' });
+    }
+});
+
+
 const port = process.env.PORT || 3000;
 testDbConnection().then(() => {
   app.listen(port, () => {
     console.log('Backend listening on', port);
   });
 });
+
