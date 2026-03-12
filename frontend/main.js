@@ -63,9 +63,16 @@ map.on('load', () => {
     if (!feature) return;
 
     const layerId = feature.layer.id;
-    const table = layerId.replace(/^layer_/, '').replace(/_/g, '.');
+    // Layer IDs are URL-encoded (encodeURIComponent) and may also use underscores to represent dots.
+    let table = layerId.replace(/^layer_/, '');
+    try {
+      table = decodeURIComponent(table);
+    } catch (_err) {
+      // ignore decoding errors
+    }
+    table = table.replace(/_/g, '.');
 
-    const id = feature.properties?.id;
+    const id = feature.properties?.id ?? feature.id;
     if (!id) return;
 
     try {
@@ -86,7 +93,7 @@ map.on('load', () => {
         .addTo(map);
     } catch (error) {
       console.error('Error fetching feature data:', error);
-      const idVal = feature.properties?.objid ?? 'Ingen ID';
+      const idVal = id ?? feature.properties?.objid ?? 'Ingen ID';
       const plasser = feature.properties?.plasser ?? 'Ingen plasser';
       new maplibregl.Popup()
         .setLngLat(e.lngLat)

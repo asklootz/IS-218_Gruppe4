@@ -404,7 +404,8 @@ app.get('/feature/:table/:id', async (req, res) => {
     if (idCol) {
       whereClause = `${quoteIdent(idCol)} = $1`;
     } else {
-      whereClause = `ctid = $1`;
+      // ctid is returned from /spatial as text like "(1,39)", so compare as text
+      whereClause = `ctid::text = $1`;
     }
 
     const q = `SELECT *, ST_AsGeoJSON(ST_Transform(${geomIdent}, 4326))::json AS geometry_json FROM ${ident} WHERE ${whereClause} LIMIT 1`;
