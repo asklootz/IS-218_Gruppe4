@@ -62,27 +62,23 @@ map.on('load', () => {
     const feature = features.find(f => f.layer.id.startsWith('layer_'));
     if (!feature) return;
 
+    // Extract table name from layer id
     const layerId = feature.layer.id;
-    // Layer IDs are URL-encoded (encodeURIComponent) and may also use underscores to represent dots.
-    let table = layerId.replace(/^layer_/, '');
-    try {
-      table = decodeURIComponent(table);
-    } catch (_err) {
-      // ignore decoding errors
-    }
-    table = table.replace(/_/g, '.');
+    const table = layerId.replace(/^layer_/, '').replace(/_/g, '.');
 
-    const id = feature.properties?.id ?? feature.id;
+    // Fetch full feature data from backend using the table and ID
+    const id = feature.properties?.id;
     if (!id) return;
 
     try {
-      const response = await fetch(`${window.location.protocol}//${window.location.host}/feature/${encodeURIComponent(table)}/${encodeURIComponent(id)}`);
+      const response = await fetch(`${backendBase}feature/${encodeURIComponent(table)}/${encodeURIComponent(id)}`);
       if (!response.ok) throw new Error('Failed to fetch feature data');
       const fullFeature = await response.json();
 
+      // Build popup HTML from specific columns (adjust as needed; here showing all properties except geometry)
       let popupHTML = '<h3>Feature Details</h3>';
       for (const [key, value] of Object.entries(fullFeature.properties || {})) {
-        if (key !== 'geometry') {
+        if (key !== 'geometry') {  // Skip geometry if present
           popupHTML += `<p><strong>${key}:</strong> ${value ?? 'N/A'}</p>`;
         }
       }
@@ -93,12 +89,14 @@ map.on('load', () => {
         .addTo(map);
     } catch (error) {
       console.error('Error fetching feature data:', error);
-      const idVal = id ?? feature.properties?.objid ?? 'Ingen ID';
-      const plasser = feature.properties?.plasser ?? 'Ingen plasser';
+      // Fallback to basic popup if fetch fails
+      const id = feature.properties?.objid ?? "Ingen ID";
+      const plasser = feature.properties?.plasser ?? "Ingen plasser";
       new maplibregl.Popup()
         .setLngLat(e.lngLat)
-        .setHTML(`<h3>ID: ${idVal}</h3><br><h3>Plasser: ${plasser}</h3>`)
+        .setHTML(`<h3>ID: ${id}</h3><br><h3>Plasser: ${plasser}</h3>`)
         .addTo(map);
     }
   });
 });
+
