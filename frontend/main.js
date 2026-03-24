@@ -90,7 +90,8 @@ map.on('load', () => {
     } catch (error) {
       console.error('Error fetching feature data:', error);
       // Fallback to basic popup if fetch fails
-      const id = feature.properties?.objid ?? "Ingen ID";
+      const id = feature.properties?.ob
+      jid ?? "Ingen ID";
       const plasser = feature.properties?.plasser ?? "Ingen plasser";
       new maplibregl.Popup()
         .setLngLat(e.lngLat)
