@@ -1068,6 +1068,7 @@ map.on('load', () => {
         return;
       }
 
+      /*
       // Build popup with all nearby results
       let popupHTML = '<h3>Features within 5km</h3>';
       results.forEach(({ table, features }) => {
@@ -1092,11 +1093,12 @@ map.on('load', () => {
           popupHTML += `<p style="font-size:0.85rem;color:#666;">... and ${features.length - 5} more</p>`;
         }
       });
+      
 
       new maplibregl.Popup()
         .setLngLat(e.lngLat)
         .setHTML(popupHTML)
-        .addTo(map);
+        .addTo(map); */
     } catch (error) {
       console.error('Error fetching nearby features:', error);
       new maplibregl.Popup()
@@ -1106,4 +1108,3 @@ map.on('load', () => {
     }
   });
 });
-
