@@ -257,6 +257,26 @@ const map = new maplibregl.Map({
   zoom: 10,
 });
 
+// Henter koordinater fra brukerens klikk på kartet, 
+// og sender en forespørsel til backend for å finne objekter innen 1000 meter.
+map.on('click', function (e) {
+
+    const lon = e.lngLat.lng;
+    const lat = e.lngLat.lat;
+
+    fetch(`/analysis/near?lon=${lon}&lat=${lat}&distance=1000`)
+        .then(res => res.json())
+        .then(data => {
+
+            data.forEach(p => {
+                new maplibregl.Marker()
+                    .setLngLat([p.lon, p.lat])
+                    .addTo(map);
+            });
+
+        });
+});
+
 // available tables/geomTables stored for global actions
 let availableTables = []; // array of { schema, table, geom_columns, rows }
 
