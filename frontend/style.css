@@ -70,7 +70,7 @@ body, html, #map {
 	display: flex;
 	flex-direction: column;
 	gap: 18px;
-
+}
 
 .sidebar-group {
 	display: flex;
