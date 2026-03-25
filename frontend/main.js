@@ -1068,7 +1068,7 @@ map.on('load', () => {
         return;
       }
 
-      /*
+      
       // Build popup with all nearby results
       let popupHTML = '<h3>Features within 5km</h3>';
       results.forEach(({ table, features }) => {
@@ -1098,7 +1098,7 @@ map.on('load', () => {
       new maplibregl.Popup()
         .setLngLat(e.lngLat)
         .setHTML(popupHTML)
-        .addTo(map); */
+        .addTo(map); 
     } catch (error) {
       console.error('Error fetching nearby features:', error);
       new maplibregl.Popup()
