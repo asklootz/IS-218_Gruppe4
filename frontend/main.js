@@ -777,68 +777,78 @@ document.addEventListener('DOMContentLoaded', () => {
 
 async function addLayerToMap(name) {
   try {
-    const tbl = tablesByName.get(name);
-    if (!tbl) throw new Error('Table not found: ' + name);
-    const rows = tbl.rows || [];
-    const features = [];
-    for (const r of rows) {
-      let geom = null;
-      let geomKey = null;
-      for (const k of Object.keys(r)) {
-        if (k === 'id') continue;
-        let val = r[k];
-        if (typeof val === 'string') {
-          try { val = JSON.parse(val); } catch (e) { }
-        }
-        if (val && typeof val === 'object' && typeof val.type === 'string') {
-          geom = val;
-          geomKey = k;
-          break;
-        }
-      }
-      if (!geom) continue;
-      const props = Object.assign({}, r);
-      delete props[geomKey];
-      const feature = { type: 'Feature', id: r.id ? String(r.id) : undefined, geometry: geom, properties: props };
-      features.push(feature);
-    }
-
-    if (features.length === 0) throw new Error('No geometry rows for table: ' + name);
-
-    const geojson = { type: 'FeatureCollection', features };
     const idSafe = encodeURIComponent(name);
     const srcId = `src_${idSafe}`;
-    if (map.getSource(srcId)) return;
-    map.addSource(srcId, { type: 'geojson', data: geojson });
+    const layerId = `layer_${idSafe}`;
 
+    if (map.getSource(srcId)) return;
+
+    // Dynamic query from backend using current map bounds
+    const bounds = map.getBounds();
+    const params = new URLSearchParams({
+      minx: bounds.getWest(),
+      miny: bounds.getSouth(),
+      maxx: bounds.getEast(),
+      maxy: bounds.getNorth(),
+      limit: 5000,
+    });
+
+    const endpoint = `${backendBase}layers/${encodeURIComponent(name)}?${params.toString()}`;
+    const response = await fetch(endpoint);
+    if (!response.ok) throw new Error(`Failed to load ${name}: ${response.statusText}`);
+
+    const geojson = await response.json();
+    let features = Array.isArray(geojson.features) ? geojson.features : [];
+
+    // Fallback using the cached rows from /spatial (old behavior) when the dynamic query returns nothing
+    if (!features.length) {
+      const tbl = tablesByName.get(name);
+      if (tbl) {
+        features = [];
+        const rows = tbl.rows || [];
+        for (const r of rows) { 
+          let geom = null;
+          let geomKey = null;
+          for (const k of Object.keys(r)) {
+            if (k === 'id') continue;
+            let val = r[k];
+            if (typeof val === 'string') {
+              try { val = JSON.parse(val); } catch (e) { }
+            }
+            if (val && typeof val === 'object' && typeof val.type === 'string') {
+              geom = val;
+              geomKey = k;
+              break;
+            }
+          }
+          if (!geom) continue;
+          const props = Object.assign({}, r);
+          delete props[geomKey];
+          features.push({ type: 'Feature', id: r.id ? String(r.id) : undefined, geometry: geom, properties: props });
+        }
+      }
+    }
+
+    if (!features.length) throw new Error('No geometry rows for table: ' + name);
+
+    const data = { type: 'FeatureCollection', features };
+
+    map.addSource(srcId, { type: 'geojson', data });
+
+    let layer;
     const geomType = (features[0].geometry && features[0].geometry.type) || 'Point';
-    let layer = null;
     if (geomType === 'Point' || geomType === 'MultiPoint') {
-      layer = {
-        id: `layer_${idSafe}`,
-        type: 'circle',
-        source: srcId,
-        paint: { 'circle-radius': 6, 'circle-color': '#007cbf' },
-      };
+      layer = { id: layerId, type: 'circle', source: srcId, paint: { 'circle-radius': 6, 'circle-color': '#007cbf' } };
     } else if (geomType === 'LineString' || geomType === 'MultiLineString') {
-      layer = {
-        id: `layer_${idSafe}`,
-        type: 'line',
-        source: srcId,
-        paint: { 'line-color': '#ff6600', 'line-width': 2 },
-      };
+      layer = { id: layerId, type: 'line', source: srcId, paint: { 'line-color': '#ff6600', 'line-width': 2 } };
     } else {
-      layer = {
-        id: `layer_${idSafe}`,
-        type: 'fill',
-        source: srcId,
-        paint: { 'fill-color': '#00aa55', 'fill-opacity': 0.4 },
-      };
+      layer = { id: layerId, type: 'fill', source: srcId, paint: { 'fill-color': '#00aa55', 'fill-opacity': 0.4 } };
     }
     map.addLayer(layer);
+
     let bbox = null;
     try {
-      if (typeof turf !== 'undefined' && turf && typeof turf.bbox === 'function') bbox = turf.bbox(geojson);
+      if (typeof turf !== 'undefined' && turf && typeof turf.bbox === 'function') bbox = turf.bbox(data);
     } catch (e) {
       console.warn('turf.bbox failed', e && e.message);
     }
@@ -950,45 +960,128 @@ setInterval(() => {
 
 map.on('load', () => {
   map.on('click', async (e) => {
-    const features = map.queryRenderedFeatures(e.point);
-    if (!features.length) return;
-
-    const feature = features.find(f => f.layer.id.startsWith('layer_'));
-    if (!feature) return;
-
-    // Extract table name from layer id
-    const layerId = feature.layer.id;
-    const table = layerId.replace(/^layer_/, '').replace(/_/g, '.');
-
-    // Fetch full feature data from backend using the table and ID
-    const id = feature.properties?.id;
-    if (!id) return;
-
+    const { lng: lon, lat } = e.lngLat;
+    const radiusMeters = 5000; // 5km radius for proximity search
+    
     try {
-      const response = await fetch(`${backendBase}feature/${encodeURIComponent(table)}/${encodeURIComponent(id)}`);
-      if (!response.ok) throw new Error('Failed to fetch feature data');
-      const fullFeature = await response.json();
-
-      // Build popup HTML from specific columns (adjust as needed; here showing all properties except geometry)
-      let popupHTML = '<h3>Feature Details</h3>';
-      for (const [key, value] of Object.entries(fullFeature.properties || {})) {
-        if (key !== 'geometry') {  // Skip geometry if present
-          popupHTML += `<p><strong>${key}:</strong> ${value ?? 'N/A'}</p>`;
+      // Get all active layers (checked in the sidebar)
+      const activeCheckboxes = document.querySelectorAll('#layers input[type=checkbox]:checked');
+      const activeTables = [];
+      activeCheckboxes.forEach(cb => {
+        const match = cb.id.match(/^chk_(.+)$/);
+        if (match) {
+          activeTables.push(decodeURIComponent(match[1]));
         }
+      });
+
+      if (activeTables.length === 0) {
+        // Query rendered features on map (existing behavior)
+        const features = map.queryRenderedFeatures(e.point);
+        if (!features.length) return;
+
+        const feature = features.find(f => f.layer.id.startsWith('layer_'));
+        if (!feature) return;
+
+        const layerId = feature.layer.id;
+        const table = layerId.replace(/^layer_/, '').replace(/_/g, '.');
+
+        const id = feature.properties?.id;
+        if (!id) return;
+
+        try {
+          const response = await fetch(`${backendBase}feature/${encodeURIComponent(table)}/${encodeURIComponent(id)}`);
+          if (!response.ok) throw new Error('Failed to fetch feature data');
+          const fullFeature = await response.json();
+
+          let popupHTML = '<h3>Feature Details</h3>';
+          for (const [key, value] of Object.entries(fullFeature.properties || {})) {
+            if (key !== 'geometry') {
+              popupHTML += `<p><strong>${key}:</strong> ${value ?? 'N/A'}</p>`;
+            }
+          }
+
+          new maplibregl.Popup()
+            .setLngLat(e.lngLat)
+            .setHTML(popupHTML)
+            .addTo(map);
+        } catch (error) {
+          console.error('Error fetching feature data:', error);
+          const id = feature.properties?.objid ?? "Ingen ID";
+          const plasser = feature.properties?.plasser ?? "Ingen plasser";
+          new maplibregl.Popup()
+            .setLngLat(e.lngLat)
+            .setHTML(`<h3>ID: ${id}</h3><br><h3>Plasser: ${plasser}</h3>`)
+            .addTo(map);
+        }
+        return;
       }
+
+      // Query all active layers for nearby features
+      const results = [];
+      await Promise.all(activeTables.map(async (tableName) => {
+        try {
+          const params = new URLSearchParams({
+            lon,
+            lat,
+            radius: radiusMeters,
+            limit: 50,
+          });
+          const url = `${backendBase}layers/${encodeURIComponent(tableName)}?${params.toString()}`;
+          const response = await fetch(url);
+          if (!response.ok) return;
+          
+          const geojson = await response.json();
+          const features = Array.isArray(geojson.features) ? geojson.features : [];
+          if (features.length > 0) {
+            results.push({ table: tableName, features });
+          }
+        } catch (err) {
+          console.warn(`Failed to query ${tableName}:`, err);
+        }
+      }));
+
+      if (results.length === 0) {
+        new maplibregl.Popup()
+          .setLngLat(e.lngLat)
+          .setHTML('<h3>No features found nearby</h3>')
+          .addTo(map);
+        return;
+      }
+
+      // Build popup with all nearby results
+      let popupHTML = '<h3>Features within 5km</h3>';
+      results.forEach(({ table, features }) => {
+        popupHTML += `<hr><strong style="color:#0066cc;">${table}</strong> (${features.length})`;
+        features.slice(0, 5).forEach((f, idx) => {
+          popupHTML += `<div style="font-size:0.85rem;margin:4px 0;padding:4px;background:#f5f5f5;border-radius:2px;">`;
+          if (f.properties.id) popupHTML += `<strong>ID:</strong> ${f.properties.id}<br>`;
+          if (f.properties.navn) popupHTML += `<strong>Navn:</strong> ${f.properties.navn}<br>`;
+          if (f.properties.plasser) popupHTML += `<strong>Plasser:</strong> ${f.properties.plasser}<br>`;
+          // Show first 2 other properties
+          let propCount = 0;
+          for (const [key, val] of Object.entries(f.properties)) {
+            if (propCount >= 2) break;
+            if (!['id', 'navn', 'plasser'].includes(key)) {
+              popupHTML += `<strong>${key}:</strong> ${val ?? 'N/A'}<br>`;
+              propCount++;
+            }
+          }
+          popupHTML += '</div>';
+        });
+        if (features.length > 5) {
+          popupHTML += `<p style="font-size:0.85rem;color:#666;">... and ${features.length - 5} more</p>`;
+        }
+      });
 
       new maplibregl.Popup()
         .setLngLat(e.lngLat)
         .setHTML(popupHTML)
         .addTo(map);
     } catch (error) {
-      console.error('Error fetching feature data:', error);
-      // Fallback to basic popup if fetch fails
-      const id = feature.properties?.objid ?? "Ingen ID";
-      const plasser = feature.properties?.plasser ?? "Ingen plasser";
+      console.error('Error fetching nearby features:', error);
       new maplibregl.Popup()
         .setLngLat(e.lngLat)
-        .setHTML(`<h3>ID: ${id}</h3><br><h3>Plasser: ${plasser}</h3>`)
+        .setHTML('<h3>Error loading nearby data</h3>')
         .addTo(map);
     }
   });

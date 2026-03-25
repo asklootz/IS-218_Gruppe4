@@ -92,6 +92,23 @@ async function getFirstGeomColumn(schema, table) {
   return r.rowCount > 0 ? r.rows[0].f_geometry_column : null;
 }
 
+async function getGeomColumn(schema, table) {
+  // Dynamisk SQL for geometri
+  const fromGeom = await pool.query(
+    `SELECT f_geometry_column as geom_col FROM public.geometry_columns WHERE f_table_schema = $1 AND f_table_name = $2 LIMIT 1`,
+    [schema, table]
+  );
+  if (fromGeom.rowCount > 0) return fromGeom.rows[0].geom_col;
+
+  const fromCols = await pool.query(
+    `SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND udt_name = 'geometry' LIMIT 1`,
+    [schema, table]
+  );
+  if (fromCols.rowCount > 0) return fromCols.rows[0].column_name;
+
+  throw new Error(`Geometry column not found for ${schema}.${table}`);
+}
+
 app.get('/layers', async (req, res) => {
   try {
     // Try geometry_columns first
@@ -115,7 +132,6 @@ app.get('/layers/:name', async (req, res) => {
   const name = req.params.name;
 
   try {
-
     // Support schema-qualified names like schema.table
     let schema = 'public';
     let table = name;
@@ -126,32 +142,68 @@ app.get('/layers/:name', async (req, res) => {
       table = parts[1];
     }
 
-    // Bygg SQL (GeoJSON)
+    const geomCol = await getGeomColumn(schema, table);
+    const useBbox = ['minx', 'miny', 'maxx', 'maxy'].every(p => req.query[p] !== undefined);
+    const usePoint = req.query.lon !== undefined && req.query.lat !== undefined && req.query.radius !== undefined;
+
+    const whereClauses = [];
+    const params = [];
+    
+    if (useBbox) {
+      const minx = Number(req.query.minx);
+      const miny = Number(req.query.miny);
+      const maxx = Number(req.query.maxx);
+      const maxy = Number(req.query.maxy);
+      if ([minx, miny, maxx, maxy].some(v => Number.isNaN(v))) {
+        return res.status(400).json({ error: 'Invalid bbox parameters' });
+      }
+      whereClauses.push(`ST_Intersects(ST_Transform(${quoteIdent(geomCol)}, 4326), ST_MakeEnvelope($1, $2, $3, $4, 4326))`);
+      params.push(minx, miny, maxx, maxy);
+    } else if (usePoint) {
+      const lon = Number(req.query.lon);
+      const lat = Number(req.query.lat);
+      const radius = Number(req.query.radius);
+      if ([lon, lat, radius].some(v => Number.isNaN(v)) || radius <= 0) {
+        return res.status(400).json({ error: 'Invalid point or radius parameters' });
+      }
+      // Use ST_DWithin with radius in meters (convert from degrees approximately)
+      whereClauses.push(`ST_DWithin(ST_Transform(${quoteIdent(geomCol)}, 4326)::geography, ST_Point($1, $2, 4326)::geography, $3)`);
+      params.push(lon, lat, radius);
+    }
+
+    const filterField = req.query.filter_field;
+    const filterValue = req.query.filter_value;
+
+    if (filterField && filterValue !== undefined) {
+      await assertColumnExists(schema, table, filterField);
+      whereClauses.push(`${quoteIdent(filterField)} = $${params.length + 1}`);
+      params.push(filterValue);
+    }
+
+    const limit = Number(req.query.limit) || 10000;
+    if (limit <= 0 || limit > 100000) {
+      return res.status(400).json({ error: 'limit must be between 1 and 100000' });
+    }
+
     const q = `
       SELECT json_build_object(
         'type', 'FeatureCollection',
-        'features', json_agg(
+        'features', COALESCE(json_agg(
           json_build_object(
             'type', 'Feature',
-            'geometry', ST_AsGeoJSON(geom)::json,
-            'properties', to_jsonb(row) - 'geom'
+            'geometry', ST_AsGeoJSON(ST_Transform(${quoteIdent(geomCol)}, 4326))::json,
+            'properties', to_jsonb(row) - '${geomCol.replace(/'/g, "''")}'
           )
-        )
+        ), '[]'::json)
       ) AS geojson
-      FROM ${schema}.${table} row;
+      FROM ${quoteIdent(schema)}.${quoteIdent(table)} row
+      ${whereClauses.length ? 'WHERE ' + whereClauses.join(' AND ') : ''}
+      LIMIT ${limit};
     `;
 
-    // Log SQL
     try {
-      console.log('[SQL] Executing for', `${schema}.${table}`);
-      console.log('[SQL] Query start:', q.slice(0, 500));
-    } catch (logErr) {
-      console.error('Failed to log SQL', logErr && logErr.message);
-    }
-
-    // Kjør SQL
-    try {
-      const result = await pool.query(q);
+      console.log('[SQL] /layers/' + name, 'bbox=', useBbox ? `${req.query.minx},${req.query.miny},${req.query.maxx},${req.query.maxy}` : 'none', 'filter=', filterField ? `${filterField}=${filterValue}` : 'none');
+      const result = await pool.query(q, params);
       res.json(result.rows[0].geojson);
     } catch (sqlErr) {
       console.error('[SQL ERROR]', sqlErr && sqlErr.stack);
