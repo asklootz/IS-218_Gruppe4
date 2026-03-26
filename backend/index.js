@@ -468,30 +468,42 @@ async function testDbConnection() {
   }
 }
 
-//Romlig SQL som viser objekter innen 1km
+/// 🔴 DYNAMISK SQL-SPØRRING:
+// Tar imot koordinater fra frontend (brukerklikk)
+// og bruker disse i en romlig spørring (ST_DWithin)
+// for å finne objekter innenfor en gitt avstand
 app.get('/analysis/near', async (req, res) => {
-    const { table, lon, lat, distance } = req.query;
+  const { lon, lat, distance } = req.query;
+  // Dynamiske parametere fra frontend (ikke hardkodet!)
 
-    try {
-        const query = `
+ // 🔴 DYNAMISK ROMLIG SQL (PostGIS):
+// Bruker koordinater fra frontend (brukerklikk) som input
+// - ST_MakePoint: lager punkt fra lon/lat
+// - ST_SetSRID: setter koordinatsystem (WGS84)
+// - ST_Transform: konverterer til samme SRID som data (25833)
+// - ST_DWithin: finner objekter innenfor gitt avstand (meter)
+  try {
+    const query = `
       SELECT *
-      FROM ${tilfluktsromoffentlige.tilfluktsrom}
+      FROM tilfluktsromoffentlige.tilfluktsrom
       WHERE ST_DWithin(
         posisjon,
         ST_Transform(
-        ST_SetSRID(ST_MakePoint(10.75, 59.91), 4326)::geography,
-        25833
-      ),
-      1000  
+          ST_SetSRID(ST_MakePoint($1, $2), 4326),
+          25833
+        ),
+        $3
+      )
     `;
 
-        const result = await pool.query(query, [lon, lat, distance]);
-        res.json(result.rows);
+    const result = await pool.query(query, [lon, lat, distance || 1000]);
 
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Database error' });
-    }
+    res.json(result.rows);
+
+  } catch (err) {
+    console.error("NEAR ERROR:", err);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 // Filter tilfluktsrom by minimum plasser and return GeoJSON

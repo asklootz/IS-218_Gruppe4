@@ -994,17 +994,17 @@ map.on('load', () => {
       .addTo(map);
 
     try {
-      const { data, error } = await supabase.rpc('get_nearby_shelters', {
-        lon: lng,
-        lat: lat,
-        dist: 1000
-      });
+      const res = await fetch(
+        `${backendBase}analysis/near?lon=${lng}&lat=${lat}&distance=1000`
+      );
 
-      console.log("DATA:", data, error);
+      const data = await res.json();
+
+      console.log("DATA:", data);
 
       if (data) {
         data.forEach(item => {
-          const coords = item.posisjon.coordinates;
+          const coords = item.geom.coordinates;
 
           new maplibregl.Marker()
             .setLngLat(coords)
@@ -1015,7 +1015,6 @@ map.on('load', () => {
     } catch (err) {
       console.error("Feil:", err);
     }
-
   });
 
 });
