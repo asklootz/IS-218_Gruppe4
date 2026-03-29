@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react'
 import maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import axios from 'axios'
+import proj4 from 'proj4'
 import { v4 as uuidv4 } from 'uuid'
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3000'
@@ -22,6 +23,86 @@ const OSM_RASTER_STYLE = {
       source: 'osm'
     }
   ]
+}
+
+proj4.defs('EPSG:25833', '+proj=utm +zone=33 +ellps=GRS80 +units=m +no_defs')
+
+function firstCoordinateFromGeometry(geometry) {
+  if (!geometry || !geometry.coordinates) return null
+  let coords = geometry.coordinates
+  while (Array.isArray(coords) && Array.isArray(coords[0])) {
+    coords = coords[0]
+  }
+  if (Array.isArray(coords) && coords.length >= 2 && Number.isFinite(Number(coords[0])) && Number.isFinite(Number(coords[1]))) {
+    return [Number(coords[0]), Number(coords[1])]
+  }
+  return null
+}
+
+function isProjectedBoundaryGeoJson(geojson) {
+  const crsName = String(geojson?.crs?.properties?.name || '').toUpperCase()
+  if (crsName.includes('25833')) return true
+
+  const feature = (geojson?.features || []).find((f) => firstCoordinateFromGeometry(f?.geometry))
+  const coord = firstCoordinateFromGeometry(feature?.geometry)
+  if (!coord) return false
+  const [x, y] = coord
+  return x < -180 || x > 180 || y < -90 || y > 90
+}
+
+function transformCoords25833To4326(coords) {
+  if (!Array.isArray(coords)) return coords
+  if (coords.length >= 2 && Number.isFinite(Number(coords[0])) && Number.isFinite(Number(coords[1]))) {
+    return proj4('EPSG:25833', 'EPSG:4326', [Number(coords[0]), Number(coords[1])])
+  }
+  return coords.map(transformCoords25833To4326)
+}
+
+function normalizeBoundaryGeoJson(rawGeojson) {
+  if (!rawGeojson || !Array.isArray(rawGeojson.features)) {
+    return { type: 'FeatureCollection', features: [] }
+  }
+  if (!isProjectedBoundaryGeoJson(rawGeojson)) return rawGeojson
+
+  return {
+    ...rawGeojson,
+    crs: undefined,
+    features: rawGeojson.features.map((feature) => ({
+      ...feature,
+      geometry: feature.geometry
+        ? {
+            ...feature.geometry,
+            coordinates: transformCoords25833To4326(feature.geometry.coordinates)
+          }
+        : feature.geometry
+    }))
+  }
+}
+
+function sheltersToFeatureCollection(shelters = []) {
+  return {
+    type: 'FeatureCollection',
+    features: shelters
+      .filter((s) => Number.isFinite(Number(s.lon)) && Number.isFinite(Number(s.lat)))
+      .map((s) => ({
+        type: 'Feature',
+        geometry: {
+          type: 'Point',
+          coordinates: [Number(s.lon), Number(s.lat)]
+        },
+        properties: {
+          id: s.id,
+          shelter_id: s.shelter_id,
+          name: s.name,
+          capacity: Number(s.capacity || 0),
+          enough_capacity: Boolean(s.enough_capacity),
+          cluster_population: Number(s.cluster_population || 0),
+          cluster_free_spaces: Number(s.cluster_free_spaces || 0),
+          missing_capacity: Number(s.missing_capacity || 0),
+          cluster_id: Number(s.cluster_id || 0)
+        }
+      }))
+  }
 }
 
 function pageFromPath(pathname) {
@@ -78,6 +159,8 @@ function App() {
 function AdminPage({ onBack }) {
   const mapContainer = useRef(null)
   const map = useRef(null)
+  const staticLayersLoaded = useRef(false)
+  const adminPopupBound = useRef(false)
   const [radius, setRadius] = useState(1000)
   const [coverage, setCoverage] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -99,23 +182,33 @@ function AdminPage({ onBack }) {
       zoom: 10
     })
 
-    map.current.on('load', () => {
-      loadData()
-    })
+    map.current.on('load', () => initializeAdminMap())
 
     return () => map.current?.remove()
   }, [])
 
-  const loadData = async () => {
-    setLoading(true)
-    try {
-      // Get coverage data
-      const covRes = await axios.get(`${API_BASE}/api/admin/coverage?radius=${radius}`)
-      setCoverage(covRes.data)
+  const applyAdminLayerVisibility = () => {
+    if (!map.current) return
+    const setVisibility = (layerId, visible) => {
+      if (map.current.getLayer(layerId)) {
+        map.current.setLayoutProperty(layerId, 'visibility', visible ? 'visible' : 'none')
+      }
+    }
+    setVisibility('shelters-layer', visibleLayers.shelters)
+    setVisibility('population-layer', visibleLayers.population)
+    setVisibility('counties-fill', visibleLayers.counties)
+    setVisibility('counties-line', visibleLayers.counties)
+    setVisibility('municipalities-line', visibleLayers.municipalities)
+    setVisibility('radius-fill', visibleLayers.radius)
+    setVisibility('radius-line', visibleLayers.radius)
+  }
 
-      // Load shelters layer
+  const loadStaticLayers = async () => {
+    if (!map.current || staticLayersLoaded.current) return
+
+    try {
       const sheltersRes = await axios.get(`${API_BASE}/api/layers/shelters`)
-      if (map.current && sheltersRes.data.features) {
+      if (sheltersRes.data.features) {
         if (!map.current.getSource('shelters')) {
           map.current.addSource('shelters', { type: 'geojson', data: sheltersRes.data })
           map.current.addLayer({
@@ -124,7 +217,12 @@ function AdminPage({ onBack }) {
             source: 'shelters',
             paint: {
               'circle-radius': 6,
-              'circle-color': '#22c55e',
+              'circle-color': [
+                'case',
+                ['==', ['get', 'enough_capacity'], true],
+                '#22c55e',
+                '#ef4444'
+              ],
               'circle-stroke-width': 2,
               'circle-stroke-color': '#fff'
             }
@@ -134,9 +232,8 @@ function AdminPage({ onBack }) {
         }
       }
 
-      // Load population layer
       const popRes = await axios.get(`${API_BASE}/api/layers/population`)
-      if (map.current && popRes.data.features) {
+      if (popRes.data.features) {
         if (!map.current.getSource('population')) {
           map.current.addSource('population', { type: 'geojson', data: popRes.data })
           map.current.addLayer({
@@ -153,9 +250,10 @@ function AdminPage({ onBack }) {
       }
 
       const countiesRes = await axios.get(`${API_BASE}/api/layers/counties`)
-      if (map.current && countiesRes.data.features) {
+      const countiesData = normalizeBoundaryGeoJson(countiesRes.data)
+      if (countiesData.features) {
         if (!map.current.getSource('counties')) {
-          map.current.addSource('counties', { type: 'geojson', data: countiesRes.data })
+          map.current.addSource('counties', { type: 'geojson', data: countiesData })
           map.current.addLayer({
             id: 'counties-fill',
             type: 'fill',
@@ -175,14 +273,15 @@ function AdminPage({ onBack }) {
             }
           })
         } else {
-          map.current.getSource('counties').setData(countiesRes.data)
+          map.current.getSource('counties').setData(countiesData)
         }
       }
 
       const municipalitiesRes = await axios.get(`${API_BASE}/api/layers/municipalities`)
-      if (map.current && municipalitiesRes.data.features) {
+      const municipalitiesData = normalizeBoundaryGeoJson(municipalitiesRes.data)
+      if (municipalitiesData.features) {
         if (!map.current.getSource('municipalities')) {
-          map.current.addSource('municipalities', { type: 'geojson', data: municipalitiesRes.data })
+          map.current.addSource('municipalities', { type: 'geojson', data: municipalitiesData })
           map.current.addLayer({
             id: 'municipalities-line',
             type: 'line',
@@ -194,31 +293,107 @@ function AdminPage({ onBack }) {
             }
           })
         } else {
-          map.current.getSource('municipalities').setData(municipalitiesRes.data)
+          map.current.getSource('municipalities').setData(municipalitiesData)
         }
       }
 
-      const setVisibility = (layerId, visible) => {
-        if (map.current.getLayer(layerId)) {
-          map.current.setLayoutProperty(layerId, 'visibility', visible ? 'visible' : 'none')
-        }
-      }
-      setVisibility('shelters-layer', visibleLayers.shelters)
-      setVisibility('population-layer', visibleLayers.population)
-      setVisibility('counties-fill', visibleLayers.counties)
-      setVisibility('counties-line', visibleLayers.counties)
-      setVisibility('municipalities-line', visibleLayers.municipalities)
+      staticLayersLoaded.current = true
     } catch (error) {
-      console.error('Error loading data:', error)
+      console.error('Error loading static layers:', error)
+    }
+  }
+
+  const loadCoverageAndRadius = async (nextRadius) => {
+    if (!map.current) return
+    setLoading(true)
+    try {
+      const [covRes, radiusRes] = await Promise.all([
+        axios.get(`${API_BASE}/api/admin/coverage?radius=${nextRadius}`),
+        axios.get(`${API_BASE}/api/admin/radius-layer?radius=${nextRadius}`)
+      ])
+
+      setCoverage(covRes.data)
+
+      const shelterFc = sheltersToFeatureCollection(covRes.data?.shelters || [])
+      if (map.current.getSource('shelters')) {
+        map.current.getSource('shelters').setData(shelterFc)
+      }
+
+      if (!map.current.getSource('radius-buffers')) {
+        map.current.addSource('radius-buffers', { type: 'geojson', data: radiusRes.data })
+        map.current.addLayer({
+          id: 'radius-fill',
+          type: 'fill',
+          source: 'radius-buffers',
+          paint: {
+            'fill-color': '#f59e0b',
+            'fill-opacity': 0.12
+          }
+        })
+        map.current.addLayer({
+          id: 'radius-line',
+          type: 'line',
+          source: 'radius-buffers',
+          paint: {
+            'line-color': '#f59e0b',
+            'line-width': 1,
+            'line-opacity': 0.7
+          }
+        })
+      } else {
+        map.current.getSource('radius-buffers').setData(radiusRes.data)
+      }
+
+      applyAdminLayerVisibility()
+    } catch (error) {
+      console.error('Error loading coverage/radius:', error)
     }
     setLoading(false)
   }
 
+  const initializeAdminMap = async () => {
+    await loadStaticLayers()
+    await loadCoverageAndRadius(radius)
+
+    if (!adminPopupBound.current && map.current) {
+      map.current.on('click', 'shelters-layer', (e) => {
+        const f = e.features?.[0]
+        if (!f) return
+        const p = f.properties || {}
+        const html = `
+          <div style="font-size:12px;line-height:1.4;">
+            <strong>${p.name || 'Tilfluktsrom'}</strong><br/>
+            Kapasitet: ${p.capacity ?? 0}<br/>
+            Område: #${p.cluster_id ?? '-'}<br/>
+            Befolkning i område: ${p.cluster_population ?? 0}<br/>
+            Ledige plasser i område: ${p.cluster_free_spaces ?? 0}<br/>
+            Manglende kapasitet: ${p.missing_capacity ?? 0}
+          </div>
+        `
+        new maplibregl.Popup({ closeButton: true })
+          .setLngLat(e.lngLat)
+          .setHTML(html)
+          .addTo(map.current)
+      })
+      map.current.on('mouseenter', 'shelters-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+      map.current.on('mouseleave', 'shelters-layer', () => { map.current.getCanvas().style.cursor = '' })
+      adminPopupBound.current = true
+    }
+
+    applyAdminLayerVisibility()
+  }
+
   useEffect(() => {
     if (map.current?.isStyleLoaded()) {
-      loadData()
+      loadCoverageAndRadius(radius)
     }
-  }, [radius, visibleLayers])
+  }, [radius])
+
+  useEffect(() => {
+    if (map.current?.isStyleLoaded()) {
+      applyAdminLayerVisibility()
+    }
+  }, [visibleLayers])
 
   const handleExportCSV = async () => {
     try {
@@ -270,16 +445,16 @@ function AdminPage({ onBack }) {
                   <div className="stat-label">Samlet tilfluktsrom</div>
                 </div>
                 <div className="stat-card">
+                  <div className="stat-value">{coverage.summary.total_clusters}</div>
+                  <div className="stat-label">Sammenslåtte radiusområder</div>
+                </div>
+                <div className="stat-card">
                   <div className="stat-value">{coverage.summary.total_population_within_radius}</div>
-                  <div className="stat-label">Befolkning i radius</div>
+                  <div className="stat-label">Befolkning i samlet radius</div>
                 </div>
                 <div className="stat-card">
                   <div className="stat-value">{coverage.summary.total_capacity}</div>
                   <div className="stat-label">Total kapasitet</div>
-                </div>
-                <div className="stat-card">
-                  <div className="stat-value">{coverage.summary.adequate_shelters}</div>
-                  <div className="stat-label">Tilstrekkelig dekning</div>
                 </div>
               </div>
             </div>
@@ -292,7 +467,8 @@ function AdminPage({ onBack }) {
                     <tr>
                       <th>Navn</th>
                       <th>Kapasitet</th>
-                      <th>Befolkning</th>
+                      <th>Befolkning (område)</th>
+                      <th>Område</th>
                       <th>Status</th>
                       <th>Mangler</th>
                     </tr>
@@ -302,7 +478,8 @@ function AdminPage({ onBack }) {
                       <tr key={i} className={s.enough_capacity ? 'adequate' : 'inadequate'}>
                         <td>{s.name}</td>
                         <td>{s.capacity}</td>
-                        <td>{s.population_sum}</td>
+                        <td>{s.cluster_population}</td>
+                        <td>#{s.cluster_id}</td>
                         <td>{s.enough_capacity ? '✓' : '✗'}</td>
                         <td>{s.missing_capacity}</td>
                       </tr>
@@ -347,6 +524,14 @@ function AdminPage({ onBack }) {
           <label className="checkbox-label">
             <input
               type="checkbox"
+              checked={visibleLayers.radius}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, radius: e.target.checked })}
+            />
+            Radius per tilfluktsrom
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
               checked={visibleLayers.counties}
               onChange={(e) => setVisibleLayers({ ...visibleLayers, counties: e.target.checked })}
             />
@@ -371,11 +556,13 @@ function AdminPage({ onBack }) {
 function UserPage({ userId, onBack }) {
   const mapContainer = useRef(null)
   const map = useRef(null)
+  const userPopupBound = useRef(false)
   const [userLocation, setUserLocation] = useState(null)
   const [following, setFollowing] = useState(false)
   const [routeMode, setRouteMode] = useState('walk')
   const [routeStrategy, setRouteStrategy] = useState('nearest')
   const [routes, setRoutes] = useState(null)
+  const [activeRoute, setActiveRoute] = useState(null)
   const [tracking, setTracking] = useState(false)
   const [visibleLayers, setVisibleLayers] = useState({
     shelters: true,
@@ -405,21 +592,53 @@ function UserPage({ userId, onBack }) {
 
   const loadShelters = async () => {
     try {
-      const res = await axios.get(`${API_BASE}/api/layers/shelters`)
-      if (map.current && res.data.features) {
+      const res = await axios.get(`${API_BASE}/api/admin/coverage?radius=1000`)
+      const shelterFc = sheltersToFeatureCollection(res.data?.shelters || [])
+      if (map.current && shelterFc.features.length > 0) {
         if (!map.current.getSource('shelters')) {
-          map.current.addSource('shelters', { type: 'geojson', data: res.data })
+          map.current.addSource('shelters', { type: 'geojson', data: shelterFc })
           map.current.addLayer({
             id: 'shelters-layer',
             type: 'circle',
             source: 'shelters',
             paint: {
               'circle-radius': 8,
-              'circle-color': '#ef4444',
+              'circle-color': [
+                'case',
+                ['==', ['get', 'enough_capacity'], true],
+                '#22c55e',
+                '#ef4444'
+              ],
               'circle-stroke-width': 2,
               'circle-stroke-color': '#fff'
             }
           })
+        } else {
+          map.current.getSource('shelters').setData(shelterFc)
+        }
+
+        if (!userPopupBound.current) {
+          map.current.on('click', 'shelters-layer', (e) => {
+            const f = e.features?.[0]
+            if (!f) return
+            const p = f.properties || {}
+            const html = `
+              <div style="font-size:12px;line-height:1.4;">
+                <strong>${p.name || 'Tilfluktsrom'}</strong><br/>
+                Kapasitet: ${p.capacity ?? 0}<br/>
+                Befolkning i område: ${p.cluster_population ?? 0}<br/>
+                Ledige plasser i område: ${p.cluster_free_spaces ?? 0}<br/>
+                Status: ${(p.enough_capacity === true || p.enough_capacity === 'true') ? 'Nok plass' : 'Ikke nok plass'}
+              </div>
+            `
+            new maplibregl.Popup({ closeButton: true })
+              .setLngLat(e.lngLat)
+              .setHTML(html)
+              .addTo(map.current)
+          })
+          map.current.on('mouseenter', 'shelters-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+          map.current.on('mouseleave', 'shelters-layer', () => { map.current.getCanvas().style.cursor = '' })
+          userPopupBound.current = true
         }
       }
     } catch (error) {
@@ -430,8 +649,9 @@ function UserPage({ userId, onBack }) {
   const loadUserLayers = async () => {
     try {
       const countiesRes = await axios.get(`${API_BASE}/api/layers/counties`)
-      if (map.current && countiesRes.data.features && !map.current.getSource('counties-user')) {
-        map.current.addSource('counties-user', { type: 'geojson', data: countiesRes.data })
+      const countiesData = normalizeBoundaryGeoJson(countiesRes.data)
+      if (map.current && countiesData.features && !map.current.getSource('counties-user')) {
+        map.current.addSource('counties-user', { type: 'geojson', data: countiesData })
         map.current.addLayer({
           id: 'counties-user-line',
           type: 'line',
@@ -441,8 +661,9 @@ function UserPage({ userId, onBack }) {
       }
 
       const municipalitiesRes = await axios.get(`${API_BASE}/api/layers/municipalities`)
-      if (map.current && municipalitiesRes.data.features && !map.current.getSource('municipalities-user')) {
-        map.current.addSource('municipalities-user', { type: 'geojson', data: municipalitiesRes.data })
+      const municipalitiesData = normalizeBoundaryGeoJson(municipalitiesRes.data)
+      if (map.current && municipalitiesData.features && !map.current.getSource('municipalities-user')) {
+        map.current.addSource('municipalities-user', { type: 'geojson', data: municipalitiesData })
         map.current.addLayer({
           id: 'municipalities-user-line',
           type: 'line',
@@ -465,6 +686,7 @@ function UserPage({ userId, onBack }) {
     setVisibility('shelters-layer', visibleLayers.shelters)
     setVisibility('counties-user-line', visibleLayers.counties)
     setVisibility('municipalities-user-line', visibleLayers.municipalities)
+    setVisibility('osm-base', visibleLayers.roads)
   }, [visibleLayers])
 
   const startTracking = () => {
@@ -480,14 +702,39 @@ function UserPage({ userId, onBack }) {
         const { latitude: lat, longitude: lon } = position.coords
         setUserLocation({ lat, lon })
 
+        const userFeature = {
+          type: 'FeatureCollection',
+          features: [{
+            type: 'Feature',
+            geometry: { type: 'Point', coordinates: [lon, lat] },
+            properties: { label: 'Du er her' }
+          }]
+        }
+
+        if (map.current) {
+          if (!map.current.getSource('user-location')) {
+            map.current.addSource('user-location', { type: 'geojson', data: userFeature })
+            map.current.addLayer({
+              id: 'user-location-dot',
+              type: 'circle',
+              source: 'user-location',
+              paint: {
+                'circle-radius': 6,
+                'circle-color': '#0ea5e9',
+                'circle-stroke-color': '#ffffff',
+                'circle-stroke-width': 2
+              }
+            })
+          } else {
+            map.current.getSource('user-location').setData(userFeature)
+          }
+        }
+
         if (map.current && following) {
           map.current.flyTo({ center: [lon, lat], zoom: 14 })
         }
 
-        // Update user location in backend
-        if (tracking) {
-          axios.post(`${API_BASE}/api/users/${userId}/location`, { lon, lat }).catch(() => {})
-        }
+        axios.post(`${API_BASE}/api/users/${userId}/location`, { lon, lat }).catch(() => {})
       },
       (error) => console.error('Geolocation error:', error),
       { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
@@ -509,42 +756,55 @@ function UserPage({ userId, onBack }) {
           strategy: routeStrategy
         }
       })
-      
+
       setRoutes(res.data.shelters)
 
-      // Draw route lines on map
       if (map.current && res.data.shelters.length > 0) {
-        const shelf = res.data.shelters[0]
-        const coordinates = [
-          [userLocation.lon, userLocation.lat],
-          [shelf.lon, shelf.lat]
-        ]
-
-        if (map.current.getSource('route-line')) {
-          map.current.removeLayer('route-layer')
-          map.current.removeSource('route-line')
-        }
-
-        map.current.addSource('route-line', {
-          type: 'geojson',
-          data: {
-            type: 'Feature',
-            geometry: {
-              type: 'LineString',
-              coordinates
-            }
+        const shelter = res.data.shelters[0]
+        const routeRes = await axios.get(`${API_BASE}/api/routing/route`, {
+          params: {
+            originLon: userLocation.lon,
+            originLat: userLocation.lat,
+            destLon: shelter.lon,
+            destLat: shelter.lat,
+            mode: routeMode
           }
         })
 
-        map.current.addLayer({
-          id: 'route-layer',
-          type: 'line',
-          source: 'route-line',
-          paint: {
-            'line-color': '#3b82f6',
-            'line-width': 3,
-            'line-dasharray': [5, 5]
+        const routeFeature = {
+          type: 'Feature',
+          geometry: routeRes.data.geometry,
+          properties: {
+            source: routeRes.data.source
           }
+        }
+
+        if (map.current.getSource('route-line')) {
+          map.current.getSource('route-line').setData(routeFeature)
+        } else {
+          map.current.addSource('route-line', {
+            type: 'geojson',
+            data: routeFeature
+          })
+
+          map.current.addLayer({
+            id: 'route-layer',
+            type: 'line',
+            source: 'route-line',
+            paint: {
+              'line-color': '#3b82f6',
+              'line-width': 4,
+              'line-opacity': 0.9
+            }
+          })
+        }
+
+        setActiveRoute({
+          shelter,
+          distanceKm: (Number(routeRes.data.distance_m || 0) / 1000).toFixed(2),
+          durationMin: Math.max(1, Math.round(Number(routeRes.data.duration_s || 0) / 60)),
+          source: routeRes.data.source,
+          steps: routeRes.data.steps || []
         })
       }
     } catch (error) {
@@ -630,6 +890,28 @@ function UserPage({ userId, onBack }) {
             Vegnett (OSM baselag)
           </label>
         </div>
+
+        {activeRoute && (
+          <div className="panel-section">
+            <h3>Anbefalt rute</h3>
+            <p className="location-info">Til: {activeRoute.shelter.name}</p>
+            <div className="route-info" style={{ marginTop: '8px' }}>
+              <span>📏 {activeRoute.distanceKm} km</span>
+              <span>⏱ {activeRoute.durationMin} min</span>
+              <span>Kilde: {activeRoute.source === 'osrm' ? 'Vei-rute' : 'Direkte linje'}</span>
+            </div>
+            {activeRoute.steps.length > 0 && (
+              <div style={{ marginTop: '10px', fontSize: '0.85rem' }}>
+                <strong>Neste steg:</strong>
+                <ol style={{ margin: '6px 0 0 18px' }}>
+                  {activeRoute.steps.slice(0, 5).map((step, idx) => (
+                    <li key={idx}>{step.instruction} ({Math.round(step.distance_m)} m)</li>
+                  ))}
+                </ol>
+              </div>
+            )}
+          </div>
+        )}
 
         {routes && (
           <div className="panel-section">
