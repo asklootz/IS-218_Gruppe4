@@ -1,8 +1,7 @@
 # Gruppe 4 "Beredskapskart"
 ## TLDR
 
-Dette er et minimalt web-eksempel som viser et OpenStreetMap kartbase (via MapLibre GL JS) og henter geometri lag fra en PostGIS database.
-Web applikasjonen viser brannstasjoner i valgte fylker og tilgjeneglighet på plasser i tilfluktsrom.
+Dette er et minimalt web-eksempel som viser et OpenStreetMap kartgrunnlag (via MapLibre GL JS) og henter geometrilag fra en PostGIS-database. Web applikasjonen viser brannstasjoner i valgte fylker og tilgjengelighet på plasser i tilfluktsrom. Problemstilling: Hvordan kan man bruke åpne geodata til å visualisere og analysere tilgjengelighet og kapasitet i tilfluktsrom, samt lokalisering av beredskapsressurser som brannstasjoner?
 
 Tjenestene kjøres med Docker Compose. 
 Tjenester:
@@ -17,11 +16,11 @@ Tjenester:
 docker compose up --build -d
 ```
 
-2. Åpne frontend på: http://localhost:8080
+2. Åpne frontend på: http://localhost:80
 
 ### Demo av system
 
-Link til youtobe video:
+Link til YouTube video:
 https://youtu.be/Z0XaCP_wVek
 
 ## Teknisk stack
@@ -38,9 +37,8 @@ https://youtu.be/Z0XaCP_wVek
 - PostgreSQL/PostGIS via Supabase
 - pg (postgres client)
 - CORS Middleware
-- Docker compose
-- WMS tile
-- GeoJSON
+- Docker Compose
+- WMS tiles
 
 ## Datakatalog
 
@@ -50,7 +48,7 @@ https://youtu.be/Z0XaCP_wVek
 | Brannstasjoner | GeoNorge | PostGIS | Hentet via Supabase |
 | Administrative enheter | GeoNorge | PostGIS | Hentet via Supabase |
 
-Med mulighet for å selv vise WMS lag som legges inn av bruker
+Med mulighet for å selv vise WMS-lag som legges inn av bruker
 
 ## Arkitekturskisse
 
