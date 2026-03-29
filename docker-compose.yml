@@ -1,18 +1,61 @@
 services:
+  postgres:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: beredskapskart-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: gis
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks:
+      - app-network
+
   backend:
     build: ./backend
+    container_name: beredskapskart-backend
     environment:
-      # Supabase connection (provided)
-      DATABASE_URL: "postgresql://postgres.rtoedavwkyicvokbcxkr:OIJlRB7WHB2AMg@aws-1-eu-central-1.pooler.supabase.com:5432/postgres?pool_mode=session"
-      DB_SSL: "true"
-      PGUSER: "postgres.rtoedavwkyicvokbcxkr"
-      PGPASSWORD: "OIJlRB7WHB2AMg"
+      DATABASE_URL: "postgresql://postgres:password@postgres:5432/gis"
+      NODE_ENV: production
+      PORT: 3000
     ports:
       - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks:
+      - app-network
 
   frontend:
     build: ./frontend
-    depends_on:
-      - backend
+    container_name: beredskapskart-frontend
+    environment:
+      VITE_API_URL: http://localhost:3000
     ports:
-      - "8080:80"
+      - "80:80"
+      - "5173:5173"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - app-network
+
+volumes:
+  postgres_data:
+
+networks:
+  app-network:
+    driver: bridge

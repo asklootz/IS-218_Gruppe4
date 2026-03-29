@@ -1,811 +1,711 @@
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
+const axios = require('axios');
+const AdmZip = require('adm-zip');
+const { v4: uuidv4 } = require('uuid');
+const XLSX = require('xlsx');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Configure Postgres connection - allow using a single DATABASE_URL (Supabase)
-const poolConfig = {};
-if (process.env.DATABASE_URL) {
-  try {
-    const u = new URL(process.env.DATABASE_URL);
-    poolConfig.host = u.hostname;
-    poolConfig.port = u.port ? Number(u.port) : 5432;
-    poolConfig.user = decodeURIComponent(u.username);
-    poolConfig.password = decodeURIComponent(u.password);
-    poolConfig.database = u.pathname && u.pathname.length > 1 ? u.pathname.slice(1) : undefined;
-    // honor explicit DB_SSL env or query params
-    if (process.env.DB_SSL === 'true' || process.env.DB_SSL === '1' || u.searchParams.get('sslmode') === 'require') {
-      poolConfig.ssl = { rejectUnauthorized: false };
-    }
-  } catch (e) {
-    // fallback to raw connection string if URL parsing fails
-    poolConfig.connectionString = process.env.DATABASE_URL;
-    if (process.env.DB_SSL === 'true' || process.env.DB_SSL === '1') {
-      poolConfig.ssl = { rejectUnauthorized: false };
-    }
-  }
-} else {
-  poolConfig.host = process.env.PGHOST || 'localhost';
-  poolConfig.user = process.env.PGUSER || 'postgres';
-  poolConfig.password = process.env.PGPASSWORD || 'example';
-  poolConfig.database = process.env.PGDATABASE || 'gis';
-  poolConfig.port = process.env.PGPORT ? Number(process.env.PGPORT) : 5432;
-}
-
-const pool = new Pool(poolConfig);
-
-// Helper to safely quote identifiers
-function quoteIdent(s) { return '"' + String(s).replace(/"/g, '""') + '"'; }
-
-async function resolveSchemaForTable(schema, table) {
-  const exact = await pool.query(
-    `SELECT table_schema FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2 LIMIT 1`,
-    [schema, table]
-  );
-  if (exact.rowCount > 0) return schema;
-
-  const anySchema = await pool.query(
-    `SELECT table_schema FROM information_schema.tables WHERE table_name = $1 ORDER BY table_schema LIMIT 1`,
-    [table]
-  );
-  if (anySchema.rowCount > 0) return anySchema.rows[0].table_schema;
-
-  throw new Error(`Table not found: ${schema}.${table}`);
-}
-
-async function assertColumnExists(schema, table, column) {
-  const r = await pool.query(
-    `SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = $3 LIMIT 1`,
-    [schema, table, column]
-  );
-  if (r.rowCount === 0) throw new Error(`Column not found: ${schema}.${table}.${column}`);
-}
-
-function getFylkeConfig(req) {
-  return {
-    nameSchema: req.query.name_schema || process.env.FYLKE_NAME_SCHEMA || 'fylker',
-    nameTable: req.query.name_table || process.env.FYLKE_NAME_TABLE || 'administrativenhetsnavn',
-    nameColumn: req.query.name_col || process.env.FYLKE_NAME_COL || 'navn',
-    geomSchema: req.query.geom_schema || process.env.FYLKE_GEOM_SCHEMA || 'fylker',
-    geomTable: req.query.geom_table || process.env.FYLKE_GEOM_TABLE || 'grense',
-    geomColumn: req.query.geom_col || process.env.FYLKE_GEOM_COL || 'grense',
-    joinColumn: req.query.join_col || process.env.FYLKE_JOIN_COL || 'id',
-    geomNameColumn: req.query.geom_name_col || process.env.FYLKE_GEOM_NAME_COL || null,
-    nameMatchMode: req.query.name_match || process.env.FYLKE_NAME_MATCH || 'join',
-  };
-}
-
-function getBrannConfig(req) {
-  return {
-    brannSchema: req.query.brann_schema || process.env.BRANN_SCHEMA || 'brannstasjoner',
-    brannTable: req.query.brann_table || process.env.BRANN_TABLE || 'brannstasjon',
-    brannGeomColumn: req.query.brann_geom_col || process.env.BRANN_GEOM_COL || 'posisjon',
-  };
-}
-
-async function getFirstGeomColumn(schema, table) {
-  const q = `SELECT f_geometry_column FROM public.geometry_columns WHERE f_table_schema = $1 AND f_table_name = $2 LIMIT 1`;
-  const r = await pool.query(q, [schema, table]);
-  return r.rowCount > 0 ? r.rows[0].f_geometry_column : null;
-}
-
-app.get('/layers', async (req, res) => {
-  try {
-    // Try geometry_columns first
-    const geomRes = await pool.query("SELECT f_table_name as table_name FROM public.geometry_columns");
-    const names = geomRes.rows.map(r => r.table_name);
-    res.json({ layers: names });
-  } catch (err) {
-    // fallback: list tables and hope
-    try {
-      const tbl = await pool.query("SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'");
-      res.json({ layers: tbl.rows.map(r => r.table_name) });
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  }
+// Database configuration
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || 'postgresql://postgres:password@postgres:5432/gis'
 });
 
-//----
-// for å kjøre romlige spørringer:
-app.get('/layers/:name', async (req, res) => {
-  const name = req.params.name;
+// Cache directory for downloaded data
+const CACHE_DIR = '/tmp/geonorge_cache';
+if (!fs.existsSync(CACHE_DIR)) {
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+}
 
+// ========== DATA BOOTSTRAP UTILITIES ==========
+
+async function downloadBuffer(url, timeout = 300000) {
   try {
-
-    // Support schema-qualified names like schema.table
-    let schema = 'public';
-    let table = name;
-
-    if (name.includes('.')) {
-      const parts = name.split('.');
-      schema = parts[0];
-      table = parts[1];
-    }
-
-    // Bygg SQL (GeoJSON)
-    const q = `
-      SELECT json_build_object(
-        'type', 'FeatureCollection',
-        'features', json_agg(
-          json_build_object(
-            'type', 'Feature',
-            'geometry', ST_AsGeoJSON(geom)::json,
-            'properties', to_jsonb(row) - 'geom'
-          )
-        )
-      ) AS geojson
-      FROM ${schema}.${table} row;
-    `;
-
-    // Log SQL
-    try {
-      console.log('[SQL] Executing for', `${schema}.${table}`);
-      console.log('[SQL] Query start:', q.slice(0, 500));
-    } catch (logErr) {
-      console.error('Failed to log SQL', logErr && logErr.message);
-    }
-
-    // Kjør SQL
-    try {
-      const result = await pool.query(q);
-      res.json(result.rows[0].geojson);
-    } catch (sqlErr) {
-      console.error('[SQL ERROR]', sqlErr && sqlErr.stack);
-      return res.status(500).json({ error: sqlErr.message });
-    }
-
-  } catch (err) {
-    console.error('[REQ ERROR] processing /layers/:name', err && err.stack);
-    res.status(500).json({ error: err.message });
+    const response = await axios.get(url, { 
+      timeout, 
+      responseType: 'arraybuffer',
+      headers: { 'User-Agent': 'Beredskapskart/1.0' }
+    });
+    return Buffer.from(response.data);
+  } catch (error) {
+    console.error(`Download failed for ${url}:`, error.message);
+    throw error;
   }
-});
-//----
+}
 
-// Return all tables (across schemas) that have geometry/geography columns
-// For each table return only an id (primary key or ctid) and the spatial columns
-app.get('/spatial', async (req, res) => {
-  const limit = Number(req.query.limit) || 500;
+async function extractGeoJsonFromZip(buffer) {
   try {
-    // Find all tables that have geometry/geography typed columns
-    const tablesQ = await pool.query(
-      `SELECT table_schema, table_name, coalesce(array_to_json(array_agg(column_name)), '[]') AS geom_columns
-       FROM information_schema.columns
-       WHERE udt_name IN ('geometry','geography')
-       GROUP BY table_schema, table_name
-       ORDER BY table_schema, table_name`
-    );
-
-    const tables = tablesQ.rows;
-
-    // For each table, fetch primary key if available and then select only pk/ctid and geom cols
-    const results = [];
-    for (const t of tables) {
-      const schema = t.table_schema;
-      const table = t.table_name;
-      const geomCols = t.geom_columns || [];
-
-      // find primary key column for this table (if any)
-      const pkQ = await pool.query(
-        `SELECT kcu.column_name FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1 AND tc.table_name = $2 LIMIT 1`,
-        [schema, table]
-      );
-      const pkCol = pkQ.rowCount > 0 ? pkQ.rows[0].column_name : null;
-
-      // Build select list: id (pk or ctid) plus each geom column as GeoJSON
-      const selectParts = [];
-      if (pkCol) {
-        selectParts.push(`${quoteIdent(pkCol)} as id`);
-      } else {
-        selectParts.push(`ctid::text as id`);
-      }
-      geomCols.forEach((gc, i) => {
-        // alias safe name
-        const alias = gc.replace(/[^a-zA-Z0-9_]/g, '_');
-        selectParts.push(`ST_AsGeoJSON(ST_Transform(${quoteIdent(gc)}, 4326))::json AS ${quoteIdent(alias)}`);
-      });
-
-      const ident = `${quoteIdent(schema)}.${quoteIdent(table)}`;
-      const q = `SELECT ${selectParts.join(', ')} FROM ${ident} LIMIT $1`;
-
+    const zip = new AdmZip(buffer);
+    const entries = zip.getEntries();
+    
+    let bestCandidate = null;
+    let maxFeatures = 0;
+    
+    for (const entry of entries) {
+      const lowerName = entry.name.toLowerCase();
+      if (entry.isDirectory || (!lowerName.endsWith('.json') && !lowerName.endsWith('.geojson'))) continue;
       try {
-        const r = await pool.query(q, [limit]);
-        results.push({ schema, table, geom_columns: geomCols, rows: r.rows });
-      } catch (err) {
-        // if a table is inaccessible or transform fails, include error message instead of rows
-        results.push({ schema, table, geom_columns: geomCols, error: err.message });
+        const content = entry.getData().toString('utf8');
+        const json = JSON.parse(content);
+        if (json.features && Array.isArray(json.features)) {
+          if (json.features.length > maxFeatures) {
+            bestCandidate = json;
+            maxFeatures = json.features.length;
+          }
+        }
+      } catch (e) {
+        // continue on parse error
       }
     }
+    
+    return bestCandidate || { type: 'FeatureCollection', features: [] };
+  } catch (error) {
+    console.error('ZIP extraction error:', error.message);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
 
-    // Log a brief summary for debugging
+async function cacheGeoJsonFromZip(layer, url) {
+  const cacheFile = path.join(CACHE_DIR, `${layer}.geojson`);
+  
+  if (fs.existsSync(cacheFile)) {
     try {
-      console.log('[SPATIAL] tables found:', results.length);
-      if (results.length > 0) {
-        const sample = results[0];
-        console.log('[SPATIAL] sample:', { schema: sample.schema, table: sample.table, geom_columns: sample.geom_columns, rows: (sample.rows||[]).length });
-      }
+      return JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
     } catch (e) {
-      console.error('Failed to log spatial summary', e && e.message);
+      fs.unlinkSync(cacheFile); // delete corrupt cache
     }
-
-    res.json({ tables: results });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
   }
-});
-
-
-// Legacy endpoint used by some frontends/tools: list schemas that contain spatial tables
-app.get('/geom-schemas', async (req, res) => {
+  
   try {
-    const q = `SELECT table_schema, array_agg(table_name ORDER BY table_name) AS tables
-               FROM (
-                 SELECT table_schema, table_name
-                 FROM information_schema.columns
-                 WHERE udt_name IN ('geometry','geography')
-                 GROUP BY table_schema, table_name
-               ) x
-               GROUP BY table_schema
-               ORDER BY table_schema`;
-    const r = await pool.query(q);
-    res.json({ schemas: r.rows });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Proxy WMS GetMap requests into XYZ tiles: /wms/tile/:z/:x/:y?wms=<base>&layers=<layers>&format=...
-// Converts tile z/x/y to WGS84 bbox and forwards the request to the WMS server (VERSION=1.1.1, SRS=EPSG:4326)
-const http = require('http');
-const https = require('https');
-
-function tile2bbox(z, x, y, options) {
-  // options: { crs: 'EPSG:4326'|'EPSG:3857', version: '1.1.1'|'1.3.0' }
-  const n = Math.pow(2, z);
-  const lon_left = x / n * 360.0 - 180.0;
-  const lon_right = (x + 1) / n * 360.0 - 180.0;
-  const lat_rad_top = Math.atan(Math.sinh(Math.PI * (1 - 2 * y / n)));
-  const lat_rad_bottom = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + 1) / n)));
-  const lat_top = lat_rad_top * 180.0 / Math.PI;
-  const lat_bottom = lat_rad_bottom * 180.0 / Math.PI;
-
-  const crs = options && options.crs ? options.crs : 'EPSG:4326';
-  const version = options && options.version ? options.version : '1.1.1';
-
-  if (crs === 'EPSG:3857') {
-    // convert lon/lat to WebMercator meters
-    function lonToX(lon) { return lon * 20037508.34 / 180.0; }
-    function latToY(lat) {
-      const rad = lat * Math.PI / 180.0;
-      return Math.log(Math.tan((Math.PI / 4) + (rad / 2))) * 20037508.34 / Math.PI;
-    }
-    const minx = lonToX(lon_left);
-    const maxx = lonToX(lon_right);
-    const miny = latToY(lat_bottom);
-    const maxy = latToY(lat_top);
-    return [minx, miny, maxx, maxy];
-  }
-
-  // default EPSG:4326
-  // For WMS 1.3.0 with EPSG:4326 the axis order is lat,lon (y,x)
-  if (version === '1.3.0') {
-    return [lat_bottom, lon_left, lat_top, lon_right];
-  }
-  return [lon_left, lat_bottom, lon_right, lat_top];
-}
-
-app.get('/wms/tile/:z/:x/:y', async (req, res) => {
-  try {
-    const { z, x, y } = req.params;
-    const base = req.query.wms;
-    if (!base) return res.status(400).send('missing wms param');
-    const layers = req.query.layers || req.query.LAYERS || '';
-    const format = req.query.format || req.query.FORMAT || 'image/png';
-    const width = req.query.width || 256;
-    const height = req.query.height || 256;
-
-    const version = req.query.version || req.query.VERSION || '1.1.1';
-    const crs = req.query.crs || req.query.CRS || req.query.srs || req.query.SRS || 'EPSG:4326';
-
-    const bboxArr = tile2bbox(Number(z), Number(x), Number(y), { crs, version });
-    const bboxStr = `${bboxArr[0]},${bboxArr[1]},${bboxArr[2]},${bboxArr[3]}`;
-
-    // Build WMS GetMap URL
-    const separator = base.includes('?') ? '&' : '?';
-    // choose parameter name for CRS based on WMS version
-    const crsParamName = (version === '1.3.0') ? 'CRS' : 'SRS';
-    const params = `SERVICE=WMS&REQUEST=GetMap&VERSION=${encodeURIComponent(version)}&FORMAT=${encodeURIComponent(format)}&TRANSPARENT=true&${crsParamName}=${encodeURIComponent(crs)}&BBOX=${encodeURIComponent(bboxStr)}&WIDTH=${width}&HEIGHT=${height}&LAYERS=${encodeURIComponent(layers)}`;
-    const finalUrl = base + separator + params;
-
-    const lib = finalUrl.startsWith('https') ? https : http;
-    const prox = lib.get(finalUrl, (proxRes) => {
-      res.statusCode = proxRes.statusCode || 200;
-      // copy content-type
-      if (proxRes.headers['content-type']) res.setHeader('Content-Type', proxRes.headers['content-type']);
-      // pipe
-      proxRes.pipe(res);
-    });
-    prox.on('error', (e) => {
-      console.error('WMS proxy error', e && e.message);
-      res.status(502).send('WMS proxy error');
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Inspect a table name: check information_schema and geometry_columns
-app.get('/inspect/:name', async (req, res) => {
-  const name = req.params.name;
-  try {
-    const tables = await pool.query(
-      `SELECT table_schema, table_name FROM information_schema.tables WHERE table_name = $1`,
-      [name]
-    );
-
-    const geoms = await pool.query(
-      `SELECT f_table_schema, f_table_name, type FROM public.geometry_columns WHERE f_table_name = $1`,
-      [name]
-    );
-
-    res.json({ tables: tables.rows, geometry_columns: geoms.rows });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Get a single feature by table and id
-app.get('/feature/:table/:id', async (req, res) => {
-  const { table, id } = req.params;
-  try {
-    let schema = 'public';
-    let tbl = table;
-    if (table.includes('.')) {
-      const parts = table.split('.');
-      schema = parts[0];
-      tbl = parts[1];
-    }
-
-    // Find geometry column
-    const geomRow = await pool.query(
-      `SELECT f_geometry_column FROM public.geometry_columns WHERE f_table_schema = $1 AND f_table_name = $2 LIMIT 1`,
-      [schema, tbl]
-    );
-    if (geomRow.rowCount === 0) {
-      const geomFind = await pool.query(
-        `SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND udt_name = 'geometry' LIMIT 1`,
-        [schema, tbl]
-      );
-      if (geomFind.rowCount === 0) {
-        return res.status(404).json({ error: 'Table not found or has no geometry' });
-      }
-      var geomCol = geomFind.rows[0].column_name;
-    } else {
-      var geomCol = geomRow.rows[0].f_geometry_column;
-    }
-
-    // Find primary key
-    const pk = await pool.query(
-      `SELECT kcu.column_name FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1 AND tc.table_name = $2 LIMIT 1`,
-      [schema, tbl]
-    );
-    let idCol = null;
-    if (pk.rowCount > 0) {
-      idCol = pk.rows[0].column_name;
-    }
-
-    const ident = `${quoteIdent(schema)}.${quoteIdent(tbl)}`;
-    const geomIdent = quoteIdent(geomCol);
-
-    let whereClause;
-    if (idCol) {
-      whereClause = `${quoteIdent(idCol)} = $1`;
-    } else {
-      whereClause = `ctid = $1`;
-    }
-
-    const q = `SELECT *, ST_AsGeoJSON(ST_Transform(${geomIdent}, 4326))::json AS geometry_json FROM ${ident} WHERE ${whereClause} LIMIT 1`;
-
-    const result = await pool.query(q, [id]);
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'Feature not found' });
-    }
-
-    const row = result.rows[0];
-    const properties = { ...row };
-    delete properties[geomCol];
-    delete properties.geometry_json;
-
-    const feature = {
-      type: 'Feature',
-      id: id,
-      geometry: row.geometry_json,
-      properties: properties
-    };
-
-    res.json(feature);
-  } catch (err) {
-    console.error('Error fetching feature:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// List tables and geometry columns inside a given schema
-app.get('/schema/:schema', async (req, res) => {
-  const schema = req.params.schema;
-  try {
-    const tables = await pool.query(
-      `SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema = $1 ORDER BY table_name`,
-      [schema]
-    );
-
-    const geoms = await pool.query(
-      `SELECT f_table_schema, f_table_name, type FROM public.geometry_columns WHERE f_table_schema = $1 ORDER BY f_table_name`,
-      [schema]
-    );
-
-    res.json({ schema, tables: tables.rows, geometry_columns: geoms.rows });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-async function testDbConnection() {
-  try {
-    console.log('DB: using DATABASE_URL=', !!process.env.DATABASE_URL);
-    // avoid printing the full connection string
-    if (process.env.DATABASE_URL) {
-      const safe = process.env.DATABASE_URL.replace(/:[^:@]*@/, ':*****@');
-      console.log('DB: connectionString example:', safe);
-    }
-    const r = await pool.query('SELECT 1');
-    console.log('DB test query result:', r.rows);
-  } catch (err) {
-    console.error('DB connection test failed:', err.message);
+    console.log(`Downloading ${layer} from ${url.substring(0, 60)}...`);
+    const buffer = await downloadBuffer(url);
+    const geojson = await extractGeoJsonFromZip(buffer);
+    fs.writeFileSync(cacheFile, JSON.stringify(geojson));
+    return geojson;
+  } catch (error) {
+    console.error(`Failed to cache ${layer}:`, error.message);
+    return { type: 'FeatureCollection', features: [] };
   }
 }
 
-/// 🔴 DYNAMISK SQL-SPØRRING:
-// Tar imot koordinater fra frontend (brukerklikk)
-// og bruker disse i en romlig spørring (ST_DWithin)
-// for å finne objekter innenfor en gitt avstand
-app.get('/analysis/near', async (req, res) => {
-  const { lon, lat, distance } = req.query;
-  // Dynamiske parametere fra frontend (ikke hardkodet!)
+function firstCoordinate(geometry) {
+  if (!geometry) return null;
+  const coords = geometry.coordinates;
+  if (!coords) return null;
+  
+  if (geometry.type === 'Point') return coords;
+  if (geometry.type === 'LineString' || geometry.type === 'MultiPoint') return coords[0];
+  if (geometry.type === 'Polygon' || geometry.type === 'MultiLineString') return coords[0][0];
+  if (geometry.type === 'MultiPolygon') return coords[0][0][0];
+  return null;
+}
 
- // 🔴 DYNAMISK ROMLIG SQL (PostGIS):
-// Bruker koordinater fra frontend (brukerklikk) som input
-// - ST_MakePoint: lager punkt fra lon/lat
-// - ST_SetSRID: setter koordinatsystem (WGS84)
-// - ST_Transform: konverterer til samme SRID som data (25833)
-// - ST_DWithin: finner objekter innenfor gitt avstand (meter)
-  try {
-    const query = `
-      SELECT *
-      FROM tilfluktsromoffentlige.tilfluktsrom
-      WHERE ST_DWithin(
-        posisjon,
-        ST_Transform(
-          ST_SetSRID(ST_MakePoint($1, $2), 4326),
-          25833
-        ),
-        $3
-      )
-    `;
+function looksProjected(coord) {
+  if (!coord || coord.length < 2) return false;
+  const [lon, lat] = coord;
+  return lon < -180 || lon > 180 || lat < -90 || lat > 90;
+}
 
-    const result = await pool.query(query, [lon, lat, distance || 1000]);
-
-    res.json(result.rows);
-
-  } catch (err) {
-    console.error("NEAR ERROR:", err);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-// Filter tilfluktsrom by minimum plasser and return GeoJSON
-app.get('/analysis/tilfluktsrom-min', async (req, res) => {
-  const minPlasser = Number(req.query.min_plasser) || 500;
-  const schema = 'tilfluktsromoffentlige';
-  const table = 'tilfluktsrom';
-
-  try {
-    const geomCol = await getFirstGeomColumn(schema, table);
-    if (!geomCol) {
-      return res.status(404).json({ error: 'Geometry column not found for tilfluktsrom' });
-    }
-
-    const q = `
-      SELECT json_build_object(
-        'type', 'FeatureCollection',
-        'features', COALESCE(json_agg(
-          json_build_object(
-            'type', 'Feature',
-            'geometry', ST_AsGeoJSON(ST_Transform(${quoteIdent(geomCol)}, 4326))::json,
-            'properties', to_jsonb(row) - $2
-          )
-        ), '[]'::json)
-      ) AS geojson
-      FROM ${quoteIdent(schema)}.${quoteIdent(table)} row
-      WHERE plasser >= $1;
-    `;
-
-    const result = await pool.query(q, [minPlasser, geomCol]);
-    res.json(result.rows[0].geojson);
-  } catch (err) {
-    console.error('tilfluktsrom-min failed', err && err.message);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-// List fylker for dropdown
-app.get('/analysis/fylke-list', async (req, res) => {
-  const cfg = getFylkeConfig(req);
-  try {
-    const nameSchema = await resolveSchemaForTable(cfg.nameSchema, cfg.nameTable);
-    const geomSchema = await resolveSchemaForTable(cfg.geomSchema, cfg.geomTable);
-
-    await assertColumnExists(nameSchema, cfg.nameTable, cfg.nameColumn);
-    const isSameTable = (geomSchema === nameSchema && cfg.geomTable === cfg.nameTable);
-    const useNameMatch = cfg.nameMatchMode && cfg.nameMatchMode !== 'join';
-    if (!isSameTable) {
-      if (useNameMatch) {
-        if (!cfg.geomNameColumn) throw new Error('Missing geom_name_col for name matching');
-        await assertColumnExists(geomSchema, cfg.geomTable, cfg.geomNameColumn);
-      } else {
-        await assertColumnExists(nameSchema, cfg.nameTable, cfg.joinColumn);
-        await assertColumnExists(geomSchema, cfg.geomTable, cfg.joinColumn);
-      }
-    }
-
-    const nameIdent = `${quoteIdent(nameSchema)}.${quoteIdent(cfg.nameTable)}`;
-    let fromSql = `${nameIdent} n`;
-    if (!isSameTable) {
-      const geomIdent = `${quoteIdent(geomSchema)}.${quoteIdent(cfg.geomTable)}`;
-      if (useNameMatch) {
-        const nameExpr = `LOWER(n.${quoteIdent(cfg.nameColumn)})`;
-        const geomNameExpr = `LOWER(g.${quoteIdent(cfg.geomNameColumn)})`;
-        const matchSql = (cfg.nameMatchMode === 'equals')
-          ? `${geomNameExpr} = ${nameExpr}`
-          : `${geomNameExpr} LIKE '%' || ${nameExpr} || '%'`;
-        fromSql = `${nameIdent} n JOIN ${geomIdent} g ON ${matchSql}`;
-      } else {
-        fromSql = `${nameIdent} n JOIN ${geomIdent} g ON n.${quoteIdent(cfg.joinColumn)} = g.${quoteIdent(cfg.joinColumn)}`;
-      }
-    }
-
-    const q = `SELECT DISTINCT n.${quoteIdent(cfg.nameColumn)} AS name
-               FROM ${fromSql}
-               WHERE n.${quoteIdent(cfg.nameColumn)} IS NOT NULL
-               ORDER BY n.${quoteIdent(cfg.nameColumn)}`;
-    const r = await pool.query(q);
-    res.json({ names: r.rows.map(row => row.name) });
-  } catch (err) {
-    console.error('fylke-list failed', err && err.message);
-    res.status(500).json({ error: err.message || 'Database error' });
-  }
-});
-
-// Discover candidate tables for fylke configuration
-app.get('/analysis/fylke-discover', async (req, res) => {
-  try {
-    const nameCols = await pool.query(
-      `SELECT table_schema, table_name, array_agg(column_name ORDER BY column_name) AS columns
-       FROM information_schema.columns
-       WHERE column_name ILIKE 'navn'
-       GROUP BY table_schema, table_name
-       ORDER BY table_schema, table_name`
-    );
-
-    const geomCols = await pool.query(
-      `SELECT table_schema, table_name, array_agg(column_name ORDER BY column_name) AS geom_columns
-       FROM information_schema.columns
-       WHERE udt_name IN ('geometry','geography')
-       GROUP BY table_schema, table_name
-       ORDER BY table_schema, table_name`
-    );
-
-    const nameSet = new Map();
-    nameCols.rows.forEach(r => { nameSet.set(`${r.table_schema}.${r.table_name}`, r.columns); });
-
-    const geomSet = new Map();
-    geomCols.rows.forEach(r => { geomSet.set(`${r.table_schema}.${r.table_name}`, r.geom_columns); });
-
-    const tablesWithBoth = [];
-    for (const [key, cols] of nameSet.entries()) {
-      if (geomSet.has(key)) {
-        tablesWithBoth.push({
-          table: key,
-          name_columns: cols,
-          geom_columns: geomSet.get(key),
-        });
-      }
-    }
-
-    res.json({
-      name_tables: nameCols.rows,
-      geom_tables: geomCols.rows,
-      tables_with_both: tablesWithBoth,
-    });
-  } catch (err) {
-    console.error('fylke-discover failed', err && err.message);
-    res.status(500).json({ error: err.message || 'Database error' });
-  }
-});
-
-// Outline a fylke as GeoJSON
-app.get('/analysis/fylke-outline', async (req, res) => {
-  const fylkeName = req.query.fylke_name;
-  if (!fylkeName) return res.status(400).json({ error: 'Missing fylke_name' });
-  const cfg = getFylkeConfig(req);
-  try {
-    const nameSchema = await resolveSchemaForTable(cfg.nameSchema, cfg.nameTable);
-    const geomSchema = await resolveSchemaForTable(cfg.geomSchema, cfg.geomTable);
-
-    await assertColumnExists(nameSchema, cfg.nameTable, cfg.nameColumn);
-    await assertColumnExists(geomSchema, cfg.geomTable, cfg.geomColumn);
-    const isSameTable = (geomSchema === nameSchema && cfg.geomTable === cfg.nameTable);
-    const useNameMatch = cfg.nameMatchMode && cfg.nameMatchMode !== 'join';
-    if (!isSameTable) {
-      if (useNameMatch) {
-        if (!cfg.geomNameColumn) throw new Error('Missing geom_name_col for name matching');
-        await assertColumnExists(geomSchema, cfg.geomTable, cfg.geomNameColumn);
-      } else {
-        await assertColumnExists(nameSchema, cfg.nameTable, cfg.joinColumn);
-        await assertColumnExists(geomSchema, cfg.geomTable, cfg.joinColumn);
-      }
-    }
-
-    const nameIdent = `${quoteIdent(nameSchema)}.${quoteIdent(cfg.nameTable)}`;
-    const geomIdent = `${quoteIdent(geomSchema)}.${quoteIdent(cfg.geomTable)}`;
-    const nameCol = `n.${quoteIdent(cfg.nameColumn)}`;
-    const geomCol = `g.${quoteIdent(cfg.geomColumn)}`;
-
-    let fromSql = `${nameIdent} n`;
-    if (!isSameTable) {
-      if (useNameMatch) {
-        const nameExpr = `LOWER(n.${quoteIdent(cfg.nameColumn)})`;
-        const geomNameExpr = `LOWER(g.${quoteIdent(cfg.geomNameColumn)})`;
-        const matchSql = (cfg.nameMatchMode === 'equals')
-          ? `${geomNameExpr} = ${nameExpr}`
-          : `${geomNameExpr} LIKE '%' || ${nameExpr} || '%'`;
-        fromSql = `${nameIdent} n JOIN ${geomIdent} g ON ${matchSql}`;
-      } else {
-        fromSql = `${nameIdent} n JOIN ${geomIdent} g ON n.${quoteIdent(cfg.joinColumn)} = g.${quoteIdent(cfg.joinColumn)}`;
-      }
-    }
-
-    const q = `
-      SELECT json_build_object(
-        'type', 'FeatureCollection',
-        'features', COALESCE(json_agg(
-          json_build_object(
-            'type', 'Feature',
-            'geometry', ST_AsGeoJSON(ST_Transform(${geomCol}, 4326))::json,
-            'properties', to_jsonb(n) - $2
-          )
-        ), '[]'::json)
-      ) AS geojson
-      FROM ${fromSql}
-      WHERE ${nameCol} = $1;
-    `;
-
-    const r = await pool.query(q, [fylkeName, cfg.geomColumn]);
-    res.json(r.rows[0].geojson);
-  } catch (err) {
-    console.error('fylke-outline failed', err && err.message);
-    res.status(500).json({ error: err.message || 'Database error' });
-  }
-});
-
-// Return brannstasjoner inside a fylke
-app.get('/analysis/brannstasjoner-in-fylke', async (req, res) => {
-  const fylkeName = req.query.fylke_name;
-  if (!fylkeName) return res.status(400).json({ error: 'Missing fylke_name' });
-  const fylkeCfg = getFylkeConfig(req);
-  const brannCfg = getBrannConfig(req);
-
-  try {
-    const nameSchema = await resolveSchemaForTable(fylkeCfg.nameSchema, fylkeCfg.nameTable);
-    const geomSchema = await resolveSchemaForTable(fylkeCfg.geomSchema, fylkeCfg.geomTable);
-    const brannSchema = await resolveSchemaForTable(brannCfg.brannSchema, brannCfg.brannTable);
-
-    await assertColumnExists(nameSchema, fylkeCfg.nameTable, fylkeCfg.nameColumn);
-    await assertColumnExists(geomSchema, fylkeCfg.geomTable, fylkeCfg.geomColumn);
-    const isSameTable = (geomSchema === nameSchema && fylkeCfg.geomTable === fylkeCfg.nameTable);
-    const useNameMatch = fylkeCfg.nameMatchMode && fylkeCfg.nameMatchMode !== 'join';
-    if (!isSameTable) {
-      if (useNameMatch) {
-        if (!fylkeCfg.geomNameColumn) throw new Error('Missing geom_name_col for name matching');
-        await assertColumnExists(geomSchema, fylkeCfg.geomTable, fylkeCfg.geomNameColumn);
-      } else {
-        await assertColumnExists(nameSchema, fylkeCfg.nameTable, fylkeCfg.joinColumn);
-        await assertColumnExists(geomSchema, fylkeCfg.geomTable, fylkeCfg.joinColumn);
-      }
-    }
-    await assertColumnExists(brannSchema, brannCfg.brannTable, brannCfg.brannGeomColumn);
-
-    const nameIdent = `${quoteIdent(nameSchema)}.${quoteIdent(fylkeCfg.nameTable)}`;
-    const geomIdent = `${quoteIdent(geomSchema)}.${quoteIdent(fylkeCfg.geomTable)}`;
-    const nameCol = `n.${quoteIdent(fylkeCfg.nameColumn)}`;
-    const geomCol = `g.${quoteIdent(fylkeCfg.geomColumn)}`;
-
-    let fromSql = `${nameIdent} n`;
-    if (!isSameTable) {
-      if (useNameMatch) {
-        const nameExpr = `LOWER(n.${quoteIdent(fylkeCfg.nameColumn)})`;
-        const geomNameExpr = `LOWER(g.${quoteIdent(fylkeCfg.geomNameColumn)})`;
-        const matchSql = (fylkeCfg.nameMatchMode === 'equals')
-          ? `${geomNameExpr} = ${nameExpr}`
-          : `${geomNameExpr} LIKE '%' || ${nameExpr} || '%'`;
-        fromSql = `${nameIdent} n JOIN ${geomIdent} g ON ${matchSql}`;
-      } else {
-        fromSql = `${nameIdent} n JOIN ${geomIdent} g ON n.${quoteIdent(fylkeCfg.joinColumn)} = g.${quoteIdent(fylkeCfg.joinColumn)}`;
-      }
-    }
-
-    const brannIdent = `${quoteIdent(brannSchema)}.${quoteIdent(brannCfg.brannTable)}`;
-    const brannGeom = `b.${quoteIdent(brannCfg.brannGeomColumn)}`;
-
-    const q = `
-      WITH fylke AS (
-        SELECT ${geomCol} AS geom
-        FROM ${fromSql}
-        WHERE ${nameCol} = $1
-      )
-      SELECT json_build_object(
-        'type', 'FeatureCollection',
-        'features', COALESCE(json_agg(
-          json_build_object(
-            'type', 'Feature',
-            'geometry', ST_AsGeoJSON(ST_Transform(${brannGeom}, 4326))::json,
-            'properties', to_jsonb(b) - $2
-          )
-        ), '[]'::json)
-      ) AS geojson
-      FROM ${brannIdent} b
-      WHERE EXISTS (
-        SELECT 1 FROM fylke f
-        WHERE ST_Within(ST_Transform(${brannGeom}, 4326), ST_Transform(f.geom, 4326))
-      );
-    `;
-
-    const r = await pool.query(q, [fylkeName, brannCfg.brannGeomColumn]);
-    res.json(r.rows[0].geojson);
-  } catch (err) {
-    console.error('brannstasjoner-in-fylke failed', err && err.message);
-    res.status(500).json({ error: err.message || 'Database error' });
-  }
-});
-
-//romlig SQL for å søke i database 
-app.get('/analysis/search', async (req, res) => {
-    const { table, field, value } = req.query;
-
-    try {
-        const query = `
-      SELECT *
-      FROM ${table}
-      WHERE ${field} ILIKE $1
-    `;
-
-        const result = await pool.query(query, [`%${value}%`]);
-        res.json(result.rows);
-
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Database error' });
-    }
-});
-
-
-const port = process.env.PORT || 3000;
-testDbConnection().then(() => {
-  app.listen(port, () => {
-    console.log('Backend listening on', port);
+function getPropIgnoreCase(properties, candidates) {
+  if (!properties || typeof properties !== 'object') return undefined;
+  const map = {};
+  Object.keys(properties).forEach((k) => {
+    map[String(k).toLowerCase()] = properties[k];
   });
+  for (const key of candidates) {
+    const value = map[String(key).toLowerCase()];
+    if (value !== undefined && value !== null && value !== '') return value;
+  }
+  return undefined;
+}
+
+function parseNumber(value, fallback = 0) {
+  if (value === undefined || value === null) return fallback;
+  const normalized = String(value).replace(/\s/g, '').replace(',', '.');
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+async function transformProjectedFeatureCollection(geojson) {
+  if (!geojson.features || geojson.features.length === 0) return geojson;
+  
+  const firstCoord = firstCoordinate(geojson.features[0].geometry);
+  if (!firstCoord || !looksProjected(firstCoord)) return geojson; // already correct
+  
+  try {
+    console.log('Transforming projected coordinates via PostGIS...');
+    const transformed = {
+      type: 'FeatureCollection',
+      features: []
+    };
+    
+    for (const feature of geojson.features) {
+      try {
+        const geomJson = JSON.stringify(feature.geometry);
+        const result = await pool.query(
+          `SELECT ST_AsGeoJSON(ST_Transform(ST_SetSRID(ST_GeomFromGeoJSON($1), 25833), 4326))::json AS geom`,
+          [geomJson]
+        );
+        
+        if (result.rows[0] && result.rows[0].geom) {
+          transformed.features.push({
+            ...feature,
+            geometry: result.rows[0].geom
+          });
+        }
+      } catch (e) {
+        console.error('Transform error for feature:', e.message);
+      }
+    }
+
+    return transformed.features.length > 0 ? transformed : geojson;
+  } catch (error) {
+    console.error('PostGIS transform failed:', error.message);
+    return geojson;
+  }
+}
+
+// ========== DATABASE INITIALIZATION ==========
+
+async function initSchema() {
+  try {
+    // Enable PostGIS
+    await pool.query('CREATE EXTENSION IF NOT EXISTS postgis');
+    
+    // Create schema if doesn't exist
+    await pool.query('CREATE SCHEMA IF NOT EXISTS tilfluktsromoffentlige');
+    
+    // Create shelters table (tilfluktsrom)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS tilfluktsromoffentlige.tilfluktsrom (
+        id SERIAL PRIMARY KEY,
+        shelter_id VARCHAR(100) UNIQUE,
+        name VARCHAR(255),
+        capacity INT,
+        location GEOMETRY(Point, 4326),
+        raw_properties JSONB
+      )
+    `);
+    
+    // Create spatial index
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_tilfluktsrom_location ON tilfluktsromoffentlige.tilfluktsrom USING GIST(location)
+    `);
+    
+    // Create population grid table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS public.population_cells (
+        id SERIAL PRIMARY KEY,
+        population INT,
+        location GEOMETRY(Point, 4326)
+      )
+    `);
+    
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_population_location ON public.population_cells USING GIST(location)
+    `);
+    
+    // Create users table for tracking
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS public.app_users (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        created_at TIMESTAMP DEFAULT NOW(),
+        opt_tracking BOOLEAN DEFAULT false
+      )
+    `);
+    
+    // Create user locations table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS public.user_locations (
+        id SERIAL PRIMARY KEY,
+        user_id UUID REFERENCES public.app_users(id),
+        location GEOMETRY(Point, 4326),
+        timestamp TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_user_locations_user_id ON public.user_locations(user_id)
+    `);
+    
+    console.log('✓ Database schema initialized');
+  } catch (error) {
+    console.error('Schema init error:', error.message);
+  }
+}
+
+// ========== DATA INGESTION ==========
+
+async function ingestShelters(geojson) {
+  if (!geojson.features) return 0;
+  
+  let inserted = 0;
+  for (const feature of geojson.features) {
+    try {
+      const { properties, geometry } = feature;
+      const coord = firstCoordinate(geometry);
+      if (!coord || coord.length < 2) continue;
+      const lon = Number(coord[0]);
+      const lat = Number(coord[1]);
+      const stableId = `${lon.toFixed(6)}_${lat.toFixed(6)}`;
+
+      const shelter_id = String(
+        getPropIgnoreCase(properties, ['id', 'shelter_id', 'objid', 'lokalid']) || stableId
+      );
+      const name = String(
+        getPropIgnoreCase(properties, ['name', 'navn', 'tilfluktsromnavn']) || 'Tilfluktsrom'
+      );
+      const capacity = Math.max(0, Math.round(parseNumber(
+        getPropIgnoreCase(properties, ['capacity', 'kapasitet', 'plasser', 'antall', 'personer']),
+        0
+      )));
+      
+      if (Number.isFinite(lon) && Number.isFinite(lat)) {
+        await pool.query(`
+          INSERT INTO tilfluktsromoffentlige.tilfluktsrom (shelter_id, name, capacity, location, raw_properties)
+          VALUES ($1, $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326), $6)
+          ON CONFLICT (shelter_id) DO UPDATE SET 
+            name = EXCLUDED.name,
+            capacity = EXCLUDED.capacity,
+            location = EXCLUDED.location,
+            raw_properties = EXCLUDED.raw_properties
+        `, [shelter_id, name, capacity, lon, lat, JSON.stringify(properties)]);
+        
+        inserted++;
+      }
+    } catch (error) {
+      console.error('Ingest shelter error:', error.message);
+    }
+  }
+  
+  return inserted;
+}
+
+async function ingestPopulation(geojson) {
+  if (!geojson.features) return 0;
+  
+  let inserted = 0;
+  for (const feature of geojson.features) {
+    try {
+      const { properties, geometry } = feature;
+      const population = Math.max(0, Math.round(parseNumber(
+        getPropIgnoreCase(properties, ['population', 'befolkning', 'personer', 'antall']),
+        0
+      )));
+      if (population <= 0) continue;
+
+      const coord = firstCoordinate(geometry);
+      if (coord && coord.length >= 2) {
+        const lon = Number(coord[0]);
+        const lat = Number(coord[1]);
+        if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
+        
+        await pool.query(`
+          INSERT INTO public.population_cells (population, location)
+          VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 4326))
+        `, [population, lon, lat]);
+        
+        inserted++;
+      }
+    } catch (error) {
+      console.error('Ingest population error:', error.message);
+    }
+  }
+  
+  return inserted;
+}
+
+async function generateSyntheticPopulation() {
+  try {
+    // Generate population grid around shelters
+    const shelters = await pool.query(`
+      SELECT ST_X(location) AS lon, ST_Y(location) AS lat
+      FROM tilfluktsromoffentlige.tilfluktsrom
+      WHERE location IS NOT NULL
+    `);
+    
+    for (const s of shelters.rows) {
+      const lon = Number(s.lon);
+      const lat = Number(s.lat);
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
+      
+      // Generate ~20 points in a 5km radius
+      for (let i = 0; i < 20; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const distance = Math.random() * 0.05; // ~5km at equator
+        const newLon = lon + distance * Math.cos(angle);
+        const newLat = lat + distance * Math.sin(angle);
+        const population = Math.floor(Math.random() * 200) + 50;
+        
+        await pool.query(`
+          INSERT INTO public.population_cells (population, location)
+          VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 4326))
+        `, [population, newLon, newLat]);
+      }
+    }
+    
+    console.log('✓ Synthetic population generated');
+  } catch (error) {
+    console.error('Synthetic population error:', error.message);
+  }
+}
+
+async function bootstrap() {
+  const checkFile = path.join(CACHE_DIR, '.bootstrapped');
+  if (fs.existsSync(checkFile)) {
+    console.log('Data already initialized, skipping remote bootstrap.');
+    return;
+  }
+  
+  console.log('🚀 Starting data bootstrap...');
+  
+  await initSchema();
+  
+  // Download and ingest shelters
+  try {
+    console.log('Downloading shelters...');
+    const sheltersGeo = await cacheGeoJsonFromZip('shelters', 
+      'https://nedlasting.geonorge.no/geonorge/Samfunnssikkerhet/TilfluktsromOffentlige/GeoJSON/Samfunnssikkerhet_0000_Norge_25833_TilfluktsromOffentlige_GeoJSON.zip');
+    const transformed = await transformProjectedFeatureCollection(sheltersGeo);
+    const count = await ingestShelters(transformed);
+    console.log(`✓ Shelters ingested: ${count}`);
+  } catch (error) {
+    console.error('Shelters bootstrap failed:', error.message);
+  }
+  
+  // Download and ingest population
+  try {
+    console.log('Downloading population...');
+    const popGeo = await cacheGeoJsonFromZip('population',
+      'https://nedlasting.geonorge.no/geonorge/Befolkning/BefolkningPaGrunnkretsniva2025/GML/Befolkning_0000_Norge_25833_BefolkningPaGrunnkretsniva2025_GML.zip');
+    const transformed = await transformProjectedFeatureCollection(popGeo);
+    const count = await ingestPopulation(transformed);
+    if (count > 0) {
+      console.log(`✓ Population ingested: ${count}`);
+    } else {
+      console.log('Population source returned zero rows, generating synthetic population fallback...');
+      await generateSyntheticPopulation();
+    }
+  } catch (error) {
+    console.error('Population bootstrap failed, generating synthetic:', error.message);
+    await generateSyntheticPopulation();
+  }
+
+  // Cache counties and municipalities as GeoJSON layers for frontend toggles
+  try {
+    const counties = await cacheGeoJsonFromZip(
+      'counties',
+      'https://nedlasting.geonorge.no/geonorge/Basisdata/Fylker/GeoJSON/Basisdata_0000_Norge_25833_Fylker_GeoJSON.zip'
+    );
+    const countiesWgs84 = await transformProjectedFeatureCollection(counties);
+    fs.writeFileSync(path.join(CACHE_DIR, 'counties.geojson'), JSON.stringify(countiesWgs84));
+    console.log(`✓ Counties cached: ${(countiesWgs84.features || []).length}`);
+  } catch (error) {
+    console.error('Counties cache failed:', error.message);
+  }
+
+  try {
+    const municipalities = await cacheGeoJsonFromZip(
+      'municipalities',
+      'https://nedlasting.geonorge.no/geonorge/Basisdata/Kommuner/GeoJSON/Basisdata_0000_Norge_25833_Kommuner_GeoJSON.zip'
+    );
+    const municipalitiesWgs84 = await transformProjectedFeatureCollection(municipalities);
+    fs.writeFileSync(path.join(CACHE_DIR, 'municipalities.geojson'), JSON.stringify(municipalitiesWgs84));
+    console.log(`✓ Municipalities cached: ${(municipalitiesWgs84.features || []).length}`);
+  } catch (error) {
+    console.error('Municipalities cache failed:', error.message);
+  }
+  
+  fs.writeFileSync(checkFile, Date.now().toString());
+  console.log('✓ Bootstrap complete');
+}
+
+// ========== API ENDPOINTS ==========
+
+app.get('/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ ok: true, bootstrapReady: true });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
 });
 
+// Admin: compute coverage statistics within radius
+app.get('/api/admin/coverage', async (req, res) => {
+  try {
+    const radius = parseInt(req.query.radius) || 1000;
+    
+    const result = await pool.query(`
+      SELECT 
+        s.id,
+        s.shelter_id,
+        s.name,
+        s.capacity,
+        ST_X(s.location) AS lon,
+        ST_Y(s.location) AS lat,
+        COALESCE(COUNT(p.id), 0) AS population_within_radius,
+        COALESCE(SUM(p.population), 0) AS population_sum,
+        CASE WHEN s.capacity >= COALESCE(SUM(p.population), 0) THEN true ELSE false END AS enough_capacity,
+        GREATEST(0, COALESCE(SUM(p.population), 0) - s.capacity) AS missing_capacity
+      FROM tilfluktsromoffentlige.tilfluktsrom s
+      LEFT JOIN public.population_cells p ON ST_DWithin(s.location, p.location, $1)
+      GROUP BY s.id, s.shelter_id, s.name, s.capacity, s.location
+      ORDER BY s.id
+    `, [radius]);
+    
+    const shelters = result.rows;
+    const totalCovered = shelters.reduce((sum, s) => sum + Number(s.population_sum || 0), 0);
+    const totalCapacity = shelters.reduce((sum, s) => sum + Number(s.capacity || 0), 0);
+    const totalMissing = shelters.reduce((sum, s) => sum + Number(s.missing_capacity || 0), 0);
+    const adequateShelters = shelters.filter(s => s.enough_capacity).length;
+    
+    res.json({
+      radius,
+      summary: {
+        total_shelters: shelters.length,
+        adequate_shelters: adequateShelters,
+        total_capacity: totalCapacity,
+        total_population_within_radius: totalCovered,
+        coverage_percent: totalCovered > 0 ? Math.round((totalCapacity / totalCovered) * 100) : 0,
+        total_missing_capacity: totalMissing
+      },
+      shelters
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: export coverage data to CSV
+app.get('/api/admin/export/csv', async (req, res) => {
+  try {
+    const radius = parseInt(req.query.radius) || 1000;
+    
+    const result = await pool.query(`
+      SELECT 
+        s.shelter_id,
+        s.name,
+        s.capacity,
+        ST_X(s.location) AS lon,
+        ST_Y(s.location) AS lat,
+        COALESCE(SUM(p.population), 0) AS population_sum,
+        CASE WHEN s.capacity >= COALESCE(SUM(p.population), 0) THEN 'Ja' ELSE 'Nei' END AS enough_capacity,
+        GREATEST(0, COALESCE(SUM(p.population), 0) - s.capacity) AS missing_capacity
+      FROM tilfluktsromoffentlige.tilfluktsrom s
+      LEFT JOIN public.population_cells p ON ST_DWithin(s.location, p.location, $1)
+      GROUP BY s.id, s.shelter_id, s.name, s.capacity, s.location
+      ORDER BY s.id
+    `, [radius]);
+    
+    const csv = [
+      'Tilfluktsrom ID,Navn,Kapasitet,Lon,Lat,Befolkning i Radius,Tilstrekkelig Kapasitet,Manglende Kapasitet'
+    ];
+    
+    result.rows.forEach(row => {
+      csv.push([
+        row.shelter_id,
+        `"${row.name}"`,
+        row.capacity,
+        row.lon.toFixed(6),
+        row.lat.toFixed(6),
+        row.population_sum,
+        row.enough_capacity,
+        row.missing_capacity
+      ].join(','));
+    });
+    
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="coverage-${radius}m.csv"`);
+    res.send(csv.join('\n'));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: export to XLSX
+app.get('/api/admin/export/xlsx', async (req, res) => {
+  try {
+    const radius = parseInt(req.query.radius) || 1000;
+    
+    const result = await pool.query(`
+      SELECT 
+        s.shelter_id,
+        s.name,
+        s.capacity,
+        ST_X(s.location) AS lon,
+        ST_Y(s.location) AS lat,
+        COALESCE(SUM(p.population), 0) AS population_sum,
+        CASE WHEN s.capacity >= COALESCE(SUM(p.population), 0) THEN 'Ja' ELSE 'Nei' END AS enough_capacity,
+        GREATEST(0, COALESCE(SUM(p.population), 0) - s.capacity) AS missing_capacity
+      FROM tilfluktsromoffentlige.tilfluktsrom s
+      LEFT JOIN public.population_cells p ON ST_DWithin(s.location, p.location, $1)
+      GROUP BY s.id, s.shelter_id, s.name, s.capacity, s.location
+      ORDER BY s.id
+    `, [radius]);
+    
+    const ws = XLSX.utils.json_to_sheet(result.rows.map(r => ({
+      'Tilfluktsrom ID': r.shelter_id,
+      'Navn': r.name,
+      'Kapasitet': r.capacity,
+      'Lon': parseFloat(r.lon.toFixed(6)),
+      'Lat': parseFloat(r.lat.toFixed(6)),
+      'Befolkning i Radius': r.population_sum,
+      'Tilstrekkelig Kapasitet': r.enough_capacity,
+      'Manglende Kapasitet': r.missing_capacity
+    })));
+    
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Dekning');
+    
+    const buffer = XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="coverage-${radius}m.xlsx"`);
+    res.send(buffer);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// User: get nearest shelters and routing info
+app.get('/api/routing/nearest-shelters', async (req, res) => {
+  try {
+    const { lon, lat, mode = 'walk' } = req.query;
+    const strategy = req.query.strategy || 'nearest'; // 'nearest' or 'hasSpace'
+    
+    if (!lon || !lat) {
+      return res.status(400).json({ error: 'Missing lon/lat' });
+    }
+    
+    // Speed modes in km/h
+    const speeds = { walk: 5, bike: 20, car: 60 };
+    const speed = speeds[mode] || 5;
+    
+    const result = await pool.query(`
+      SELECT 
+        s.id,
+        s.shelter_id,
+        s.name,
+        s.capacity,
+        ST_X(s.location) AS lon,
+        ST_Y(s.location) AS lat,
+        ST_DistanceSphere(ST_MakePoint($1::float, $2::float), s.location) AS distance_m,
+        COALESCE(SUM(p.population), 0) AS population_nearby,
+        s.capacity - COALESCE(SUM(p.population), 0) AS free_spots
+      FROM tilfluktsromoffentlige.tilfluktsrom s
+      LEFT JOIN public.population_cells p ON ST_DWithin(s.location, p.location, 1000)
+      GROUP BY s.id, s.shelter_id, s.name, s.capacity, s.location
+      ORDER BY ${strategy === 'hasSpace' ? 'free_spots DESC, distance_m' : 'distance_m'}
+      LIMIT 20
+    `, [parseFloat(lon), parseFloat(lat)]);
+    
+    const shelters = result.rows.map(s => ({
+      ...s,
+      distance_km: (s.distance_m / 1000).toFixed(2),
+      travel_time_minutes: Math.round((s.distance_m / 1000) / speed * 60)
+    }));
+    
+    res.json({ mode, strategy, shelters });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// User: track user location
+app.post('/api/users/:userId/location', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { lon, lat } = req.body;
+    
+    if (!lon || !lat) {
+      return res.status(400).json({ error: 'Missing lon/lat' });
+    }
+    
+    await pool.query(`
+      INSERT INTO public.user_locations (user_id, location)
+      VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 4326))
+    `, [userId, parseFloat(lon), parseFloat(lat)]);
+    
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all layers as GeoJSON
+app.get('/api/layers/:layer', async (req, res) => {
+  try {
+    const { layer } = req.params;
+    
+    let query = '';
+    let result;
+    
+    if (layer === 'shelters') {
+      query = `
+        SELECT json_build_object(
+          'type', 'FeatureCollection',
+          'features', json_agg(json_build_object(
+            'type', 'Feature',
+            'geometry', json_build_object('type', 'Point', 'coordinates', json_build_array(ST_X(location), ST_Y(location))),
+            'properties', json_build_object('id', id, 'name', name, 'capacity', capacity)
+          ))
+        ) AS geojson
+        FROM tilfluktsromoffentlige.tilfluktsrom
+      `;
+      result = await pool.query(query);
+    } else if (layer === 'population') {
+      query = `
+        SELECT json_build_object(
+          'type', 'FeatureCollection',
+          'features', json_agg(json_build_object(
+            'type', 'Feature',
+            'geometry', json_build_object('type', 'Point', 'coordinates', json_build_array(ST_X(location), ST_Y(location))),
+            'properties', json_build_object('population', population)
+          ))
+        ) AS geojson
+        FROM public.population_cells LIMIT 10000
+      `;
+      result = await pool.query(query);
+    } else if (layer === 'counties' || layer === 'municipalities') {
+      const cacheFile = path.join(CACHE_DIR, `${layer}.geojson`);
+      if (fs.existsSync(cacheFile)) {
+        const geojson = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+        return res.json(geojson);
+      }
+      return res.json({ type: 'FeatureCollection', features: [] });
+    }
+    
+    if (result && result.rows[0]) {
+      res.json(result.rows[0].geojson);
+    } else {
+      res.json({ type: 'FeatureCollection', features: [] });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ========== SERVER STARTUP ==========
+
+const PORT = process.env.PORT || 3000;
+
+async function start() {
+  try {
+    await bootstrap();
+    
+    app.listen(PORT, () => {
+      console.log(`✓ Backend listening on port ${PORT}`);
+    });
+  } catch (error) {
+    console.error('Startup error:', error);
+    process.exit(1);
+  }
+}
+
+start();
