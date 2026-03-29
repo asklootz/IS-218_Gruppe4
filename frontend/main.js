@@ -949,7 +949,9 @@ setInterval(() => {
 }, 30000);
 
 map.on('load', () => {
-
+// 🔴 DYNAMISK SPØRRING:
+// Denne funksjonen trigges når bruker klikker på kartet.
+// Koordinatene (lng, lat) sendes til backend for å hente data i nærheten.
   map.on('click', async (e) => {
     const features = map.queryRenderedFeatures(e.point);
 
@@ -985,6 +987,7 @@ map.on('load', () => {
     }
 
     // 🔴 Klikk på kart → analyse
+    // Henter dynamiske koordinater fra brukerens klikk
     const { lng, lat } = e.lngLat;
 
     console.log("KART-KLIKK:", lng, lat);
@@ -994,6 +997,8 @@ map.on('load', () => {
       .addTo(map);
 
     try {
+      // Sender dynamiske parametere (lon, lat) til backend
+      // Backend bruker disse i en romlig SQL-spørring (PostGIS)
       const res = await fetch(
         `${backendBase}analysis/near?lon=${lng}&lat=${lat}&distance=1000`
       );
