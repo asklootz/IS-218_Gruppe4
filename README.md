@@ -1,68 +1,73 @@
-# Gruppe 4 "Beredskapskart"
-## TLDR
+# Beredskapskart (Gruppe 4)
 
-Dette er et minimalt web-eksempel som viser et OpenStreetMap kartgrunnlag (via MapLibre GL JS) og henter geometrilag fra en PostGIS-database. Web applikasjonen viser brannstasjoner i valgte fylker og tilgjengelighet på plasser i tilfluktsrom. Problemstilling: Hvordan kan man bruke åpne geodata til å visualisere og analysere tilgjengelighet og kapasitet i tilfluktsrom, samt lokalisering av beredskapsressurser som brannstasjoner?
+Moderne, fullcontainerisert beredskapsapplikasjon med to sider:
+- Administratorside for analyse, kapasitetsberegning, lagstyring og eksport
+- Brukerside for geolokasjon, nærmeste tilfluktsrom og ruteforslag
 
-Tjenestene kjøres med Docker Compose. 
-Tjenester:
-- `backend`: Node/Express API that exposes `/layers` and `/layers/:name` returning GeoJSON from PostGIS Supabase server
-- `frontend`: statisk nettsted betjent av nginx med MapLibre-kart og lagkontroller
+Applikasjonen bruker OpenStreetMap som basiskart, React i frontend og lokal PostGIS i Docker.
 
-## Quick start with a Supabase (or remote Postgres) database:
+## Oppstart
 
-1. Oppstart av appen i Docker-miljø (PowerShell):
+Kjør kun:
 
 ```powershell
-docker compose up --build -d
+docker compose up -d
 ```
 
-2. Åpne frontend på: http://localhost:80
+Deretter:
+- Frontend: http://localhost
+- Backend API: http://localhost:3000
 
-### Demo av system
+## Arkitektur
 
-Link til YouTube video:
-https://youtu.be/Z0XaCP_wVek
+- `postgres`: `postgis/postgis:16-3.4-alpine`
+- `backend`: Node.js/Express API med automatisk data-bootstrap
+- `frontend`: React + Vite + MapLibre, servert med Nginx
 
-## Teknisk stack
+Ved oppstart:
+1. PostGIS startes og initialiseres
+2. Backend oppretter skjema/tabeller
+3. Backend laster ned geodata fra GeoNorge (Atom/WMS-kilder)
+4. Data prosesseres og gjøres klare for visning/analyse
+5. Frontend blir tilgjengelig når backend er frisk
 
-- MapLibre GL JS (via CDN)
-- JavaScript (ES6)
-- HTML5 / CSS3
-- GeoJSON (lokale filer)
-- Turf.js
-- DOMParser
-- OGC API / WFS (GeoNorge)
-- OpenStreetMap (bakgrunnskart)
-- Node.js + Express.js
-- PostgreSQL/PostGIS via Supabase
-- pg (postgres client)
-- CORS Middleware
+## Funksjoner
+
+### Forside
+- Valg mellom Administratorside og Brukerside
+- Egne URL-er: `/admin` og `/bruker`
+
+### Administratorside
+- Radius-slider for dekningsanalyse
+- Løpende tabelloppdatering per tilfluktsrom
+- Visning av kapasitet, befolkning i radius og manglende kapasitet
+- Eksport til CSV og Excel
+- Kartlag med toggles
+
+### Brukerside
+- Geolokasjon av bruker
+- Knapp for å følge brukerposisjon
+- Ruteforslag til nærmeste tilfluktsrom
+- Strategi: nærmeste generelt eller med ledig kapasitet
+- Transportvalg: gå/sykkel/bil
+- Mobil- og desktopvennlig layout
+
+## API (utvalg)
+
+- `GET /health`
+- `GET /api/admin/coverage?radius=1000`
+- `GET /api/admin/export/csv?radius=1000`
+- `GET /api/admin/export/xlsx?radius=1000`
+- `GET /api/routing/nearest-shelters?lon=10.75&lat=59.91&strategy=nearest&mode=walk`
+- `POST /api/users/:userId/location`
+- `GET /api/layers/shelters`
+- `GET /api/layers/population`
+
+## Teknologi
+
+- React 18 + Vite
+- MapLibre GL
+- Node.js + Express
+- PostgreSQL/PostGIS
 - Docker Compose
-- WMS tiles
-
-## Datakatalog
-
-| Datasett | Kilde | Format | Bearbeiding |
-|--------|------|--------|------------|
-| Tilfluktsrom | GeoNorge | PostGIS | Hentet via Supabase |
-| Brannstasjoner | GeoNorge | PostGIS | Hentet via Supabase |
-| Administrative enheter | GeoNorge | PostGIS | Hentet via Supabase |
-
-Med mulighet for å selv vise WMS-lag som legges inn av bruker
-
-## Arkitekturskisse
-
-Kartløsningen er bygget med MapLibre GL JS. GeoJSON-filer lastes lokalt
-inn som sources i MapLibre, mens eksterne datasett hentes via OGC API (WFS).
-Dataene visualiseres som layers i kartet og gjøres interaktive med klikkbare
-popups og datadrevet styling.
-
-<img width="571" height="242" alt="diagram" src="https://github.com/user-attachments/assets/cd79ab0e-498b-4884-b368-9add472ad8c2" />
-
-
-## Refleksjon
-
-- Kartløsningen kan skaleres bedre ved bruk av vector tiles
-- Brukergrensesnittet kan forbedres med tydeligere kontroller
-- Mer avansert romlig filtrering kan gi bedre analyse
-- Avhengighet av eksterne API-er kan påvirke stabilitet
+- GeoNorge Atom/WMS-kilder

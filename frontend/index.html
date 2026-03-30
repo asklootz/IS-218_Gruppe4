@@ -1,62 +1,17 @@
 <!doctype html>
-<html>
+<html lang="no">
   <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Beredskapskart</title>
-    <link href="https://unpkg.com/maplibre-gl@2.4.0/dist/maplibre-gl.css" rel="stylesheet" />
-    <link rel="stylesheet" href="style.css" />
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Beredskapskart - Evakueringsstøtte</title>
+    <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet">
   </head>
   <body>
-    <div id="sidebar">
-      <div class="sidebar-header">
-        <h2>🗺️ Map Layers</h2>
-        <div style="display:flex;gap:8px;align-items:center;">
-          <button id="darkModeToggle" title="Toggle dark mode">🌙</button>
-          <button id="sidebarToggle" title="Hide sidebar" aria-label="Hide sidebar">⏴</button>
-        </div>
-      </div>
-      <div class="sidebar-section">
-        <div class="sidebar-group">
-          <button id="showAll">Show All</button>
-          <button id="hideAll">Hide All</button>
-          <button id="filterTilfluktsrom500Btn">Tilfluktsrom 500+</button>
-        </div>
-        <div class="sidebar-group">
-          <label for="fylkeSelect" style="font-size:0.98rem;margin-bottom:2px;">Fylke filter (brannstasjoner)</label>
-          <select id="fylkeSelect"></select>
-          <button id="fylkeApplyBtn">Show brannstasjoner in fylke</button>
-          <button id="fylkeClearBtn">Clear fylke filter</button>
-        </div>
-        <div class="sidebar-group">
-          <button id="saveLayersBtn">💾 Save Layers</button>
-          <input type="file" id="loadLayersInput" style="display:none" accept="application/json" />
-          <button id="loadLayersBtn">📂 Load Layers</button>
-        </div>
-        <div class="sidebar-group">
-          <input id="appLinkInput" type="text" placeholder="Add a link to the app" />
-          <button id="addAppLinkBtn">➕ Add Link</button>
-        </div>
-        <div id="appLinksList" class="sidebar-group"></div>
-        <div class="sidebar-group" id="wmsSection">
-          <label for="wms_base_url" style="font-size:0.98rem;margin-bottom:2px;">WMS Service URL</label>
-          <input id="wms_base_url" type="text" placeholder="Paste WMS base URL here" style="margin-bottom:4px;" />
-          <button id="showWmsLayersBtn">Show WMS Layers</button>
-          <input id="wms_layers" type="text" placeholder="Layer name (auto-filled)" style="margin-bottom:4px;" />
-          <button id="addWmsLayerBtn">Add WMS Layer</button>
-          <div id="wmsTreeMenuContainer" style="margin-top:6px;"></div>
-        </div>
-        <div id="layers" class="sidebar-group"></div>
-      </div>
-    </div>
-    <div id="map"></div>
-    <button id="sidebarShowBtn" title="Show sidebar" aria-label="Show sidebar" style="display:none;position:absolute;left:8px;top:16px;z-index:1100;background:#23272f;color:#ffd700;border:none;border-radius:6px;padding:8px 12px;font-size:1.2rem;box-shadow:0 1px 4px #0005;cursor:pointer;">⏵</button>
-
-    <script src="https://unpkg.com/maplibre-gl@2.4.0/dist/maplibre-gl.js"></script>
-    <script type="module" src="wmsStorage.js"></script>
-    <script type="module" src="main.js"></script>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>
