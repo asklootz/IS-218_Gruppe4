@@ -71,3 +71,11 @@ Ved oppstart:
 - PostgreSQL/PostGIS
 - Docker Compose
 - GeoNorge Atom/WMS-kilder
+
+## Demo av systemt
+![Skjermopptak 2026-03-30 kl  20 42 17-2](https://github.com/user-attachments/assets/a5c99f2c-a112-4f37-9251-fd1e7dfd63f7)
+![Skjermopptak 2026-03-30 kl  20 41 12-2](https://github.com/user-attachments/assets/33e93f92-7ef7-4cca-bbaf-c1c1b5066623)
+
+## Refleksjon
+- legge til flere enn bare tilfluktsrom
+
