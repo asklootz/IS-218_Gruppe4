@@ -79,3 +79,5 @@ Ved oppstart:
 ## Refleksjon
 - legge til flere enn bare tilfluktsrom
 
+## Google Collab Link for DEL A
+Lenke til google collab: https://colab.research.google.com/drive/1oUW47z1zeP80I1mDGadpsudwXjQfep1m?usp=sharing
