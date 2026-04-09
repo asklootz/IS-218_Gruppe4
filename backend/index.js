@@ -1,3 +1,4 @@
+console.log("🔥 NY KODE KJØRER");
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -77,30 +78,53 @@ async function extractGeoJsonFromZip(buffer, layerHint = '') {
     let bestCandidate = null;
     let bestScore = Number.NEGATIVE_INFINITY;
     
+    // Map layer hints to expected nested keys
+    const keyMap = {
+      counties: 'Fylke',
+      municipalities: 'Kommune'
+    };
+    const expectedKey = keyMap[layerHint] || layerHint;
+    
+    console.log(`Extracting ${layerHint}, expected key: ${expectedKey}`);
+    
     for (const entry of entries) {
       const lowerName = entry.name.toLowerCase();
       if (entry.isDirectory || (!lowerName.endsWith('.json') && !lowerName.endsWith('.geojson'))) continue;
+      console.log(`Processing entry: ${entry.name}`);
       try {
         const content = entry.getData().toString('utf8');
         const json = JSON.parse(content);
-        if (json.features && Array.isArray(json.features)) {
-          const score = scoreZipEntryForLayer(entry.name, layerHint) + json.features.length;
+        
+        // Handle nested GeoJSON structures like { "Fylke": { "type": "FeatureCollection", ... } }
+        let geojson = json;
+        if (json[expectedKey]) {
+          console.log(`Found nested key ${expectedKey}`);
+          geojson = json[expectedKey];
+        }
+        
+        if (geojson.features && Array.isArray(geojson.features)) {
+          const score = scoreZipEntryForLayer(entry.name, layerHint) + geojson.features.length;
+          console.log(`Valid GeoJSON with ${geojson.features.length} features, score: ${score}`);
           if (score > bestScore) {
-            bestCandidate = json;
+            bestCandidate = geojson;
             bestScore = score;
           }
+        } else {
+          console.log(`No features found in ${entry.name}`);
         }
       } catch (e) {
-        // continue on parse error
+        console.log(`Parse error for ${entry.name}: ${e.message}`);
       }
     }
     
+    console.log(`Best candidate has ${bestCandidate?.features?.length || 0} features`);
     return bestCandidate || { type: 'FeatureCollection', features: [] };
   } catch (error) {
     console.error('ZIP extraction error:', error.message);
     return { type: 'FeatureCollection', features: [] };
   }
 }
+
 
 async function cacheGeoJsonFromZip(layer, url) {
   const cacheFile = path.join(CACHE_DIR, `${layer}.geojson`);
