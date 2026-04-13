@@ -59,12 +59,12 @@ function scoreZipEntryForLayer(entryName, layerHint) {
 
   // Prefer semantic matches for administrative layers over generic border datasets.
   if (hint === 'counties') {
-    if (lower.includes('fylke')) score += 1000;
-    if (lower.includes('grense')) score -= 200;
+    if (lower.includes('fylke')) score += 5000;
+    if (lower.includes('grense')) score -= 5000;
   }
   if (hint === 'municipalities') {
-    if (lower.includes('kommune')) score += 1000;
-    if (lower.includes('grense')) score -= 200;
+    if (lower.includes('kommune')) score += 5000;
+    if (lower.includes('grense')) score -= 5000;
   }
 
   return score;
@@ -92,7 +92,11 @@ async function extractGeoJsonFromZip(buffer, layerHint = '') {
       if (entry.isDirectory || (!lowerName.endsWith('.json') && !lowerName.endsWith('.geojson'))) continue;
       console.log(`Processing entry: ${entry.name}`);
       try {
-        const content = entry.getData().toString('utf8');
+        const content = entry
+          .getData()
+          .toString('utf8')
+          .replace(/^\uFEFF/, '')
+          .trim();
         const json = JSON.parse(content);
         
         // Handle nested GeoJSON structures like { "Fylke": { "type": "FeatureCollection", ... } }
@@ -103,7 +107,7 @@ async function extractGeoJsonFromZip(buffer, layerHint = '') {
         }
         
         if (geojson.features && Array.isArray(geojson.features)) {
-          const score = scoreZipEntryForLayer(entry.name, layerHint) + geojson.features.length;
+          const score = scoreZipEntryForLayer(entry.name, layerHint) + Math.min(geojson.features.length, 100);
           console.log(`Valid GeoJSON with ${geojson.features.length} features, score: ${score}`);
           if (score > bestScore) {
             bestCandidate = geojson;

@@ -208,6 +208,9 @@ function AdminPage({ onBack }) {
     if (map.current.getLayer('counties-fill') && map.current.getLayer('counties-line')) {
       map.current.moveLayer('counties-fill', 'counties-line')
     }
+    if (map.current.getLayer('municipalities-line') && map.current.getLayer('radius-line')) {
+      map.current.moveLayer('municipalities-line', 'radius-line')
+    }
   }
 
   const loadStaticLayers = async () => {
@@ -295,9 +298,9 @@ function AdminPage({ onBack }) {
             type: 'line',
             source: 'municipalities',
             paint: {
-              'line-color': '#64748b',
-              'line-width': 0.6,
-              'line-opacity': 0.55
+              'line-color': '#0afcd3',
+              'line-width': 1.2,
+              'line-opacity': 0.9
             }
           })
         } else {
@@ -676,7 +679,7 @@ function UserPage({ userId, onBack }) {
           id: 'municipalities-user-line',
           type: 'line',
           source: 'municipalities-user',
-          paint: { 'line-color': '#94a3b8', 'line-width': 0.6, 'line-opacity': 0.55 }
+          paint: { 'line-color': '#0afcd3', 'line-width': 2, 'line-opacity': 0.9 }
         })
       }
     } catch (error) {
@@ -695,6 +698,10 @@ function UserPage({ userId, onBack }) {
     setVisibility('counties-user-line', visibleLayers.counties)
     setVisibility('municipalities-user-line', visibleLayers.municipalities)
     setVisibility('osm-base', visibleLayers.roads)
+
+    if (map.current.getLayer('municipalities-user-line') && map.current.getLayer('counties-user-line')) {
+      map.current.moveLayer('municipalities-user-line', 'counties-user-line')
+    }
   }, [visibleLayers])
 
   const startTracking = () => {
