@@ -1,5 +1,4 @@
 // --- Sidebar Toggle ---
-console.log("🔥 NY KODE KJØRER");
 function setupSidebarToggle() {
   const sidebar = document.getElementById('sidebar');
   const sidebarToggle = document.getElementById('sidebarToggle');
