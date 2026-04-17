@@ -11,7 +11,7 @@ Applikasjonen bruker OpenStreetMap som basiskart, React i frontend og lokal Post
 Kjør kun:
 
 ```powershell
-docker compose up -d
+docker compose up -d --build
 ```
 
 Deretter:
