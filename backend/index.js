@@ -1,4 +1,10 @@
-console.log("🔥 NY KODE KJØRER");
+function logStartup() {
+  if (process.env.LOG_STARTUP === 'true') {
+    console.info('[startup] backend/index.js loaded');
+  }
+}
+
+logStartup();
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
