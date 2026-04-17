@@ -201,6 +201,16 @@ function AdminPage({ onBack }) {
     setVisibility('municipalities-line', visibleLayers.municipalities)
     setVisibility('radius-fill', visibleLayers.radius)
     setVisibility('radius-line', visibleLayers.radius)
+
+    if (map.current.getLayer('counties-line') && map.current.getLayer('radius-line')) {
+      map.current.moveLayer('counties-line', 'radius-line')
+    }
+    if (map.current.getLayer('counties-fill') && map.current.getLayer('counties-line')) {
+      map.current.moveLayer('counties-fill', 'counties-line')
+    }
+    if (map.current.getLayer('municipalities-line') && map.current.getLayer('radius-line')) {
+      map.current.moveLayer('municipalities-line', 'radius-line')
+    }
   }
 
   const loadStaticLayers = async () => {
@@ -260,7 +270,7 @@ function AdminPage({ onBack }) {
             source: 'counties',
             paint: {
               'fill-color': '#0ea5e9',
-              'fill-opacity': 0.08
+              'fill-opacity': 0.18
             }
           })
           map.current.addLayer({
@@ -268,8 +278,9 @@ function AdminPage({ onBack }) {
             type: 'line',
             source: 'counties',
             paint: {
-              'line-color': '#0284c7',
-              'line-width': 1.2
+              'line-color': '#075985',
+              'line-width': 2,
+              'line-opacity': 0.95
             }
           })
         } else {
@@ -287,9 +298,9 @@ function AdminPage({ onBack }) {
             type: 'line',
             source: 'municipalities',
             paint: {
-              'line-color': '#64748b',
-              'line-width': 0.6,
-              'line-opacity': 0.55
+              'line-color': '#0afcd3',
+              'line-width': 1.2,
+              'line-opacity': 0.9
             }
           })
         } else {
@@ -656,7 +667,7 @@ function UserPage({ userId, onBack }) {
           id: 'counties-user-line',
           type: 'line',
           source: 'counties-user',
-          paint: { 'line-color': '#2563eb', 'line-width': 1.2 }
+          paint: { 'line-color': '#1d4ed8', 'line-width': 2, 'line-opacity': 0.95 }
         })
       }
 
@@ -668,7 +679,7 @@ function UserPage({ userId, onBack }) {
           id: 'municipalities-user-line',
           type: 'line',
           source: 'municipalities-user',
-          paint: { 'line-color': '#94a3b8', 'line-width': 0.6, 'line-opacity': 0.55 }
+          paint: { 'line-color': '#0afcd3', 'line-width': 2, 'line-opacity': 0.9 }
         })
       }
     } catch (error) {
@@ -687,6 +698,10 @@ function UserPage({ userId, onBack }) {
     setVisibility('counties-user-line', visibleLayers.counties)
     setVisibility('municipalities-user-line', visibleLayers.municipalities)
     setVisibility('osm-base', visibleLayers.roads)
+
+    if (map.current.getLayer('municipalities-user-line') && map.current.getLayer('counties-user-line')) {
+      map.current.moveLayer('municipalities-user-line', 'counties-user-line')
+    }
   }, [visibleLayers])
 
   const startTracking = () => {
