@@ -595,6 +595,10 @@ app.get('/health', async (req, res) => {
 });
 
 async function fetchCoverageRows(radius) {
+  // Agder fylke bounds (approximate coordinates for Agder region in southern Norway)
+  const agderBBox = 'POLYGON((7.0 57.8, 9.5 57.8, 9.5 59.0, 7.0 59.0, 7.0 57.8))';
+  const agderGeom = `ST_GeomFromText('${agderBBox}', 4326)`;
+  
   const result = await pool.query(`
     WITH shelter_buffers AS (
       SELECT
@@ -605,6 +609,7 @@ async function fetchCoverageRows(radius) {
         s.location,
         ST_Buffer(s.location::geography, $1)::geometry AS buffer_geom
       FROM tilfluktsromoffentlige.tilfluktsrom s
+      WHERE ST_Intersects(s.location, ${agderGeom})
     ),
     cluster_groups AS (
       SELECT
@@ -716,6 +721,10 @@ app.get('/api/admin/coverage', async (req, res) => {
 app.get('/api/admin/radius-layer', async (req, res) => {
   try {
     const radius = parseInt(req.query.radius) || 1000;
+    // Agder fylke bounds
+    const agderBBox = 'POLYGON((7.0 57.8, 9.5 57.8, 9.5 59.0, 7.0 59.0, 7.0 57.8))';
+    const agderGeom = `ST_GeomFromText('${agderBBox}', 4326)`;
+    
     const result = await pool.query(`
       WITH shelter_buffers AS (
         SELECT
@@ -725,6 +734,7 @@ app.get('/api/admin/radius-layer', async (req, res) => {
           s.capacity,
           ST_Buffer(s.location::geography, $1)::geometry AS buffer_geom
         FROM tilfluktsromoffentlige.tilfluktsrom s
+        WHERE ST_Intersects(s.location, ${agderGeom})
       ),
       cluster_groups AS (
         SELECT
@@ -837,6 +847,10 @@ app.get('/api/routing/nearest-shelters', async (req, res) => {
       return res.status(400).json({ error: 'Missing lon/lat' });
     }
     
+    // Agder fylke bounds
+    const agderBBox = 'POLYGON((7.0 57.8, 9.5 57.8, 9.5 59.0, 7.0 59.0, 7.0 57.8))';
+    const agderGeom = `ST_GeomFromText('${agderBBox}', 4326)`;
+    
     // Speed modes in km/h
     const speeds = { walk: 5, bike: 20, car: 60 };
     const speed = speeds[mode] || 5;
@@ -854,6 +868,7 @@ app.get('/api/routing/nearest-shelters', async (req, res) => {
         s.capacity - COALESCE(SUM(p.population), 0) AS free_spots
       FROM tilfluktsromoffentlige.tilfluktsrom s
       LEFT JOIN public.population_cells p ON ST_DWithin(s.location::geography, p.location::geography, 1000)
+      WHERE ST_Intersects(s.location, ${agderGeom})
       GROUP BY s.id, s.shelter_id, s.name, s.capacity, s.location
       ORDER BY ${strategy === 'hasSpace' ? 'free_spots DESC, distance_m' : 'distance_m'}
       LIMIT 20
@@ -957,10 +972,76 @@ app.post('/api/users/:userId/location', async (req, res) => {
   }
 });
 
+// Get all spatial tables and data filtered to Agder fylke
+app.get('/spatial', async (req, res) => {
+  try {
+    // Agder fylke bounds (approximate coordinates for Agder region in southern Norway)
+    // This includes the geometry for Agder/Sørlandet region
+    const agderBBox = 'POLYGON((7.0 57.8, 9.5 57.8, 9.5 59.0, 7.0 59.0, 7.0 57.8))';
+    const agderGeom = `ST_GeomFromText('${agderBBox}', 4326)`;
+    
+    const tables = [];
+    
+    // Query all spatial tables in the database
+    const tableQuery = `
+      SELECT 
+        table_schema, 
+        table_name,
+        json_agg(DISTINCT column_name) AS geom_columns
+      FROM information_schema.columns
+      WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+        AND udt_name IN ('geometry', 'geography')
+      GROUP BY table_schema, table_name
+      ORDER BY table_schema, table_name
+    `;
+    
+    const tableResult = await pool.query(tableQuery);
+    
+    for (const tbl of tableResult.rows) {
+      const { table_schema, table_name, geom_columns } = tbl;
+      const geomCol = geom_columns && geom_columns.length > 0 ? geom_columns[0] : null;
+      
+      if (!geomCol) continue; // Skip tables without geometry
+      
+      try {
+        // Fetch rows within Agder bounds
+        const dataQuery = `
+          SELECT row_to_json(t) as row
+          FROM ${table_schema}.${table_name} t
+          WHERE ST_Intersects(${geomCol}, ${agderGeom})
+          LIMIT 5000
+        `;
+        
+        const dataResult = await pool.query(dataQuery);
+        const rows = dataResult.rows.map(r => r.row);
+        
+        if (rows.length > 0) {
+          tables.push({
+            schema: table_schema,
+            table: table_name,
+            geom_columns: geom_columns,
+            rows: rows
+          });
+        }
+      } catch (err) {
+        console.warn(`Error fetching data from ${table_schema}.${table_name}:`, err.message);
+      }
+    }
+    
+    res.json({ tables });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Get all layers as GeoJSON
 app.get('/api/layers/:layer', async (req, res) => {
   try {
     const { layer } = req.params;
+    
+    // Agder fylke bounds
+    const agderBBox = 'POLYGON((7.0 57.8, 9.5 57.8, 9.5 59.0, 7.0 59.0, 7.0 57.8))';
+    const agderGeom = `ST_GeomFromText('${agderBBox}', 4326)`;
     
     let query = '';
     let result;
@@ -976,6 +1057,7 @@ app.get('/api/layers/:layer', async (req, res) => {
           ))
         ) AS geojson
         FROM tilfluktsromoffentlige.tilfluktsrom
+        WHERE ST_Intersects(location, ${agderGeom})
       `;
       result = await pool.query(query);
     } else if (layer === 'population') {
@@ -988,7 +1070,7 @@ app.get('/api/layers/:layer', async (req, res) => {
             'properties', json_build_object('population', population)
           ))
         ) AS geojson
-        FROM (SELECT * FROM public.population_cells LIMIT 3000) p
+        FROM (SELECT * FROM public.population_cells WHERE ST_Intersects(location, ${agderGeom}) LIMIT 3000) p
       `;
       result = await pool.query(query);
     } else if (layer === 'counties' || layer === 'municipalities') {
@@ -1003,6 +1085,221 @@ app.get('/api/layers/:layer', async (req, res) => {
     }
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ========== ANALYSIS ENDPOINTS (Agder-filtered) ==========
+
+// Find nearby tilfluktsrom within distance
+app.get('/analysis/near', async (req, res) => {
+  try {
+    const { lon, lat, distance } = req.query;
+    const agderBBox = 'POLYGON((7.0 57.8, 9.5 57.8, 9.5 59.0, 7.0 59.0, 7.0 57.8))';
+    const agderGeom = `ST_GeomFromText('${agderBBox}', 4326)`;
+    
+    const query = `
+      SELECT 
+        id, shelter_id, name, capacity, 
+        ST_X(location) AS lon, ST_Y(location) AS lat,
+        ST_DistanceSphere(location, ST_MakePoint($1::float, $2::float)) AS distance_m
+      FROM tilfluktsromoffentlige.tilfluktsrom
+      WHERE ST_Intersects(location, ${agderGeom})
+        AND ST_DWithin(location::geography, ST_MakePoint($1::float, $2::float)::geography, $3::float)
+      ORDER BY distance_m
+      LIMIT 20
+    `;
+    
+    const result = await pool.query(query, [parseFloat(lon), parseFloat(lat), parseFloat(distance) || 1000]);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('analysis/near failed:', err.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Filter tilfluktsrom by minimum capacity and return GeoJSON
+app.get('/analysis/tilfluktsrom-min', async (req, res) => {
+  try {
+    const minCapacity = Number(req.query.min_plasser) || 500;
+    const agderBBox = 'POLYGON((7.0 57.8, 9.5 57.8, 9.5 59.0, 7.0 59.0, 7.0 57.8))';
+    const agderGeom = `ST_GeomFromText('${agderBBox}', 4326)`;
+    
+    const q = `
+      SELECT json_build_object(
+        'type', 'FeatureCollection',
+        'features', COALESCE(json_agg(
+          json_build_object(
+            'type', 'Feature',
+            'geometry', ST_AsGeoJSON(location)::json,
+            'properties', json_build_object(
+              'id', id, 'name', name, 'capacity', capacity, 'shelter_id', shelter_id
+            )
+          )
+        ), '[]'::json)
+      ) AS geojson
+      FROM tilfluktsromoffentlige.tilfluktsrom
+      WHERE ST_Intersects(location, ${agderGeom})
+        AND capacity >= $1
+    `;
+    
+    const result = await pool.query(q, [minCapacity]);
+    res.json(result.rows[0].geojson);
+  } catch (err) {
+    console.error('analysis/tilfluktsrom-min failed:', err.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// List all fylker (not filtered to Agder - needed for dropdown)
+app.get('/analysis/fylke-list', async (req, res) => {
+  try {
+    const q = `
+      SELECT DISTINCT navn AS name
+      FROM fylker.administrativenhetnavn
+      ORDER BY navn
+    `;
+    const result = await pool.query(q);
+    res.json({ names: result.rows.map(r => r.name) });
+  } catch (err) {
+    console.error('analysis/fylke-list failed:', err.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// List available discovery tables
+app.get('/analysis/fylke-discover', async (req, res) => {
+  try {
+    const nameCols = await pool.query(`
+      SELECT table_schema, table_name, array_agg(column_name ORDER BY column_name) AS columns
+      FROM information_schema.columns
+      WHERE column_name ILIKE 'navn'
+      GROUP BY table_schema, table_name
+      ORDER BY table_schema, table_name
+    `);
+
+    const geomCols = await pool.query(`
+      SELECT table_schema, table_name, array_agg(column_name ORDER BY column_name) AS geom_columns
+      FROM information_schema.columns
+      WHERE udt_name IN ('geometry','geography')
+      GROUP BY table_schema, table_name
+      ORDER BY table_schema, table_name
+    `);
+
+    const nameSet = new Map();
+    nameCols.rows.forEach(r => { nameSet.set(\`\${r.table_schema}.\${r.table_name}\`, r.columns); });
+
+    const geomSet = new Map();
+    geomCols.rows.forEach(r => { geomSet.set(\`\${r.table_schema}.\${r.table_name}\`, r.geom_columns); });
+
+    const tablesWithBoth = [];
+    for (const [key, cols] of nameSet.entries()) {
+      if (geomSet.has(key)) {
+        tablesWithBoth.push({
+          table: key,
+          name_columns: cols,
+          geom_columns: geomSet.get(key),
+        });
+      }
+    }
+
+    res.json({
+      name_tables: nameCols.rows,
+      geom_tables: geomCols.rows,
+      tables_with_both: tablesWithBoth,
+    });
+  } catch (err) {
+    console.error('analysis/fylke-discover failed:', err.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Get fylke outline as GeoJSON
+app.get('/analysis/fylke-outline', async (req, res) => {
+  try {
+    const fylkeName = req.query.fylke_name;
+    if (!fylkeName) return res.status(400).json({ error: 'Missing fylke_name' });
+    
+    const q = `
+      SELECT json_build_object(
+        'type', 'FeatureCollection',
+        'features', COALESCE(json_agg(
+          json_build_object(
+            'type', 'Feature',
+            'geometry', ST_AsGeoJSON(omrade)::json,
+            'properties', json_build_object('fylkesnavn', fylkesnavn)
+          )
+        ), '[]'::json)
+      ) AS geojson
+      FROM fylker.fylke
+      WHERE fylkesnavn = $1
+    `;
+    
+    const result = await pool.query(q, [fylkeName]);
+    res.json(result.rows[0]?.geojson || { type: 'FeatureCollection', features: [] });
+  } catch (err) {
+    console.error('analysis/fylke-outline failed:', err.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Get brannstasjoner inside a fylke
+app.get('/analysis/brannstasjoner-in-fylke', async (req, res) => {
+  try {
+    const fylkeName = req.query.fylke_name;
+    if (!fylkeName) return res.status(400).json({ error: 'Missing fylke_name' });
+    
+    const q = `
+      WITH fylke_geom AS (
+        SELECT omrade
+        FROM fylker.fylke
+        WHERE fylkesnavn = $1
+      )
+      SELECT json_build_object(
+        'type', 'FeatureCollection',
+        'features', COALESCE(json_agg(
+          json_build_object(
+            'type', 'Feature',
+            'geometry', ST_AsGeoJSON(ST_Transform(posisjon, 4326))::json,
+            'properties', to_jsonb(b) - 'posisjon'
+          )
+        ), '[]'::json)
+      ) AS geojson
+      FROM brannstasjoner.brannstasjon b
+      WHERE ST_Within(
+        ST_Transform(b.posisjon, 4326),
+        (SELECT omrade FROM fylke_geom)
+      )
+    `;
+    
+    const result = await pool.query(q, [fylkeName]);
+    res.json(result.rows[0]?.geojson || { type: 'FeatureCollection', features: [] });
+  } catch (err) {
+    console.error('analysis/brannstasjoner-in-fylke failed:', err.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Generic spatial search within Agder
+app.get('/analysis/search', async (req, res) => {
+  try {
+    const { table, field, value } = req.query;
+    if (!table || !field) return res.status(400).json({ error: 'Missing table or field' });
+    
+    const agderBBox = 'POLYGON((7.0 57.8, 9.5 57.8, 9.5 59.0, 7.0 59.0, 7.0 57.8))';
+    const agderGeom = `ST_GeomFromText('${agderBBox}', 4326)`;
+    
+    // Only search within safe, known tables
+    const safeTables = ['tilfluktsromoffentlige.tilfluktsrom', 'public.population_cells'];
+    if (!safeTables.includes(table)) {
+      return res.status(400).json({ error: 'Table not allowed' });
+    }
+    
+    const q = \`SELECT * FROM \${table} WHERE \${field} ILIKE $1 AND ST_Intersects(location, \${agderGeom})\`;
+    const result = await pool.query(q, [\`%\${value}%\`]);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('analysis/search failed:', err.message);
+    res.status(500).json({ error: 'Database error' });
   }
 });
 
