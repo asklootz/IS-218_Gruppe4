@@ -1186,10 +1186,10 @@ app.get('/analysis/fylke-discover', async (req, res) => {
     `);
 
     const nameSet = new Map();
-    nameCols.rows.forEach(r => { nameSet.set(\`\${r.table_schema}.\${r.table_name}\`, r.columns); });
+    nameCols.rows.forEach(r => { nameSet.set(`${r.table_schema}.${r.table_name}`, r.columns); });
 
     const geomSet = new Map();
-    geomCols.rows.forEach(r => { geomSet.set(\`\${r.table_schema}.\${r.table_name}\`, r.geom_columns); });
+    geomCols.rows.forEach(r => { geomSet.set(`${r.table_schema}.${r.table_name}`, r.geom_columns); });
 
     const tablesWithBoth = [];
     for (const [key, cols] of nameSet.entries()) {
@@ -1294,8 +1294,8 @@ app.get('/analysis/search', async (req, res) => {
       return res.status(400).json({ error: 'Table not allowed' });
     }
     
-    const q = \`SELECT * FROM \${table} WHERE \${field} ILIKE $1 AND ST_Intersects(location, \${agderGeom})\`;
-    const result = await pool.query(q, [\`%\${value}%\`]);
+    const q = `SELECT * FROM ${table} WHERE ${field} ILIKE $1 AND ST_Intersects(location, ${agderGeom})`;
+    const result = await pool.query(q, [`%${value}%`]);
     res.json(result.rows);
   } catch (err) {
     console.error('analysis/search failed:', err.message);
