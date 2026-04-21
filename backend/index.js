@@ -203,6 +203,59 @@ async function getBoundaryLayerGeoJson(layer) {
   }
 }
 
+async function getBoundaryLayerGeoJsonFiltered(layer) {
+  const fullGeoJson = await getBoundaryLayerGeoJson(layer);
+  
+  // Agder fylke bounds (approximate coordinates for Agder region in southern Norway)
+  const agderBBox = {
+    type: 'Polygon',
+    coordinates: [[[7.0, 57.8], [9.5, 57.8], [9.5, 59.0], [7.0, 59.0], [7.0, 57.8]]]
+  };
+  
+  // Filter features that intersect with Agder bounds
+  const filteredFeatures = fullGeoJson.features.filter(feature => {
+    try {
+      // Simple bounding box intersection check
+      const geom = feature.geometry;
+      if (!geom) return false;
+      
+      // Get bounds of the feature
+      let minLon = Infinity, maxLon = -Infinity, minLat = Infinity, maxLat = -Infinity;
+      
+      function processCoords(coords) {
+        if (Array.isArray(coords[0])) {
+          coords.forEach(processCoords);
+        } else {
+          minLon = Math.min(minLon, coords[0]);
+          maxLon = Math.max(maxLon, coords[0]);
+          minLat = Math.min(minLat, coords[1]);
+          maxLat = Math.max(maxLat, coords[1]);
+        }
+      }
+      
+      if (geom.type === 'Polygon' || geom.type === 'MultiPolygon') {
+        processCoords(geom.coordinates);
+      } else if (geom.type === 'Point') {
+        minLon = maxLon = geom.coordinates[0];
+        minLat = maxLat = geom.coordinates[1];
+      }
+      
+      // Check if feature bounds intersect with Agder bounds
+      const agderMinLon = 7.0, agderMaxLon = 9.5, agderMinLat = 57.8, agderMaxLat = 59.0;
+      
+      return !(maxLon < agderMinLon || minLon > agderMaxLon || maxLat < agderMinLat || minLat > agderMaxLat);
+    } catch (e) {
+      console.warn(`Error filtering feature:`, e.message);
+      return false;
+    }
+  });
+  
+  return {
+    type: 'FeatureCollection',
+    features: filteredFeatures
+  };
+}
+
 function firstCoordinate(geometry) {
   if (!geometry) return null;
   const coords = geometry.coordinates;
@@ -555,15 +608,16 @@ async function bootstrap() {
     console.log(`Skipping population ingest (already ${existingPopulation} rows).`);
   }
 
-  // Cache counties and municipalities as GeoJSON layers for frontend toggles
+  // Cache counties and municipalities as GeoJSON layers for frontend toggles (Agder-filtered)
   try {
     const counties = await cacheGeoJsonFromZip(
       'counties',
       'https://nedlasting.geonorge.no/geonorge/Basisdata/Fylker/GeoJSON/Basisdata_0000_Norge_25833_Fylker_GeoJSON.zip'
     );
     const countiesWgs84 = await transformProjectedFeatureCollection(counties);
-    fs.writeFileSync(path.join(CACHE_DIR, 'counties.geojson'), JSON.stringify(countiesWgs84));
-    console.log(`✓ Counties cached: ${(countiesWgs84.features || []).length}`);
+    const countiesFiltered = await getBoundaryLayerGeoJsonFiltered('counties');
+    fs.writeFileSync(path.join(CACHE_DIR, 'counties.geojson'), JSON.stringify(countiesFiltered));
+    console.log(`✓ Counties cached (Agder-filtered): ${(countiesFiltered.features || []).length}`);
   } catch (error) {
     console.error('Counties cache failed:', error.message);
   }
@@ -574,8 +628,9 @@ async function bootstrap() {
       'https://nedlasting.geonorge.no/geonorge/Basisdata/Kommuner/GeoJSON/Basisdata_0000_Norge_25833_Kommuner_GeoJSON.zip'
     );
     const municipalitiesWgs84 = await transformProjectedFeatureCollection(municipalities);
-    fs.writeFileSync(path.join(CACHE_DIR, 'municipalities.geojson'), JSON.stringify(municipalitiesWgs84));
-    console.log(`✓ Municipalities cached: ${(municipalitiesWgs84.features || []).length}`);
+    const municipalitiesFiltered = await getBoundaryLayerGeoJsonFiltered('municipalities');
+    fs.writeFileSync(path.join(CACHE_DIR, 'municipalities.geojson'), JSON.stringify(municipalitiesFiltered));
+    console.log(`✓ Municipalities cached (Agder-filtered): ${(municipalitiesFiltered.features || []).length}`);
   } catch (error) {
     console.error('Municipalities cache failed:', error.message);
   }
@@ -1074,7 +1129,7 @@ app.get('/api/layers/:layer', async (req, res) => {
       `;
       result = await pool.query(query);
     } else if (layer === 'counties' || layer === 'municipalities') {
-      const geojson = await getBoundaryLayerGeoJson(layer);
+      const geojson = await getBoundaryLayerGeoJsonFiltered(layer);
       return res.json(geojson);
     }
     
