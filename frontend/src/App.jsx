@@ -169,6 +169,11 @@ function AdminPage({ onBack }) {
     population: true,
     counties: true,
     municipalities: false,
+    fire_stations: true,
+    farms: true,
+    water_sources: true,
+    doctors: true,
+    hospitals: true,
     radius: true
   })
 
@@ -199,6 +204,11 @@ function AdminPage({ onBack }) {
     setVisibility('counties-fill', visibleLayers.counties)
     setVisibility('counties-line', visibleLayers.counties)
     setVisibility('municipalities-line', visibleLayers.municipalities)
+    setVisibility('fire_stations-layer', visibleLayers.fire_stations)
+    setVisibility('farms-layer', visibleLayers.farms)
+    setVisibility('water_sources-layer', visibleLayers.water_sources)
+    setVisibility('doctors-layer', visibleLayers.doctors)
+    setVisibility('hospitals-layer', visibleLayers.hospitals)
     setVisibility('radius-fill', visibleLayers.radius)
     setVisibility('radius-line', visibleLayers.radius)
 
@@ -305,6 +315,63 @@ function AdminPage({ onBack }) {
           })
         } else {
           map.current.getSource('municipalities').setData(municipalitiesData)
+        }
+      }
+
+      // Load fire stations
+      const fireRes = await axios.get(`${API_BASE}/api/layers/fire_stations`)
+      if (fireRes.data.features) {
+        if (!map.current.getSource('fire_stations')) {
+          map.current.addSource('fire_stations', { type: 'geojson', data: fireRes.data })
+          map.current.addLayer({
+            id: 'fire_stations-layer',
+            type: 'circle',
+            source: 'fire_stations',
+            paint: {
+              'circle-radius': 5,
+              'circle-color': '#ff6b6b',
+              'circle-stroke-width': 2,
+              'circle-stroke-color': '#fff'
+            }
+          })
+        } else {
+          map.current.getSource('fire_stations').setData(fireRes.data)
+        }
+      }
+
+      // Load Overture layers
+      const layersConfig = [
+        { name: 'farms', color: '#84cc16', label: 'Farms' },
+        { name: 'water_sources', color: '#06b6d4', label: 'Water Sources' },
+        { name: 'doctors', color: '#f97316', label: 'Doctors' },
+        { name: 'hospitals', color: '#d946ef', label: 'Hospitals' }
+      ]
+
+      for (const layerConfig of layersConfig) {
+        try {
+          const res = await axios.get(`${API_BASE}/api/layers/${layerConfig.name}`)
+          console.log(`Loaded ${layerConfig.name}:`, res.data.features?.length, 'features')
+          if (res.data.features && res.data.features.length > 0) {
+            if (!map.current.getSource(layerConfig.name)) {
+              map.current.addSource(layerConfig.name, { type: 'geojson', data: res.data })
+              map.current.addLayer({
+                id: `${layerConfig.name}-layer`,
+                type: 'circle',
+                source: layerConfig.name,
+                paint: {
+                  'circle-radius': 4,
+                  'circle-color': layerConfig.color,
+                  'circle-stroke-width': 1,
+                  'circle-stroke-color': '#fff'
+                }
+              })
+              console.log(`Added layer: ${layerConfig.name}-layer`)
+            } else {
+              map.current.getSource(layerConfig.name).setData(res.data)
+            }
+          }
+        } catch (error) {
+          console.warn(`Failed to load ${layerConfig.name}:`, error.message)
         }
       }
 
@@ -555,6 +622,46 @@ function AdminPage({ onBack }) {
               onChange={(e) => setVisibleLayers({ ...visibleLayers, municipalities: e.target.checked })}
             />
             Kommuner
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={visibleLayers.fire_stations}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, fire_stations: e.target.checked })}
+            />
+            Brannstasjoner
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={visibleLayers.farms}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, farms: e.target.checked })}
+            />
+            Farms
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={visibleLayers.water_sources}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, water_sources: e.target.checked })}
+            />
+            Water Sources
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={visibleLayers.doctors}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, doctors: e.target.checked })}
+            />
+            Doctors
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={visibleLayers.hospitals}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, hospitals: e.target.checked })}
+            />
+            Hospitals
           </label>
         </div>
       </div>

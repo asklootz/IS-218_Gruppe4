@@ -33,7 +33,11 @@ Inneholder to sider:
 | Befolkning     | Geonorge | GML/GeoJSON      | Parsing → filtrering → lagring i PostGIS |
 | Fylker         | Geonorge | GeoJSON          | Cache + reprojisering |
 | Kommuner       | Geonorge | GeoJSON          | Cache + reprojisering |
-| Brannstasjoner | Lokal DB | PostGIS          | Romlige spørringer (ST_Within) |
+| Brannstasjoner | Geonorge | GML (ZIP)        | Nedlasting → GML parsing → lagring i PostGIS |
+| Farms          | Overture | Parquet (S3)     | Nedlasting → parsing → lagring i PostGIS |
+| Water Sources  | Overture | Parquet (S3)     | Nedlasting → parsing → lagring i PostGIS |
+| Doctors        | Overture | Parquet (S3)     | Nedlasting → parsing → lagring i PostGIS |
+| Hospitals      | Overture | Parquet (S3)     | Nedlasting → parsing → lagring i PostGIS |
 
 ## Arkitekturskisse: 
 

@@ -10,10 +10,12 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const axios = require('axios');
 const AdmZip = require('adm-zip');
+const xml2js = require('xml2js');
 const { v4: uuidv4 } = require('uuid');
 const XLSX = require('xlsx');
 const fs = require('fs');
 const path = require('path');
+const { execSync } = require('child_process');
 
 const app = express();
 app.use(cors());
@@ -131,6 +133,93 @@ async function extractGeoJsonFromZip(buffer, layerHint = '') {
     return bestCandidate || { type: 'FeatureCollection', features: [] };
   } catch (error) {
     console.error('ZIP extraction error:', error.message);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
+function asArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value === undefined || value === null) return [];
+  return [value];
+}
+
+function xmlValue(value) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  if (Array.isArray(value)) return xmlValue(value[0]);
+  if (typeof value === 'object') {
+    if (value._ !== undefined && value._ !== null) return String(value._);
+  }
+  return undefined;
+}
+
+function extractPrefixedFields(record, prefix) {
+  const out = {};
+  if (!record || typeof record !== 'object') return out;
+  for (const [key, raw] of Object.entries(record)) {
+    if (!String(key).startsWith(prefix)) continue;
+    const clean = String(key).slice(prefix.length);
+    out[clean] = xmlValue(raw);
+  }
+  return out;
+}
+
+async function extractFireStationsFromGmlZip(buffer) {
+  try {
+    const zip = new AdmZip(buffer);
+    const entries = zip.getEntries();
+    const gmlEntry = entries.find((entry) => {
+      const lower = String(entry.name || '').toLowerCase();
+      return !entry.isDirectory && lower.endsWith('.gml');
+    });
+
+    if (!gmlEntry) return { type: 'FeatureCollection', features: [] };
+
+    const xml = gmlEntry.getData().toString('utf8').replace(/^\uFEFF/, '');
+    const parsed = await xml2js.parseStringPromise(xml, {
+      explicitArray: false,
+      mergeAttrs: true,
+      trim: true,
+    });
+
+    const members = asArray(parsed?.['gml:FeatureCollection']?.['gml:featureMember']);
+    const features = [];
+
+    for (const member of members) {
+      const station = member?.['app:Brannstasjon'];
+      if (!station) continue;
+
+      const posText = xmlValue(station?.['app:posisjon']?.['gml:Point']?.['gml:pos']);
+      if (!posText) continue;
+
+      const coords = posText.split(/\s+/).map(Number).filter(Number.isFinite);
+      if (coords.length < 2) continue;
+
+      // In EPSG:4258 GML, positions are typically stored as lat lon.
+      const lat = coords[0];
+      const lon = coords[1];
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
+
+      const properties = {
+        ...extractPrefixedFields(station, 'app:'),
+        gml_id: station?.['gml:id'] || undefined,
+      };
+
+      features.push({
+        type: 'Feature',
+        geometry: {
+          type: 'Point',
+          coordinates: [lon, lat],
+        },
+        properties,
+      });
+    }
+
+    return { type: 'FeatureCollection', features };
+  } catch (error) {
+    console.error('GML extraction error:', error.message);
     return { type: 'FeatureCollection', features: [] };
   }
 }
@@ -295,6 +384,10 @@ function parseNumber(value, fallback = 0) {
 }
 
 async function transformProjectedFeatureCollection(geojson) {
+  return transformProjectedFeatureCollectionWithSrid(geojson, 25833);
+}
+
+async function transformProjectedFeatureCollectionWithSrid(geojson, sourceSrid = 25833) {
   if (!geojson.features || geojson.features.length === 0) return geojson;
   
   const firstCoord = firstCoordinate(geojson.features[0].geometry);
@@ -311,8 +404,8 @@ async function transformProjectedFeatureCollection(geojson) {
       try {
         const geomJson = JSON.stringify(feature.geometry);
         const result = await pool.query(
-          `SELECT ST_AsGeoJSON(ST_Transform(ST_SetSRID(ST_GeomFromGeoJSON($1), 25833), 4326))::json AS geom`,
-          [geomJson]
+          `SELECT ST_AsGeoJSON(ST_Transform(ST_SetSRID(ST_GeomFromGeoJSON($1), $2), 4326))::json AS geom`,
+          [geomJson, sourceSrid]
         );
         
         if (result.rows[0] && result.rows[0].geom) {
@@ -342,6 +435,8 @@ async function initSchema() {
     
     // Create schema if doesn't exist
     await pool.query('CREATE SCHEMA IF NOT EXISTS tilfluktsromoffentlige');
+    await pool.query('CREATE SCHEMA IF NOT EXISTS brannstasjoner');
+    await pool.query('CREATE SCHEMA IF NOT EXISTS overture');
     
     // Create shelters table (tilfluktsrom)
     await pool.query(`
@@ -358,6 +453,74 @@ async function initSchema() {
     // Create spatial index
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_tilfluktsrom_location ON tilfluktsromoffentlige.tilfluktsrom USING GIST(location)
+    `);
+
+    // Fire stations used by analysis endpoints.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS brannstasjoner.brannstasjon (
+        id SERIAL PRIMARY KEY,
+        objid TEXT UNIQUE,
+        brannstasjon TEXT,
+        brannvesen TEXT,
+        stasjonstype TEXT,
+        kasernert TEXT,
+        opphav TEXT,
+        posisjon GEOMETRY(Point, 4326),
+        raw_properties JSONB
+      )
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_brannstasjon_posisjon ON brannstasjoner.brannstasjon USING GIST(posisjon)
+    `);
+
+    // Overture Maps data tables
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS overture.farms (
+        id TEXT PRIMARY KEY,
+        name VARCHAR(255),
+        location GEOMETRY(Point, 4326),
+        raw_properties JSONB
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_farms_location ON overture.farms USING GIST(location)
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS overture.water_sources (
+        id TEXT PRIMARY KEY,
+        name VARCHAR(255),
+        location GEOMETRY(Point, 4326),
+        raw_properties JSONB
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_water_sources_location ON overture.water_sources USING GIST(location)
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS overture.doctors (
+        id TEXT PRIMARY KEY,
+        name VARCHAR(255),
+        location GEOMETRY(Point, 4326),
+        raw_properties JSONB
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_doctors_location ON overture.doctors USING GIST(location)
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS overture.hospitals (
+        id TEXT PRIMARY KEY,
+        name VARCHAR(255),
+        location GEOMETRY(Point, 4326),
+        raw_properties JSONB
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_hospitals_location ON overture.hospitals USING GIST(location)
     `);
     
     // Create population grid table
@@ -485,6 +648,182 @@ async function ingestPopulation(geojson) {
   return inserted;
 }
 
+async function ingestFireStations(geojson) {
+  if (!geojson.features) return 0;
+
+  let inserted = 0;
+  for (const feature of geojson.features) {
+    try {
+      const properties = feature.properties || {};
+      const coord = firstCoordinate(feature.geometry);
+      if (!coord || coord.length < 2) continue;
+
+      const lon = Number(coord[0]);
+      const lat = Number(coord[1]);
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
+
+      const fallbackId = `${lon.toFixed(6)}_${lat.toFixed(6)}`;
+      const objid = String(getPropIgnoreCase(properties, ['objid', 'anleggid', 'gml_id']) || fallbackId);
+      const brannstasjon = String(getPropIgnoreCase(properties, ['brannstasjon', 'name', 'navn']) || 'Brannstasjon');
+      const brannvesen = String(getPropIgnoreCase(properties, ['brannvesen']) || '');
+      const stasjonstype = String(getPropIgnoreCase(properties, ['stasjonstype']) || '');
+      const kasernert = String(getPropIgnoreCase(properties, ['kasernert']) || '');
+      const opphav = String(getPropIgnoreCase(properties, ['opphav']) || '');
+
+      await pool.query(`
+        INSERT INTO brannstasjoner.brannstasjon
+          (objid, brannstasjon, brannvesen, stasjonstype, kasernert, opphav, posisjon, raw_properties)
+        VALUES
+          ($1, $2, $3, $4, $5, $6, ST_SetSRID(ST_MakePoint($7, $8), 4326), $9)
+        ON CONFLICT (objid) DO UPDATE SET
+          brannstasjon = EXCLUDED.brannstasjon,
+          brannvesen = EXCLUDED.brannvesen,
+          stasjonstype = EXCLUDED.stasjonstype,
+          kasernert = EXCLUDED.kasernert,
+          opphav = EXCLUDED.opphav,
+          posisjon = EXCLUDED.posisjon,
+          raw_properties = EXCLUDED.raw_properties
+      `, [objid, brannstasjon, brannvesen, stasjonstype, kasernert, opphav, lon, lat, JSON.stringify(properties)]);
+
+      inserted++;
+    } catch (error) {
+      console.error('Ingest fire station error:', error.message);
+    }
+  }
+
+  return inserted;
+}
+
+async function ingestOvertureLayer(table, features) {
+  if (!features || features.length === 0) return 0;
+
+  let inserted = 0;
+  for (const feature of features) {
+    try {
+      const properties = feature.properties || {};
+      const geometry = feature.geometry;
+      if (!geometry || !geometry.coordinates) continue;
+
+      const id = String(properties.id || feature.id || `${geometry.coordinates[0]}_${geometry.coordinates[1]}`);
+      const name = String(properties.name || properties.names?.primary || 'Unknown');
+      const lon = Number(geometry.coordinates[0]);
+      const lat = Number(geometry.coordinates[1]);
+
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
+
+      await pool.query(`
+        INSERT INTO overture.${table}
+          (id, name, location, raw_properties)
+        VALUES
+          ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326), $5)
+        ON CONFLICT (id) DO UPDATE SET
+          name = EXCLUDED.name,
+          location = EXCLUDED.location,
+          raw_properties = EXCLUDED.raw_properties
+      `, [id, name, lon, lat, JSON.stringify(properties)]);
+
+      inserted++;
+    } catch (error) {
+      console.error(`Ingest ${table} error:`, error.message);
+    }
+  }
+
+  return inserted;
+}
+
+async function downloadAndIngestOvertureData() {
+  try {
+    const geoJsonFile = '/app/places_agder.geojson';
+    
+    // Download if not already present
+    if (!fs.existsSync(geoJsonFile)) {
+      console.log('Running Overture Maps download for Agder...');
+      try {
+        execSync('python3 /app/download_overture.py', { stdio: 'inherit', timeout: 300000 });
+      } catch (error) {
+        console.warn('Overture download warning:', error.message);
+        return 0;
+      }
+    }
+    
+    if (!fs.existsSync(geoJsonFile)) {
+      console.warn('Overture GeoJSON file not found');
+      return 0;
+    }
+    
+    // Parse GeoJSON and categorize by place type
+    const geojson = JSON.parse(fs.readFileSync(geoJsonFile, 'utf8'));
+    if (!geojson.features) return 0;
+    
+    console.log(`Processing ${geojson.features.length} Overture place features...`);
+    
+    let inserted = 0;
+    const typeMap = {
+      farms: [],
+      water_sources: [],
+      doctors: [],
+      hospitals: [],
+      other: []
+    };
+    
+    for (const feature of geojson.features) {
+      const props = feature.properties || {};
+      const geometry = feature.geometry;
+      if (!geometry || geometry.type !== 'Point') continue;
+      
+      const id = props.id || uuidv4();
+      const name = props.name || props.names?.primary || 'Unknown Place';
+      const lon = geometry.coordinates[0];
+      const lat = geometry.coordinates[1];
+      const categories = props.categories || {};
+      const categoryPrimary = (categories.primary || '').toLowerCase();
+      
+      // Categorize by primary category
+      let category = 'other';
+      if (categoryPrimary.includes('farm') || categoryPrimary.includes('agricultural')) {
+        category = 'farms';
+      } else if (categoryPrimary.includes('water')) {
+        category = 'water_sources';
+      } else if (categoryPrimary.includes('doctor') || categoryPrimary.includes('clinic') || categoryPrimary.includes('urgent_care')) {
+        category = 'doctors';
+      } else if (categoryPrimary.includes('hospital')) {
+        category = 'hospitals';
+      }
+      
+      if (category !== 'other') {
+        typeMap[category].push({ id, name, lon, lat, props });
+        inserted++;
+      }
+    }
+    
+    // Ingest categorized places
+    for (const [table, places] of Object.entries(typeMap)) {
+      if (table === 'other' || places.length === 0) continue;
+      
+      for (const place of places) {
+        try {
+          await pool.query(`
+            INSERT INTO overture.${table} (id, name, location, raw_properties)
+            VALUES ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326), $5)
+            ON CONFLICT (id) DO UPDATE SET
+              name = EXCLUDED.name,
+              location = EXCLUDED.location,
+              raw_properties = EXCLUDED.raw_properties
+          `, [place.id, place.name, place.lon, place.lat, JSON.stringify(place.props)]);
+        } catch (error) {
+          console.error(`Error ingesting ${table}:`, error.message);
+        }
+      }
+      console.log(`✓ Ingested ${places.length} places into ${table}`);
+    }
+    
+    return inserted;
+  } catch (error) {
+    console.error('Overture data ingestion error:', error.message);
+    return 0;
+  }
+}
+
 async function generateSyntheticPopulation() {
   try {
     // Reset fallback population to avoid accumulation across repeated bootstrap runs.
@@ -542,11 +881,13 @@ async function bootstrap() {
     SELECT
       (SELECT COUNT(*)::int FROM tilfluktsromoffentlige.tilfluktsrom) AS shelters,
       (SELECT COUNT(*)::int FROM public.population_cells) AS population,
-      (SELECT COALESCE(SUM(population), 0)::bigint FROM public.population_cells) AS population_sum
+      (SELECT COALESCE(SUM(population), 0)::bigint FROM public.population_cells) AS population_sum,
+      (SELECT COUNT(*)::int FROM brannstasjoner.brannstasjon) AS fire_stations
   `);
   let existingShelters = Number(existing.rows[0]?.shelters || 0);
   let existingPopulation = Number(existing.rows[0]?.population || 0);
   let existingPopulationSum = Number(existing.rows[0]?.population_sum || 0);
+  const existingFireStations = Number(existing.rows[0]?.fire_stations || 0);
 
   // Self-heal old inflated fallback datasets from previous versions.
   if (existingPopulation > 50000 || existingPopulationSum > 6_500_000) {
@@ -564,11 +905,6 @@ async function bootstrap() {
     console.log(`Population baseline repaired (rows=${existingPopulation}, sum=${existingPopulationSum}).`);
   }
 
-  if (existingShelters > 0 && existingPopulation > 0) {
-    console.log(`Data already in database (shelters=${existingShelters}, population=${existingPopulation}), skipping re-ingest.`);
-    return;
-  }
-  
   // Download and ingest shelters
   if (existingShelters === 0) {
     try {
@@ -606,6 +942,93 @@ async function bootstrap() {
     }
   } else {
     console.log(`Skipping population ingest (already ${existingPopulation} rows).`);
+  }
+
+  // Download and ingest fire stations from provided Geonorge GML ZIP.
+  if (existingFireStations === 0) {
+    try {
+      console.log('Downloading fire stations...');
+      const fireZip = await downloadBuffer(
+        'https://nedlasting.geonorge.no/api/download/order/9e8cd748-a26f-4f93-8448-37a10fff8b35/ebba84f5-0e8c-4eb0-84e9-39e58cd40cf2'
+      );
+      const fireGeo = await extractFireStationsFromGmlZip(fireZip);
+      const fireCount = await ingestFireStations(fireGeo);
+      console.log(`✓ Fire stations ingested: ${fireCount}`);
+    } catch (error) {
+      console.error('Fire stations bootstrap failed:', error.message);
+    }
+  } else {
+    console.log(`Skipping fire station ingest (already ${existingFireStations} rows).`);
+  }
+
+  // Download and ingest real Overture Maps data for Agder
+  try {
+    const farmCount = await pool.query('SELECT COUNT(*) as count FROM overture.farms');
+    if (farmCount.rows[0].count === 0) {
+      console.log('Downloading real Overture Maps data for Agder...');
+      const count = await downloadAndIngestOvertureData();
+      if (count > 0) {
+        console.log(`✓ Overture data loaded: ${count} features across all categories`);
+      } else {
+        console.log('No Overture data ingested, using sample data fallback...');
+        // Sample farms in Agder region (fallback if download fails)
+        const farmSamples = [
+          { id: 'farm_1', name: 'Gård Kristiansand', lon: 8.767, lat: 58.015 },
+          { id: 'farm_2', name: 'Økogård Lillesand', lon: 8.376, lat: 58.267 },
+          { id: 'farm_3', name: 'Appelsinhagen', lon: 7.751, lat: 58.469 }
+        ];
+        for (const farm of farmSamples) {
+          await pool.query(`
+            INSERT INTO overture.farms (id, name, location, raw_properties)
+            VALUES ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326), $5)
+            ON CONFLICT (id) DO NOTHING
+          `, [farm.id, farm.name, farm.lon, farm.lat, JSON.stringify(farm)]);
+        }
+        
+        // Sample water sources
+        const waterSamples = [
+          { id: 'water_1', name: 'Vannverk Mandal', lon: 7.467, lat: 58.031 },
+          { id: 'water_2', name: 'Vannbehandling Arendal', lon: 8.769, lat: 58.460 }
+        ];
+        for (const water of waterSamples) {
+          await pool.query(`
+            INSERT INTO overture.water_sources (id, name, location, raw_properties)
+            VALUES ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326), $5)
+            ON CONFLICT (id) DO NOTHING
+          `, [water.id, water.name, water.lon, water.lat, JSON.stringify(water)]);
+        }
+        
+        // Sample doctors/urgent care
+        const doctorSamples = [
+          { id: 'doc_1', name: 'Legevakt Kristiansand', lon: 8.772, lat: 58.010 },
+          { id: 'doc_2', name: 'Legevakt Arendal', lon: 8.769, lat: 58.462 },
+          { id: 'doc_3', name: 'Legevakt Mandal', lon: 7.467, lat: 58.032 }
+        ];
+        for (const doctor of doctorSamples) {
+          await pool.query(`
+            INSERT INTO overture.doctors (id, name, location, raw_properties)
+            VALUES ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326), $5)
+            ON CONFLICT (id) DO NOTHING
+          `, [doctor.id, doctor.name, doctor.lon, doctor.lat, JSON.stringify(doctor)]);
+        }
+        
+        // Sample hospitals
+        const hospitalSamples = [
+          { id: 'hosp_1', name: 'Sykehuset i Kristiansand', lon: 8.767, lat: 58.015 },
+          { id: 'hosp_2', name: 'Sykehuset i Arendal', lon: 8.769, lat: 58.462 }
+        ];
+        for (const hospital of hospitalSamples) {
+          await pool.query(`
+            INSERT INTO overture.hospitals (id, name, location, raw_properties)
+            VALUES ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326), $5)
+            ON CONFLICT (id) DO NOTHING
+          `, [hospital.id, hospital.name, hospital.lon, hospital.lat, JSON.stringify(hospital)]);
+        }
+        console.log('✓ Sample Overture data loaded');
+      }
+    }
+  } catch (error) {
+    console.error('Overture data loading failed:', error.message);
   }
 
   // Cache counties and municipalities as GeoJSON layers for frontend toggles (Agder-filtered)
@@ -1126,6 +1549,47 @@ app.get('/api/layers/:layer', async (req, res) => {
           ))
         ) AS geojson
         FROM (SELECT * FROM public.population_cells WHERE ST_Intersects(location, ${agderGeom}) LIMIT 3000) p
+      `;
+      result = await pool.query(query);
+    } else if (layer === 'fire_stations') {
+      query = `
+        SELECT json_build_object(
+          'type', 'FeatureCollection',
+          'features', COALESCE(json_agg(json_build_object(
+            'type', 'Feature',
+            'geometry', ST_AsGeoJSON(posisjon)::json,
+            'properties', json_build_object(
+              'objid', objid,
+              'brannstasjon', brannstasjon,
+              'brannvesen', brannvesen,
+              'stasjonstype', stasjonstype,
+              'kasernert', kasernert,
+              'opphav', opphav
+            )
+          )), '[]'::json)
+        ) AS geojson
+        FROM brannstasjoner.brannstasjon
+        WHERE ST_Intersects(posisjon, ${agderGeom})
+      `;
+      result = await pool.query(query);
+    } else if (layer === 'farms' || layer === 'water_sources' || layer === 'doctors' || layer === 'hospitals') {
+      // Overture Maps layers
+      query = `
+        SELECT json_build_object(
+          'type', 'FeatureCollection',
+          'features', COALESCE(json_agg(json_build_object(
+            'type', 'Feature',
+            'geometry', json_build_object('type', 'Point', 'coordinates', json_build_array(ST_X(location), ST_Y(location))),
+            'properties', json_build_object(
+              'id', id,
+              'name', name,
+              'type', '${layer}'
+            )
+          )), '[]'::json)
+        ) AS geojson
+        FROM overture.${layer}
+        WHERE ST_Intersects(location, ${agderGeom})
+        LIMIT 1000
       `;
       result = await pool.query(query);
     } else if (layer === 'counties' || layer === 'municipalities') {
