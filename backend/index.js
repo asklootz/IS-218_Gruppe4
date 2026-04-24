@@ -1450,6 +1450,127 @@ app.post('/api/users/:userId/location', async (req, res) => {
   }
 });
 
+// Admin: create a new safe area
+app.post('/api/admin/safe-areas', async (req, res) => {
+  try {
+    const { name, lon, lat, capacity } = req.body;
+    
+    if (!name || lon === undefined || lat === undefined) {
+      return res.status(400).json({ error: 'Missing name, lon, or lat' });
+    }
+    
+    // Ensure table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS public.safe_areas (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        location GEOMETRY(Point, 4326) NOT NULL,
+        capacity INT DEFAULT 0,
+        created_by VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_safe_areas_location ON public.safe_areas USING GIST(location);
+    `);
+    
+    const result = await pool.query(`
+      INSERT INTO public.safe_areas (name, location, capacity)
+      VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 4326), $4)
+      RETURNING id, name, ST_X(location) as lon, ST_Y(location) as lat, capacity, created_at
+    `, [name, parseFloat(lon), parseFloat(lat), parseInt(capacity) || 0]);
+    
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error creating safe area:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all safe areas as GeoJSON
+app.get('/api/layers/safe-areas', async (req, res) => {
+  try {
+    // Check if table exists first
+    const tableExists = await pool.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name = 'safe_areas'
+      );
+    `);
+    
+    if (!tableExists.rows[0].exists) {
+      console.log('safe_areas table does not exist yet');
+      return res.json({
+        type: 'FeatureCollection',
+        features: []
+      });
+    }
+    
+    const result = await pool.query(`
+      SELECT 
+        id,
+        name,
+        capacity,
+        ST_X(location) as lon,
+        ST_Y(location) as lat
+      FROM public.safe_areas
+    `);
+    
+    const features = result.rows.map(row => ({
+      type: 'Feature',
+      geometry: {
+        type: 'Point',
+        coordinates: [parseFloat(row.lon), parseFloat(row.lat)]
+      },
+      properties: {
+        id: row.id,
+        name: row.name,
+        capacity: row.capacity
+      }
+    }));
+    
+    res.json({
+      type: 'FeatureCollection',
+      features: features
+    });
+  } catch (error) {
+    console.error('Error loading safe areas:', error);
+    // Return empty collection on error instead of 500
+    res.json({
+      type: 'FeatureCollection',
+      features: []
+    });
+  }
+});
+
+// Delete a safe area
+app.delete('/api/admin/safe-areas/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Ensure table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS public.safe_areas (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        location GEOMETRY(Point, 4326) NOT NULL,
+        capacity INT DEFAULT 0,
+        created_by VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_safe_areas_location ON public.safe_areas USING GIST(location);
+    `);
+    
+    await pool.query('DELETE FROM public.safe_areas WHERE id = $1', [id]);
+    
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error deleting safe area:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Get all spatial tables and data filtered to Agder fylke
 app.get('/spatial', async (req, res) => {
   try {

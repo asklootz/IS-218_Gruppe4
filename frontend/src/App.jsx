@@ -174,6 +174,7 @@ function AdminPage({ onBack }) {
     water_sources: true,
     doctors: true,
     hospitals: true,
+    safe_areas: true,
     radius: false
   })
 
@@ -209,6 +210,7 @@ function AdminPage({ onBack }) {
     setVisibility('water_sources-layer', visibleLayers.water_sources)
     setVisibility('doctors-layer', visibleLayers.doctors)
     setVisibility('hospitals-layer', visibleLayers.hospitals)
+    setVisibility('safe-areas-layer', visibleLayers.safe_areas)
     setVisibility('radius-fill', visibleLayers.radius)
     setVisibility('radius-line', visibleLayers.radius)
 
@@ -372,6 +374,45 @@ function AdminPage({ onBack }) {
           }
         } catch (error) {
           console.warn(`Failed to load ${layerConfig.name}:`, error.message)
+        }
+      }
+
+      // Load safe areas
+      try {
+        const safeAreasRes = await axios.get(`${API_BASE}/api/layers/safe-areas`)
+        if (!map.current.getSource('safe-areas')) {
+          map.current.addSource('safe-areas', { type: 'geojson', data: safeAreasRes.data || { type: 'FeatureCollection', features: [] } })
+          map.current.addLayer({
+            id: 'safe-areas-layer',
+            type: 'circle',
+            source: 'safe-areas',
+            paint: {
+              'circle-radius': 6,
+              'circle-color': '#8b5cf6',
+              'circle-stroke-width': 2,
+              'circle-stroke-color': '#fff'
+            }
+          })
+          console.log('Added layer: safe-areas-layer')
+        } else {
+          map.current.getSource('safe-areas').setData(safeAreasRes.data || { type: 'FeatureCollection', features: [] })
+        }
+      } catch (error) {
+        console.warn('Failed to load safe areas:', error.message)
+        // Create empty layer anyway so click handler works
+        if (!map.current.getSource('safe-areas')) {
+          map.current.addSource('safe-areas', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } })
+          map.current.addLayer({
+            id: 'safe-areas-layer',
+            type: 'circle',
+            source: 'safe-areas',
+            paint: {
+              'circle-radius': 6,
+              'circle-color': '#8b5cf6',
+              'circle-stroke-width': 2,
+              'circle-stroke-color': '#fff'
+            }
+          })
         }
       }
 
@@ -556,6 +597,97 @@ function AdminPage({ onBack }) {
       })
       map.current.on('mouseenter', 'hospitals-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
       map.current.on('mouseleave', 'hospitals-layer', () => { map.current.getCanvas().style.cursor = '' })
+
+      // Add popup handlers for safe areas
+      map.current.on('click', 'safe-areas-layer', (e) => {
+        const f = e.features?.[0]
+        if (!f) return
+        const p = f.properties || {}
+        const safeAreaId = p.id
+        const html = `
+          <div style="font-size:12px;line-height:1.4;">
+            <strong>🛡️ Trygt område</strong><br/>
+            <strong>${p.name}</strong><br/>
+            Kapasitet: ${p.capacity ?? 0}<br/>
+            <button id="deleteSafeAreaBtn" class="delete-btn" style="margin-top:8px;padding:4px 8px;background:#ef4444;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;">Slett</button>
+          </div>
+        `
+        const popup = new maplibregl.Popup({ closeButton: true })
+          .setLngLat(e.lngLat)
+          .setHTML(html)
+          .addTo(map.current)
+        
+        const popupElement = popup.getElement()
+        const deleteBtn = popupElement?.querySelector('#deleteSafeAreaBtn')
+        if (deleteBtn) {
+          deleteBtn.addEventListener('click', async () => {
+            try {
+              await axios.delete(`${API_BASE}/api/admin/safe-areas/${safeAreaId}`)
+              popup.remove()
+              const res = await axios.get(`${API_BASE}/api/layers/safe-areas`)
+              if (map.current.getSource('safe-areas')) {
+                map.current.getSource('safe-areas').setData(res.data)
+              }
+            } catch (error) {
+              console.error('Error deleting safe area:', error)
+              alert('Feil ved sletting av område')
+            }
+          })
+        }
+      })
+      map.current.on('mouseenter', 'safe-areas-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+      map.current.on('mouseleave', 'safe-areas-layer', () => { map.current.getCanvas().style.cursor = '' })
+
+      // Add click handler to map for creating new safe areas
+      map.current.on('click', (e) => {
+        // Only query layers that exist
+        const layersToQuery = ['shelters-layer', 'fire_stations-layer', 'farms-layer', 'water_sources-layer', 'doctors-layer', 'hospitals-layer']
+        if (map.current.getLayer('safe-areas-layer')) {
+          layersToQuery.push('safe-areas-layer')
+        }
+        
+        const features = map.current.queryRenderedFeatures({ layers: layersToQuery })
+        if (features.length === 0) {
+          const { lng: lon, lat } = e.lngLat
+          const html = `
+            <div style="font-size:12px;line-height:1.4;">
+              <input type="text" id="newSafeName" placeholder="Navn på område" style="width:100%;padding:4px;margin-bottom:4px;border:1px solid #ddd;border-radius:4px;"/>
+              <input type="number" id="newSafeCapacity" placeholder="Kapasitet" style="width:100%;padding:4px;margin-bottom:4px;border:1px solid #ddd;border-radius:4px;"/>
+              <button id="createSafeAreaBtn" style="width:100%;padding:6px;background:#22c55e;color:white;border:none;border-radius:4px;cursor:pointer;font-weight:bold;">Lag trygt område</button>
+            </div>
+          `
+          const popup = new maplibregl.Popup({ closeButton: true })
+            .setLngLat([lon, lat])
+            .setHTML(html)
+            .addTo(map.current)
+          
+          const popupElement = popup.getElement()
+          const btn = popupElement?.querySelector('#createSafeAreaBtn')
+          const nameInput = popupElement?.querySelector('#newSafeName')
+          const capacityInput = popupElement?.querySelector('#newSafeCapacity')
+          if (btn && nameInput && capacityInput) {
+            btn.addEventListener('click', async () => {
+              const name = nameInput.value.trim()
+              const capacity = parseInt(capacityInput.value) || 0
+              if (!name) {
+                alert('Vennligst skriv inn navn på område')
+                return
+              }
+              try {
+                await axios.post(`${API_BASE}/api/admin/safe-areas`, { name, lon, lat, capacity })
+                popup.remove()
+                const res = await axios.get(`${API_BASE}/api/layers/safe-areas`)
+                if (map.current.getSource('safe-areas')) {
+                  map.current.getSource('safe-areas').setData(res.data)
+                }
+              } catch (error) {
+                console.error('Error creating safe area:', error)
+                alert('Feil ved opprettelse av område')
+              }
+            })
+          }
+        }
+      })
 
       adminPopupBound.current = true
     }
@@ -765,6 +897,14 @@ function AdminPage({ onBack }) {
             />
             Hospitals
           </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={visibleLayers.safe_areas}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, safe_areas: e.target.checked })}
+            />
+            Trygge områder
+          </label>
         </div>
       </div>
 
@@ -786,6 +926,7 @@ function UserPage({ userId, onBack }) {
   const [tracking, setTracking] = useState(false)
   const [visibleLayers, setVisibleLayers] = useState({
     shelters: true,
+    safe_areas: true,
     counties: false,
     municipalities: false,
     roads: true
@@ -890,6 +1031,7 @@ function UserPage({ userId, onBack }) {
     map.current.on('load', () => {
       loadShelters()
       loadUserLayers()
+      loadSafeAreas()
     })
 
     return () => map.current?.remove()
@@ -981,6 +1123,51 @@ function UserPage({ userId, onBack }) {
     }
   }
 
+  const loadSafeAreas = async () => {
+    try {
+      const res = await axios.get(`${API_BASE}/api/layers/safe-areas`)
+      if (map.current && res.data.features && res.data.features.length > 0) {
+        if (!map.current.getSource('safe-areas-user')) {
+          map.current.addSource('safe-areas-user', { type: 'geojson', data: res.data })
+          map.current.addLayer({
+            id: 'safe-areas-user-layer',
+            type: 'circle',
+            source: 'safe-areas-user',
+            paint: {
+              'circle-radius': 8,
+              'circle-color': '#8b5cf6',
+              'circle-stroke-width': 2,
+              'circle-stroke-color': '#fff'
+            }
+          })
+
+          map.current.on('click', 'safe-areas-user-layer', (e) => {
+            const f = e.features?.[0]
+            if (!f) return
+            const p = f.properties || {}
+            const html = `
+              <div style="font-size:12px;line-height:1.4;">
+                <strong>🛡️ Trygt område</strong><br/>
+                <strong>${p.name}</strong><br/>
+                Kapasitet: ${p.capacity ?? 0}
+              </div>
+            `
+            new maplibregl.Popup({ closeButton: true })
+              .setLngLat(e.lngLat)
+              .setHTML(html)
+              .addTo(map.current)
+          })
+          map.current.on('mouseenter', 'safe-areas-user-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+          map.current.on('mouseleave', 'safe-areas-user-layer', () => { map.current.getCanvas().style.cursor = '' })
+        } else {
+          map.current.getSource('safe-areas-user').setData(res.data)
+        }
+      }
+    } catch (error) {
+      console.error('Error loading safe areas:', error)
+    }
+  }
+
   useEffect(() => {
     if (!map.current) return
     const setVisibility = (layerId, visible) => {
@@ -989,6 +1176,7 @@ function UserPage({ userId, onBack }) {
       }
     }
     setVisibility('shelters-layer', visibleLayers.shelters)
+    setVisibility('safe-areas-user-layer', visibleLayers.safe_areas)
     setVisibility('counties-user-line', visibleLayers.counties)
     setVisibility('municipalities-user-line', visibleLayers.municipalities)
     setVisibility('osm-base', visibleLayers.roads)
@@ -1133,6 +1321,10 @@ function UserPage({ userId, onBack }) {
           <label className="checkbox-label">
             <input type="checkbox" checked={visibleLayers.shelters} onChange={(e) => setVisibleLayers({ ...visibleLayers, shelters: e.target.checked })} />
             Tilfluktsrom
+          </label>
+          <label className="checkbox-label">
+            <input type="checkbox" checked={visibleLayers.safe_areas} onChange={(e) => setVisibleLayers({ ...visibleLayers, safe_areas: e.target.checked })} />
+            Trygge områder
           </label>
           <label className="checkbox-label">
             <input type="checkbox" checked={visibleLayers.counties} onChange={(e) => setVisibleLayers({ ...visibleLayers, counties: e.target.checked })} />
