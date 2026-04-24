@@ -689,20 +689,105 @@ function UserPage({ userId, onBack }) {
     roads: true
   })
 
+  const startTracking = () => {
+    if (!navigator.geolocation) {
+      alert('Geolocation not supported')
+      return
+    }
+
+    setTracking(true)
+
+    navigator.geolocation.watchPosition(
+      (position) => {
+        const { latitude: lat, longitude: lon } = position.coords
+        setUserLocation({ lat, lon })
+
+        const userFeature = {
+          type: 'FeatureCollection',
+          features: [{
+            type: 'Feature',
+            geometry: { type: 'Point', coordinates: [lon, lat] },
+            properties: { label: 'Du er her' }
+          }]
+        }
+
+        if (map.current) {
+          if (!map.current.getSource('user-location')) {
+            map.current.addSource('user-location', { type: 'geojson', data: userFeature })
+            map.current.addLayer({
+              id: 'user-location-dot',
+              type: 'circle',
+              source: 'user-location',
+              paint: {
+                'circle-radius': 6,
+                'circle-color': '#0ea5e9',
+                'circle-stroke-color': '#ffffff',
+                'circle-stroke-width': 2
+              }
+            })
+          } else {
+            map.current.getSource('user-location').setData(userFeature)
+          }
+        }
+
+        if (map.current && following) {
+          map.current.flyTo({ center: [lon, lat], zoom: 14 })
+        }
+
+        axios.post(`${API_BASE}/api/users/${userId}/location`, { lon, lat }).catch(() => {})
+      },
+      (error) => {
+        console.error('Geolocation error:', error)
+        console.error('Error code:', error.code)
+        // 1 = PERMISSION_DENIED, 2 = POSITION_UNAVAILABLE, 3 = TIMEOUT
+        if (error.code === 1) {
+          console.warn('Geolocation permission denied')
+        } else if (error.code === 3) {
+          console.warn('Geolocation timeout - retrying with lower accuracy')
+          // Retry with lower accuracy requirements
+          navigator.geolocation.watchPosition(
+            (position) => {
+              const { latitude: lat, longitude: lon } = position.coords
+              setUserLocation({ lat, lon })
+            },
+            (err) => console.error('Fallback geolocation also failed:', err),
+            { enableHighAccuracy: false, timeout: 10000, maximumAge: 5000 }
+          )
+        }
+      },
+      { enableHighAccuracy: true, timeout: 30000, maximumAge: 0 }
+    )
+  }
+
+  // Start tracking immediately on component mount
+  useEffect(() => {
+    startTracking()
+  }, [])
+
+  // Automatically enable follow mode once user location is obtained
+  useEffect(() => {
+    if (userLocation && map.current && !following) {
+      setFollowing(true)
+      map.current.flyTo({
+        center: [userLocation.lon, userLocation.lat],
+        zoom: 14
+      })
+    }
+  }, [userLocation])
+
   useEffect(() => {
     if (!mapContainer.current) return
 
     map.current = new maplibregl.Map({
       container: mapContainer.current,
       style: OSM_RASTER_STYLE,
-      center: [10.75, 59.91],
-      zoom: 10
+      center: [8.2707, 58.1456],
+      zoom: 11
     })
 
     map.current.on('load', () => {
       loadShelters()
       loadUserLayers()
-      startTracking()
     })
 
     return () => map.current?.remove()
@@ -810,58 +895,6 @@ function UserPage({ userId, onBack }) {
       map.current.moveLayer('municipalities-user-line', 'counties-user-line')
     }
   }, [visibleLayers])
-
-  const startTracking = () => {
-    if (!navigator.geolocation) {
-      alert('Geolocation not supported')
-      return
-    }
-
-    setTracking(true)
-
-    navigator.geolocation.watchPosition(
-      (position) => {
-        const { latitude: lat, longitude: lon } = position.coords
-        setUserLocation({ lat, lon })
-
-        const userFeature = {
-          type: 'FeatureCollection',
-          features: [{
-            type: 'Feature',
-            geometry: { type: 'Point', coordinates: [lon, lat] },
-            properties: { label: 'Du er her' }
-          }]
-        }
-
-        if (map.current) {
-          if (!map.current.getSource('user-location')) {
-            map.current.addSource('user-location', { type: 'geojson', data: userFeature })
-            map.current.addLayer({
-              id: 'user-location-dot',
-              type: 'circle',
-              source: 'user-location',
-              paint: {
-                'circle-radius': 6,
-                'circle-color': '#0ea5e9',
-                'circle-stroke-color': '#ffffff',
-                'circle-stroke-width': 2
-              }
-            })
-          } else {
-            map.current.getSource('user-location').setData(userFeature)
-          }
-        }
-
-        if (map.current && following) {
-          map.current.flyTo({ center: [lon, lat], zoom: 14 })
-        }
-
-        axios.post(`${API_BASE}/api/users/${userId}/location`, { lon, lat }).catch(() => {})
-      },
-      (error) => console.error('Geolocation error:', error),
-      { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
-    )
-  }
 
   const handleComputeRoute = async () => {
     if (!userLocation) {
