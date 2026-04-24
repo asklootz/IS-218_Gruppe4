@@ -166,15 +166,15 @@ function AdminPage({ onBack }) {
   const [loading, setLoading] = useState(false)
   const [visibleLayers, setVisibleLayers] = useState({
     shelters: true,
-    population: true,
-    counties: true,
+    population: false,
+    counties: false,
     municipalities: false,
     fire_stations: true,
     farms: true,
     water_sources: true,
     doctors: true,
     hospitals: true,
-    radius: true
+    radius: false
   })
 
   useEffect(() => {
@@ -279,7 +279,7 @@ function AdminPage({ onBack }) {
             type: 'fill',
             source: 'counties',
             paint: {
-              'fill-color': '#0ea5e9',
+              'fill-color': '#00000000',
               'fill-opacity': 0.18
             }
           })
@@ -455,6 +455,108 @@ function AdminPage({ onBack }) {
       })
       map.current.on('mouseenter', 'shelters-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
       map.current.on('mouseleave', 'shelters-layer', () => { map.current.getCanvas().style.cursor = '' })
+
+      // Add popup handlers for fire stations
+      map.current.on('click', 'fire_stations-layer', (e) => {
+        const f = e.features?.[0]
+        if (!f) return
+        const p = f.properties || {}
+        const html = `
+          <div style="font-size:12px;line-height:1.4;">
+            <strong>🚒 Brannstasjon</strong><br/>
+            ${p.name ? `<strong>${p.name}</strong><br/>` : ''}
+            ${p.website ? `<a href="${p.website}" target="_blank">Besøk nettside</a><br/>` : ''}
+            ${p.phone ? `Telefon: ${p.phone}<br/>` : ''}
+          </div>
+        `
+        new maplibregl.Popup({ closeButton: true })
+          .setLngLat(e.lngLat)
+          .setHTML(html)
+          .addTo(map.current)
+      })
+      map.current.on('mouseenter', 'fire_stations-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+      map.current.on('mouseleave', 'fire_stations-layer', () => { map.current.getCanvas().style.cursor = '' })
+
+      // Add popup handlers for farms
+      map.current.on('click', 'farms-layer', (e) => {
+        const f = e.features?.[0]
+        if (!f) return
+        const p = f.properties || {}
+        const html = `
+          <div style="font-size:12px;line-height:1.4;">
+            <strong>🌾 Gård</strong><br/>
+            ${p.name ? `<strong>${p.name}</strong><br/>` : ''}
+          </div>
+        `
+        new maplibregl.Popup({ closeButton: true })
+          .setLngLat(e.lngLat)
+          .setHTML(html)
+          .addTo(map.current)
+      })
+      map.current.on('mouseenter', 'farms-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+      map.current.on('mouseleave', 'farms-layer', () => { map.current.getCanvas().style.cursor = '' })
+
+      // Add popup handlers for water sources
+      map.current.on('click', 'water_sources-layer', (e) => {
+        const f = e.features?.[0]
+        if (!f) return
+        const p = f.properties || {}
+        const html = `
+          <div style="font-size:12px;line-height:1.4;">
+            <strong>💧 Vannkilde</strong><br/>
+            ${p.name ? `<strong>${p.name}</strong><br/>` : ''}
+          </div>
+        `
+        new maplibregl.Popup({ closeButton: true })
+          .setLngLat(e.lngLat)
+          .setHTML(html)
+          .addTo(map.current)
+      })
+      map.current.on('mouseenter', 'water_sources-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+      map.current.on('mouseleave', 'water_sources-layer', () => { map.current.getCanvas().style.cursor = '' })
+
+      // Add popup handlers for doctors
+      map.current.on('click', 'doctors-layer', (e) => {
+        const f = e.features?.[0]
+        if (!f) return
+        const p = f.properties || {}
+        const html = `
+          <div style="font-size:12px;line-height:1.4;">
+            <strong>👨‍⚕️ Lege</strong><br/>
+            ${p.name ? `<strong>${p.name}</strong><br/>` : ''}
+            ${p.website ? `<a href="${p.website}" target="_blank">Besøk nettside</a><br/>` : ''}
+            ${p.phone ? `Telefon: ${p.phone}<br/>` : ''}
+          </div>
+        `
+        new maplibregl.Popup({ closeButton: true })
+          .setLngLat(e.lngLat)
+          .setHTML(html)
+          .addTo(map.current)
+      })
+      map.current.on('mouseenter', 'doctors-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+      map.current.on('mouseleave', 'doctors-layer', () => { map.current.getCanvas().style.cursor = '' })
+
+      // Add popup handlers for hospitals
+      map.current.on('click', 'hospitals-layer', (e) => {
+        const f = e.features?.[0]
+        if (!f) return
+        const p = f.properties || {}
+        const html = `
+          <div style="font-size:12px;line-height:1.4;">
+            <strong>🏥 Sykehus</strong><br/>
+            ${p.name ? `<strong>${p.name}</strong><br/>` : ''}
+            ${p.website ? `<a href="${p.website}" target="_blank">Besøk nettside</a><br/>` : ''}
+            ${p.phone ? `Telefon: ${p.phone}<br/>` : ''}
+          </div>
+        `
+        new maplibregl.Popup({ closeButton: true })
+          .setLngLat(e.lngLat)
+          .setHTML(html)
+          .addTo(map.current)
+      })
+      map.current.on('mouseenter', 'hospitals-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+      map.current.on('mouseleave', 'hospitals-layer', () => { map.current.getCanvas().style.cursor = '' })
+
       adminPopupBound.current = true
     }
 
@@ -684,7 +786,7 @@ function UserPage({ userId, onBack }) {
   const [tracking, setTracking] = useState(false)
   const [visibleLayers, setVisibleLayers] = useState({
     shelters: true,
-    counties: true,
+    counties: false,
     municipalities: false,
     roads: true
   })
