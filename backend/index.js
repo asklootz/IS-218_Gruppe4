@@ -49,6 +49,10 @@ const TILFLUKTSROM_WFS_TYPE_NAME = 'app:Tilfluktsrom';
 const TILFLUKTSROM_WFS_GML_URL = `${TILFLUKTSROM_WFS_BASE_URL}?service=WFS&version=2.0.0&request=GetFeature&typeNames=${encodeURIComponent(TILFLUKTSROM_WFS_TYPE_NAME)}&srsName=urn:ogc:def:crs:EPSG::4326&outputFormat=${encodeURIComponent('application/gml+xml; version=3.2')}`;
 const TILFLUKTSROM_ZIP_FALLBACK_URL = 'https://nedlasting.geonorge.no/geonorge/Samfunnssikkerhet/TilfluktsromOffentlige/GeoJSON/Samfunnssikkerhet_0000_Norge_25833_TilfluktsromOffentlige_GeoJSON.zip';
 
+const KARTVERKET_API_BASE = 'https://api.kartverket.no/kommuneinfo/v1';
+const GEONORGE_COUNTIES_ZIP = 'https://nedlasting.geonorge.no/geonorge/Basisdata/Fylker/GeoJSON/Basisdata_0000_Norge_25833_Fylker_GeoJSON.zip';
+const GEONORGE_MUNICIPALITIES_ZIP = 'https://nedlasting.geonorge.no/geonorge/Basisdata/Kommuner/GeoJSON/Basisdata_0000_Norge_25833_Kommuner_GeoJSON.zip';
+
 // ========== DATA BOOTSTRAP UTILITIES ==========
 
 async function downloadBuffer(url, timeout = 300000) {
@@ -448,21 +452,136 @@ async function cacheTilfluktsromGeoJson() {
   return transformedFallback;
 }
 
+function kartverketOmradeToGeometry(omrade) {
+  if (!omrade || !omrade.type || !omrade.coordinates) return null;
+  return { type: omrade.type, coordinates: omrade.coordinates };
+}
+
+async function fetchFylkerFromKartverket() {
+  console.log('Fetching fylker from Kartverket API...');
+  const listResp = await axios.get(`${KARTVERKET_API_BASE}/fylkerkommuner`, { timeout: 30000 });
+  const fylkerData = Array.isArray(listResp.data) ? listResp.data : [];
+  if (fylkerData.length === 0) throw new Error('Kartverket API returned empty fylke list');
+
+  const features = [];
+  const batchSize = 5;
+  for (let i = 0; i < fylkerData.length; i += batchSize) {
+    const batch = fylkerData.slice(i, i + batchSize);
+    const results = await Promise.allSettled(
+      batch.map(async (fylke) => {
+        const resp = await axios.get(
+          `${KARTVERKET_API_BASE}/fylker/${fylke.fylkesnummer}/omrade`,
+          { timeout: 15000 }
+        );
+        const geometry = kartverketOmradeToGeometry(resp.data.omrade);
+        if (!geometry) throw new Error(`No omrade in response for fylke ${fylke.fylkesnummer}`);
+        return {
+          type: 'Feature',
+          properties: { fylkesnummer: fylke.fylkesnummer, fylkesnavn: fylke.fylkesnavn },
+          geometry
+        };
+      })
+    );
+    for (const r of results) {
+      if (r.status === 'fulfilled') features.push(r.value);
+      else console.warn(`Fylke omrade fetch failed: ${r.reason?.message}`);
+    }
+  }
+  if (features.length === 0) throw new Error('No fylker fetched from Kartverket API');
+  console.log(`✓ Fetched ${features.length} fylker from Kartverket API`);
+  return { type: 'FeatureCollection', features };
+}
+
+async function fetchKommunerFromKartverket() {
+  console.log('Fetching kommuner from Kartverket API...');
+  const listResp = await axios.get(`${KARTVERKET_API_BASE}/fylkerkommuner`, { timeout: 30000 });
+  const fylkerData = Array.isArray(listResp.data) ? listResp.data : [];
+
+  const kommuneList = [];
+  for (const fylke of fylkerData) {
+    for (const k of (fylke.kommuner || [])) {
+      kommuneList.push({
+        kommunenummer: k.kommunenummer,
+        kommunenavn: k.kommunenavnNorsk || k.kommunenavn,
+        fylkesnavn: fylke.fylkesnavn,
+        fylkesnummer: fylke.fylkesnummer
+      });
+    }
+  }
+  if (kommuneList.length === 0) throw new Error('Kartverket API returned no kommuner');
+
+  const features = [];
+  const batchSize = 10;
+  for (let i = 0; i < kommuneList.length; i += batchSize) {
+    const batch = kommuneList.slice(i, i + batchSize);
+    const results = await Promise.allSettled(
+      batch.map(async (k) => {
+        const resp = await axios.get(
+          `${KARTVERKET_API_BASE}/kommuner/${k.kommunenummer}/omrade`,
+          { timeout: 15000 }
+        );
+        const geometry = kartverketOmradeToGeometry(resp.data.omrade);
+        if (!geometry) throw new Error(`No omrade for kommune ${k.kommunenummer}`);
+        return {
+          type: 'Feature',
+          properties: {
+            kommunenummer: k.kommunenummer,
+            kommunenavn: k.kommunenavn,
+            fylkesnavn: k.fylkesnavn,
+            fylkesnummer: k.fylkesnummer
+          },
+          geometry
+        };
+      })
+    );
+    for (const r of results) {
+      if (r.status === 'fulfilled') features.push(r.value);
+      else console.warn(`Kommune omrade fetch failed: ${r.reason?.message}`);
+    }
+  }
+  if (features.length === 0) throw new Error('No kommuner fetched from Kartverket API');
+  console.log(`✓ Fetched ${features.length} kommuner from Kartverket API`);
+  return { type: 'FeatureCollection', features };
+}
+
 async function refreshBoundaryLayer(layer) {
-  const urlByLayer = {
-    counties:
-      'https://nedlasting.geonorge.no/geonorge/Basisdata/Fylker/GeoJSON/Basisdata_0000_Norge_25833_Fylker_GeoJSON.zip',
-    municipalities:
-      'https://nedlasting.geonorge.no/geonorge/Basisdata/Kommuner/GeoJSON/Basisdata_0000_Norge_25833_Kommuner_GeoJSON.zip'
-  };
+  if (layer !== 'counties' && layer !== 'municipalities') {
+    return { type: 'FeatureCollection', features: [] };
+  }
 
-  const url = urlByLayer[layer];
-  if (!url) return { type: 'FeatureCollection', features: [] };
+  // Primary: Kartverket API (ETRS89 ≈ WGS84, no reprojection needed)
+  try {
+    const geojson = layer === 'counties'
+      ? await fetchFylkerFromKartverket()
+      : await fetchKommunerFromKartverket();
+    if (geojson?.features?.length > 0) {
+      fs.writeFileSync(path.join(CACHE_DIR, `${layer}.geojson`), JSON.stringify(geojson));
+      return geojson;
+    }
+  } catch (error) {
+    console.warn(`Kartverket API unavailable for ${layer}: ${error.message}. Falling back to Geonorge ZIP.`);
+  }
 
-  const raw = await cacheGeoJsonFromZip(layer, url);
+  // Fallback: download ZIP from Geonorge and reproject from EPSG:25833
+  const fallbackUrl = layer === 'counties' ? GEONORGE_COUNTIES_ZIP : GEONORGE_MUNICIPALITIES_ZIP;
+  const rawCacheFile = path.join(CACHE_DIR, `${layer}_raw.geojson`);
+  let raw;
+  if (fs.existsSync(rawCacheFile)) {
+    try {
+      const cached = JSON.parse(fs.readFileSync(rawCacheFile, 'utf8'));
+      if (Array.isArray(cached?.features) && cached.features.length > 0) raw = cached;
+    } catch (e) {
+      fs.unlinkSync(rawCacheFile);
+    }
+  }
+  if (!raw) {
+    console.log(`Downloading ${layer} from Geonorge (${fallbackUrl.substring(0, 60)}...)...`);
+    const buffer = await downloadBuffer(fallbackUrl);
+    raw = await extractGeoJsonFromZip(buffer, layer);
+    fs.writeFileSync(rawCacheFile, JSON.stringify(raw));
+  }
   const transformed = await transformProjectedFeatureCollection(raw);
-  const cacheFile = path.join(CACHE_DIR, `${layer}.geojson`);
-  fs.writeFileSync(cacheFile, JSON.stringify(transformed));
+  fs.writeFileSync(path.join(CACHE_DIR, `${layer}.geojson`), JSON.stringify(transformed));
   return transformed;
 }
 
@@ -1225,12 +1344,9 @@ async function bootstrap() {
   }
 
   // Cache counties and municipalities as GeoJSON layers for frontend toggles (Agder-filtered)
+  // Primary source: Kartverket API. Fallback: Geonorge ZIP download.
   try {
-    const counties = await cacheGeoJsonFromZip(
-      'counties',
-      'https://nedlasting.geonorge.no/geonorge/Basisdata/Fylker/GeoJSON/Basisdata_0000_Norge_25833_Fylker_GeoJSON.zip'
-    );
-    const countiesWgs84 = await transformProjectedFeatureCollection(counties);
+    await refreshBoundaryLayer('counties');
     const countiesFiltered = await getBoundaryLayerGeoJsonFiltered('counties');
     fs.writeFileSync(path.join(CACHE_DIR, 'counties.geojson'), JSON.stringify(countiesFiltered));
     console.log(`✓ Counties cached (Agder-filtered): ${(countiesFiltered.features || []).length}`);
@@ -1239,11 +1355,7 @@ async function bootstrap() {
   }
 
   try {
-    const municipalities = await cacheGeoJsonFromZip(
-      'municipalities',
-      'https://nedlasting.geonorge.no/geonorge/Basisdata/Kommuner/GeoJSON/Basisdata_0000_Norge_25833_Kommuner_GeoJSON.zip'
-    );
-    const municipalitiesWgs84 = await transformProjectedFeatureCollection(municipalities);
+    await refreshBoundaryLayer('municipalities');
     const municipalitiesFiltered = await getBoundaryLayerGeoJsonFiltered('municipalities');
     fs.writeFileSync(path.join(CACHE_DIR, 'municipalities.geojson'), JSON.stringify(municipalitiesFiltered));
     console.log(`✓ Municipalities cached (Agder-filtered): ${(municipalitiesFiltered.features || []).length}`);
