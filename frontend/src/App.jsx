@@ -716,13 +716,21 @@ function AdminPage({ onBack }) {
 
       // Add click handler to map for creating new safe areas
       map.current.on('click', (e) => {
-        // Only query layers that exist
-        const layersToQuery = ['shelters-layer', 'fire_stations-layer', 'farms-layer', 'water_sources-layer', 'doctors-layer', 'hospitals-layer', 'live-users-layer']
-        if (map.current.getLayer('safe-areas-layer')) {
-          layersToQuery.push('safe-areas-layer')
-        }
+        const candidateLayers = [
+          'shelters-layer',
+          'fire_stations-layer',
+          'farms-layer',
+          'water_sources-layer',
+          'doctors-layer',
+          'hospitals-layer',
+          'live-users-layer',
+          'safe-areas-layer'
+        ]
+        const layersToQuery = candidateLayers.filter((layerId) => map.current.getLayer(layerId))
         
-        const features = map.current.queryRenderedFeatures({ layers: layersToQuery })
+        const features = layersToQuery.length > 0
+          ? map.current.queryRenderedFeatures(e.point, { layers: layersToQuery })
+          : []
         if (features.length === 0) {
           const { lng: lon, lat } = e.lngLat
           const html = `

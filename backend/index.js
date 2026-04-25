@@ -1630,8 +1630,9 @@ async function bootstrap() {
 
   // Download and ingest real Overture Maps data for Agder
   try {
-    const farmCount = await pool.query('SELECT COUNT(*) as count FROM overture.farms');
-    if (farmCount.rows[0].count === 0) {
+    const farmCountResult = await pool.query('SELECT COUNT(*) as count FROM overture.farms');
+    const farmCount = Number(farmCountResult.rows[0]?.count || 0);
+    if (farmCount === 0) {
       console.log('Downloading real Overture Maps data for Agder...');
       const count = await downloadAndIngestOvertureData();
       if (count > 0) {
@@ -1693,6 +1694,8 @@ async function bootstrap() {
         }
         console.log('✓ Sample Overture data loaded');
       }
+    } else {
+      console.log(`Skipping Overture ingest (already ${farmCount} farm rows).`);
     }
   } catch (error) {
     console.error('Overture data loading failed:', error.message);
