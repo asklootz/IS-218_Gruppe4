@@ -2190,6 +2190,178 @@ app.get('/api/admin/live-users', async (req, res) => {
   }
 });
 
+async function buildLatestUsersSubquery() {
+  const columnCheck = await pool.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'user_locations'
+      AND column_name IN ('timestamp', 'created_at')
+  `);
+
+  const columns = new Set(columnCheck.rows.map((r) => r.column_name));
+  const timeColumn = columns.has('timestamp')
+    ? 'timestamp'
+    : columns.has('created_at')
+      ? 'created_at'
+      : null;
+
+  const orderExpr = timeColumn ? `"${timeColumn}" DESC NULLS LAST, id DESC` : 'id DESC';
+  const selectTimeExpr = timeColumn ? `"${timeColumn}"` : 'NOW()';
+
+  return {
+    latestUsersCte: `
+      WITH latest AS (
+        SELECT DISTINCT ON (user_id)
+          user_id::text AS user_id,
+          location,
+          ${selectTimeExpr} AS last_seen
+        FROM public.user_locations
+        WHERE location IS NOT NULL
+        ORDER BY user_id, ${orderExpr}
+      )
+    `,
+  };
+}
+
+app.get('/api/admin/shelters/:id/live-users', async (req, res) => {
+  try {
+    const shelterId = Number(req.params.id);
+    const radiusM = Number.parseInt(req.query.radius, 10) || 150;
+
+    if (!Number.isFinite(shelterId)) {
+      return res.status(400).json({ error: 'Invalid shelter id' });
+    }
+
+    const { latestUsersCte } = await buildLatestUsersSubquery();
+    const result = await pool.query(`
+      ${latestUsersCte}
+      SELECT
+        COUNT(*)::int AS live_users_count
+      FROM latest lu
+      JOIN tilfluktsromoffentlige.tilfluktsrom s ON s.id = $1
+      WHERE ST_DWithin(lu.location::geography, s.location::geography, $2)
+    `, [shelterId, radiusM]);
+
+    res.json({
+      id: shelterId,
+      radius_m: radiusM,
+      live_users_count: Number(result.rows[0]?.live_users_count || 0),
+      updated_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('Error counting live users near shelter:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/safe-areas/:id/live-users', async (req, res) => {
+  try {
+    const safeAreaId = Number(req.params.id);
+    const radiusM = Number.parseInt(req.query.radius, 10) || 150;
+
+    if (!Number.isFinite(safeAreaId)) {
+      return res.status(400).json({ error: 'Invalid safe area id' });
+    }
+
+    const { latestUsersCte } = await buildLatestUsersSubquery();
+    const result = await pool.query(`
+      ${latestUsersCte}
+      SELECT
+        COUNT(*)::int AS live_users_count
+      FROM latest lu
+      JOIN public.safe_areas sa ON sa.id = $1
+      WHERE ST_DWithin(lu.location::geography, sa.location::geography, $2)
+    `, [safeAreaId, radiusM]);
+
+    res.json({
+      id: safeAreaId,
+      radius_m: radiusM,
+      live_users_count: Number(result.rows[0]?.live_users_count || 0),
+      updated_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('Error counting live users near safe area:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/shelters/live-users', async (req, res) => {
+  try {
+    const radiusM = Number.parseInt(req.query.radius, 10) || 150;
+    const { latestUsersCte } = await buildLatestUsersSubquery();
+
+    const result = await pool.query(`
+      ${latestUsersCte}
+      SELECT
+        s.id,
+        COUNT(lu.user_id)::int AS live_users_count
+      FROM tilfluktsromoffentlige.tilfluktsrom s
+      LEFT JOIN latest lu ON ST_DWithin(lu.location::geography, s.location::geography, $1)
+      GROUP BY s.id
+      ORDER BY s.id
+    `, [radiusM]);
+
+    res.json({
+      radius_m: radiusM,
+      counts: result.rows.map((row) => ({
+        id: Number(row.id),
+        live_users_count: Number(row.live_users_count || 0),
+      })),
+      updated_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('Error counting live users near shelters:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/safe-areas/live-users', async (req, res) => {
+  try {
+    const radiusM = Number.parseInt(req.query.radius, 10) || 150;
+
+    const tableExists = await pool.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = 'safe_areas'
+      )
+    `);
+
+    if (!tableExists.rows[0]?.exists) {
+      return res.json({
+        radius_m: radiusM,
+        counts: [],
+        updated_at: new Date().toISOString(),
+      });
+    }
+
+    const { latestUsersCte } = await buildLatestUsersSubquery();
+    const result = await pool.query(`
+      ${latestUsersCte}
+      SELECT
+        sa.id,
+        COUNT(lu.user_id)::int AS live_users_count
+      FROM public.safe_areas sa
+      LEFT JOIN latest lu ON ST_DWithin(lu.location::geography, sa.location::geography, $1)
+      GROUP BY sa.id
+      ORDER BY sa.id
+    `, [radiusM]);
+
+    res.json({
+      radius_m: radiusM,
+      counts: result.rows.map((row) => ({
+        id: Number(row.id),
+        live_users_count: Number(row.live_users_count || 0),
+      })),
+      updated_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('Error counting live users near safe areas:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Admin: create a new safe area
 app.post('/api/admin/safe-areas', async (req, res) => {
   try {

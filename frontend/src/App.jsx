@@ -172,6 +172,9 @@ function AdminPage({ onBack }) {
   const staticLayersLoaded = useRef(false)
   const adminPopupBound = useRef(false)
   const liveUsersInterval = useRef(null)
+  const markerLiveCountInterval = useRef(null)
+  const sheltersGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
+  const safeAreasGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
   const [radius, setRadius] = useState(1000)
   const [coverage, setCoverage] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -207,9 +210,85 @@ function AdminPage({ onBack }) {
         clearInterval(liveUsersInterval.current)
         liveUsersInterval.current = null
       }
+      if (markerLiveCountInterval.current) {
+        clearInterval(markerLiveCountInterval.current)
+        markerLiveCountInterval.current = null
+      }
       map.current?.remove()
     }
   }, [])
+
+  const clearMarkerLiveCountInterval = () => {
+    if (markerLiveCountInterval.current) {
+      clearInterval(markerLiveCountInterval.current)
+      markerLiveCountInterval.current = null
+    }
+  }
+
+  const bindLiveUserCountToPopup = ({ popup, endpoint, updateMs = 10000 }) => {
+    const popupElement = popup.getElement()
+    const countEl = popupElement?.querySelector('.live-users-count')
+    if (!countEl) return
+
+    clearMarkerLiveCountInterval()
+
+    const refreshCount = async () => {
+      try {
+        const res = await axios.get(endpoint)
+        const count = Number(res.data?.live_users_count || 0)
+        countEl.textContent = String(count)
+      } catch (error) {
+        countEl.textContent = '0'
+      }
+    }
+
+    refreshCount()
+    markerLiveCountInterval.current = setInterval(refreshCount, updateMs)
+    popup.on('close', clearMarkerLiveCountInterval)
+  }
+
+  const applyLiveCountsToSource = (sourceId, geojsonRef, counts = []) => {
+    if (!map.current || !map.current.getSource(sourceId)) return
+    const current = geojsonRef.current
+    if (!current || !Array.isArray(current.features)) return
+
+    const countMap = new Map(
+      (counts || []).map((row) => [Number(row.id), Number(row.live_users_count || 0)])
+    )
+
+    const updated = {
+      ...current,
+      features: current.features.map((feature) => {
+        const featureId = Number(feature?.properties?.id)
+        const count = Number.isFinite(featureId) ? (countMap.get(featureId) || 0) : 0
+        return {
+          ...feature,
+          properties: {
+            ...(feature.properties || {}),
+            live_users_count: count,
+          },
+        }
+      }),
+    }
+
+    geojsonRef.current = updated
+    map.current.getSource(sourceId).setData(updated)
+  }
+
+  const refreshMarkerLiveCounts = async () => {
+    if (!map.current) return
+    try {
+      const [shelterRes, safeAreasRes] = await Promise.all([
+        axios.get(`${API_BASE}/api/admin/shelters/live-users?radius=150`),
+        axios.get(`${API_BASE}/api/admin/safe-areas/live-users?radius=150`)
+      ])
+
+      applyLiveCountsToSource('shelters', sheltersGeoJsonRef, shelterRes.data?.counts || [])
+      applyLiveCountsToSource('safe-areas', safeAreasGeoJsonRef, safeAreasRes.data?.counts || [])
+    } catch (error) {
+      console.warn('Failed to refresh marker live counts:', error.message)
+    }
+  }
 
   const applyAdminLayerVisibility = () => {
     if (!map.current) return
@@ -219,6 +298,7 @@ function AdminPage({ onBack }) {
       }
     }
     setVisibility('shelters-layer', visibleLayers.shelters)
+    setVisibility('shelters-live-count-layer', visibleLayers.shelters)
     setVisibility('population-layer', visibleLayers.population)
     setVisibility('counties-fill', visibleLayers.counties)
     setVisibility('counties-line', visibleLayers.counties)
@@ -229,6 +309,7 @@ function AdminPage({ onBack }) {
     setVisibility('doctors-layer', visibleLayers.doctors)
     setVisibility('hospitals-layer', visibleLayers.hospitals)
     setVisibility('safe-areas-layer', visibleLayers.safe_areas)
+    setVisibility('safe-areas-live-count-layer', visibleLayers.safe_areas)
     setVisibility('live-users-layer', visibleLayers.live_users)
     setVisibility('radius-fill', visibleLayers.radius)
     setVisibility('radius-line', visibleLayers.radius)
@@ -250,6 +331,7 @@ function AdminPage({ onBack }) {
     try {
       const sheltersRes = await axios.get(`${API_BASE}/api/layers/shelters`)
       if (sheltersRes.data.features) {
+        sheltersGeoJsonRef.current = sheltersRes.data
         if (!map.current.getSource('shelters')) {
           map.current.addSource('shelters', { type: 'geojson', data: sheltersRes.data })
           map.current.addLayer({
@@ -266,6 +348,23 @@ function AdminPage({ onBack }) {
               ],
               'circle-stroke-width': 2,
               'circle-stroke-color': '#fff'
+            }
+          })
+          map.current.addLayer({
+            id: 'shelters-live-count-layer',
+            type: 'symbol',
+            source: 'shelters',
+            layout: {
+              'text-field': ['to-string', ['coalesce', ['get', 'live_users_count'], 0]],
+              'text-size': 11,
+              'text-offset': [0, -1.6],
+              'text-allow-overlap': true,
+              'text-ignore-placement': true
+            },
+            paint: {
+              'text-color': '#111827',
+              'text-halo-color': '#ffffff',
+              'text-halo-width': 1.2
             }
           })
         } else {
@@ -399,6 +498,7 @@ function AdminPage({ onBack }) {
       // Load safe areas
       try {
         const safeAreasRes = await axios.get(`${API_BASE}/api/layers/safe-areas`)
+        safeAreasGeoJsonRef.current = safeAreasRes.data || { type: 'FeatureCollection', features: [] }
         if (!map.current.getSource('safe-areas')) {
           map.current.addSource('safe-areas', { type: 'geojson', data: safeAreasRes.data || { type: 'FeatureCollection', features: [] } })
           map.current.addLayer({
@@ -412,6 +512,23 @@ function AdminPage({ onBack }) {
               'circle-stroke-color': '#fff'
             }
           })
+          map.current.addLayer({
+            id: 'safe-areas-live-count-layer',
+            type: 'symbol',
+            source: 'safe-areas',
+            layout: {
+              'text-field': ['to-string', ['coalesce', ['get', 'live_users_count'], 0]],
+              'text-size': 11,
+              'text-offset': [0, -1.6],
+              'text-allow-overlap': true,
+              'text-ignore-placement': true
+            },
+            paint: {
+              'text-color': '#111827',
+              'text-halo-color': '#ffffff',
+              'text-halo-width': 1.2
+            }
+          })
           console.log('Added layer: safe-areas-layer')
         } else {
           map.current.getSource('safe-areas').setData(safeAreasRes.data || { type: 'FeatureCollection', features: [] })
@@ -420,7 +537,9 @@ function AdminPage({ onBack }) {
         console.warn('Failed to load safe areas:', error.message)
         // Create empty layer anyway so click handler works
         if (!map.current.getSource('safe-areas')) {
-          map.current.addSource('safe-areas', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } })
+          const emptySafeAreas = { type: 'FeatureCollection', features: [] }
+          safeAreasGeoJsonRef.current = emptySafeAreas
+          map.current.addSource('safe-areas', { type: 'geojson', data: emptySafeAreas })
           map.current.addLayer({
             id: 'safe-areas-layer',
             type: 'circle',
@@ -430,6 +549,23 @@ function AdminPage({ onBack }) {
               'circle-color': '#8b5cf6',
               'circle-stroke-width': 2,
               'circle-stroke-color': '#fff'
+            }
+          })
+          map.current.addLayer({
+            id: 'safe-areas-live-count-layer',
+            type: 'symbol',
+            source: 'safe-areas',
+            layout: {
+              'text-field': ['to-string', ['coalesce', ['get', 'live_users_count'], 0]],
+              'text-size': 11,
+              'text-offset': [0, -1.6],
+              'text-allow-overlap': true,
+              'text-ignore-placement': true
+            },
+            paint: {
+              'text-color': '#111827',
+              'text-halo-color': '#ffffff',
+              'text-halo-width': 1.2
             }
           })
         }
@@ -453,6 +589,7 @@ function AdminPage({ onBack }) {
       setCoverage(covRes.data)
 
       const shelterFc = sheltersToFeatureCollection(covRes.data?.shelters || [])
+      sheltersGeoJsonRef.current = shelterFc
       if (map.current.getSource('shelters')) {
         map.current.getSource('shelters').setData(shelterFc)
       }
@@ -514,6 +651,8 @@ function AdminPage({ onBack }) {
         map.current.getSource('live-users').setData(fc)
       }
 
+      await refreshMarkerLiveCounts()
+
       applyAdminLayerVisibility()
     } catch (error) {
       console.warn('Failed to load live users:', error.message)
@@ -536,6 +675,7 @@ function AdminPage({ onBack }) {
         const f = e.features?.[0]
         if (!f) return
         const p = f.properties || {}
+        const shelterId = Number(p.id)
         const html = `
           <div style="font-size:12px;line-height:1.4;">
             <strong>${p.name || 'Tilfluktsrom'}</strong><br/>
@@ -543,13 +683,24 @@ function AdminPage({ onBack }) {
             Område: #${p.cluster_id ?? '-'}<br/>
             Befolkning i område: ${p.cluster_population ?? 0}<br/>
             Ledige plasser i område: ${p.cluster_free_spaces ?? 0}<br/>
-            Manglende kapasitet: ${p.missing_capacity ?? 0}
+            Manglende kapasitet: ${p.missing_capacity ?? 0}<br/>
+            Aktive brukere innen 150m: <strong class="live-users-count">Laster...</strong>
           </div>
         `
-        new maplibregl.Popup({ closeButton: true })
+        const popup = new maplibregl.Popup({ closeButton: true })
           .setLngLat(e.lngLat)
           .setHTML(html)
           .addTo(map.current)
+
+        if (Number.isFinite(shelterId)) {
+          bindLiveUserCountToPopup({
+            popup,
+            endpoint: `${API_BASE}/api/admin/shelters/${shelterId}/live-users?radius=150`
+          })
+        } else {
+          const countEl = popup.getElement()?.querySelector('.live-users-count')
+          if (countEl) countEl.textContent = '0'
+        }
       })
       map.current.on('mouseenter', 'shelters-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
       map.current.on('mouseleave', 'shelters-layer', () => { map.current.getCanvas().style.cursor = '' })
@@ -666,6 +817,7 @@ function AdminPage({ onBack }) {
             <strong>🛡️ Trygt område</strong><br/>
             <strong>${p.name}</strong><br/>
             Kapasitet: ${p.capacity ?? 0}<br/>
+            Aktive brukere innen 150m: <strong class="live-users-count">Laster...</strong><br/>
             <button id="deleteSafeAreaBtn" class="delete-btn" style="margin-top:8px;padding:4px 8px;background:#ef4444;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;">Slett</button>
           </div>
         `
@@ -673,6 +825,16 @@ function AdminPage({ onBack }) {
           .setLngLat(e.lngLat)
           .setHTML(html)
           .addTo(map.current)
+
+        if (Number.isFinite(Number(safeAreaId))) {
+          bindLiveUserCountToPopup({
+            popup,
+            endpoint: `${API_BASE}/api/admin/safe-areas/${safeAreaId}/live-users?radius=150`
+          })
+        } else {
+          const countEl = popup.getElement()?.querySelector('.live-users-count')
+          if (countEl) countEl.textContent = '0'
+        }
         
         const popupElement = popup.getElement()
         const deleteBtn = popupElement?.querySelector('#deleteSafeAreaBtn')
@@ -682,9 +844,11 @@ function AdminPage({ onBack }) {
               await axios.delete(`${API_BASE}/api/admin/safe-areas/${safeAreaId}`)
               popup.remove()
               const res = await axios.get(`${API_BASE}/api/layers/safe-areas`)
+              safeAreasGeoJsonRef.current = res.data || { type: 'FeatureCollection', features: [] }
               if (map.current.getSource('safe-areas')) {
                 map.current.getSource('safe-areas').setData(res.data)
               }
+              await refreshMarkerLiveCounts()
             } catch (error) {
               console.error('Error deleting safe area:', error)
               alert('Feil ved sletting av område')
@@ -761,9 +925,11 @@ function AdminPage({ onBack }) {
                 await axios.post(`${API_BASE}/api/admin/safe-areas`, { name, lon, lat, capacity })
                 popup.remove()
                 const res = await axios.get(`${API_BASE}/api/layers/safe-areas`)
+                safeAreasGeoJsonRef.current = res.data || { type: 'FeatureCollection', features: [] }
                 if (map.current.getSource('safe-areas')) {
                   map.current.getSource('safe-areas').setData(res.data)
                 }
+                await refreshMarkerLiveCounts()
               } catch (error) {
                 console.error('Error creating safe area:', error)
                 alert('Feil ved opprettelse av område')
