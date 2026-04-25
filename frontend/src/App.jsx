@@ -917,6 +917,8 @@ function UserPage({ userId, onBack }) {
   const mapContainer = useRef(null)
   const map = useRef(null)
   const userPopupBound = useRef(false)
+  const routeModeRef = useRef('walk')
+  const userLocationRef = useRef(null)
   const [userLocation, setUserLocation] = useState(null)
   const [following, setFollowing] = useState(false)
   const [routeMode, setRouteMode] = useState('walk')
@@ -1019,6 +1021,14 @@ function UserPage({ userId, onBack }) {
   }, [userLocation])
 
   useEffect(() => {
+    routeModeRef.current = routeMode
+  }, [routeMode])
+
+  useEffect(() => {
+    userLocationRef.current = userLocation
+  }, [userLocation])
+
+  useEffect(() => {
     if (!mapContainer.current) return
 
     map.current = new maplibregl.Map({
@@ -1075,13 +1085,32 @@ function UserPage({ userId, onBack }) {
                 Kapasitet: ${p.capacity ?? 0}<br/>
                 Befolkning i område: ${p.cluster_population ?? 0}<br/>
                 Ledige plasser i område: ${p.cluster_free_spaces ?? 0}<br/>
-                Status: ${(p.enough_capacity === true || p.enough_capacity === 'true') ? 'Nok plass' : 'Ikke nok plass'}
+                Status: ${(p.enough_capacity === true || p.enough_capacity === 'true') ? 'Nok plass' : 'Ikke nok plass'}<br/>
+                <button class="route-to-marker-btn" style="margin-top:8px;padding:6px 8px;background:#0ea5e9;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;">Få veibeskrivelse hit</button>
               </div>
             `
-            new maplibregl.Popup({ closeButton: true })
+            const popup = new maplibregl.Popup({ closeButton: true })
               .setLngLat(e.lngLat)
               .setHTML(html)
               .addTo(map.current)
+
+            const popupElement = popup.getElement()
+            const routeBtn = popupElement?.querySelector('.route-to-marker-btn')
+            if (routeBtn) {
+              routeBtn.addEventListener('click', async () => {
+                const coordinates = f.geometry?.coordinates || []
+                const destLon = Number(coordinates[0])
+                const destLat = Number(coordinates[1])
+                if (Number.isFinite(destLon) && Number.isFinite(destLat)) {
+                  await routeToSpecificMarker({
+                    lon: destLon,
+                    lat: destLat,
+                    name: p.name || 'Tilfluktsrom'
+                  })
+                  popup.remove()
+                }
+              })
+            }
           })
           map.current.on('mouseenter', 'shelters-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
           map.current.on('mouseleave', 'shelters-layer', () => { map.current.getCanvas().style.cursor = '' })
@@ -1149,13 +1178,32 @@ function UserPage({ userId, onBack }) {
               <div style="font-size:12px;line-height:1.4;">
                 <strong>🛡️ Trygt område</strong><br/>
                 <strong>${p.name}</strong><br/>
-                Kapasitet: ${p.capacity ?? 0}
+                  Kapasitet: ${p.capacity ?? 0}<br/>
+                  <button class="route-to-marker-btn" style="margin-top:8px;padding:6px 8px;background:#0ea5e9;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;">Få veibeskrivelse hit</button>
               </div>
             `
-            new maplibregl.Popup({ closeButton: true })
+              const popup = new maplibregl.Popup({ closeButton: true })
               .setLngLat(e.lngLat)
               .setHTML(html)
               .addTo(map.current)
+
+              const popupElement = popup.getElement()
+              const routeBtn = popupElement?.querySelector('.route-to-marker-btn')
+              if (routeBtn) {
+                routeBtn.addEventListener('click', async () => {
+                  const coordinates = f.geometry?.coordinates || []
+                  const destLon = Number(coordinates[0])
+                  const destLat = Number(coordinates[1])
+                  if (Number.isFinite(destLon) && Number.isFinite(destLat)) {
+                    await routeToSpecificMarker({
+                      lon: destLon,
+                      lat: destLat,
+                      name: p.name || 'Trygt område'
+                    })
+                    popup.remove()
+                  }
+                })
+              }
           })
           map.current.on('mouseenter', 'safe-areas-user-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
           map.current.on('mouseleave', 'safe-areas-user-layer', () => { map.current.getCanvas().style.cursor = '' })
@@ -1185,6 +1233,64 @@ function UserPage({ userId, onBack }) {
       map.current.moveLayer('municipalities-user-line', 'counties-user-line')
     }
   }, [visibleLayers])
+
+  const routeToSpecificMarker = async ({ lon, lat, name }) => {
+    const origin = userLocationRef.current
+    if (!origin) {
+      alert('Venligst tillat geolokalisering først')
+      return
+    }
+
+    try {
+      const routeRes = await axios.get(`${API_BASE}/api/routing/route`, {
+        params: {
+          originLon: origin.lon,
+          originLat: origin.lat,
+          destLon: lon,
+          destLat: lat,
+          mode: routeModeRef.current
+        }
+      })
+
+      const routeFeature = {
+        type: 'Feature',
+        geometry: routeRes.data.geometry,
+        properties: {
+          source: routeRes.data.source
+        }
+      }
+
+      if (map.current.getSource('route-line')) {
+        map.current.getSource('route-line').setData(routeFeature)
+      } else {
+        map.current.addSource('route-line', {
+          type: 'geojson',
+          data: routeFeature
+        })
+
+        map.current.addLayer({
+          id: 'route-layer',
+          type: 'line',
+          source: 'route-line',
+          paint: {
+            'line-color': '#3b82f6',
+            'line-width': 4,
+            'line-opacity': 0.9
+          }
+        })
+      }
+
+      setActiveRoute({
+        shelter: { name },
+        distanceKm: (Number(routeRes.data.distance_m || 0) / 1000).toFixed(2),
+        durationMin: Math.max(1, Math.round(Number(routeRes.data.duration_s || 0) / 60)),
+        source: routeRes.data.source,
+        steps: routeRes.data.steps || []
+      })
+    } catch (error) {
+      console.error('Routing error:', error)
+    }
+  }
 
   const handleComputeRoute = async () => {
     if (!userLocation) {
@@ -1376,6 +1482,19 @@ function UserPage({ userId, onBack }) {
                   <div className="route-capacity">
                     Kapasitet: {route.free_spots > 0 ? '✓' : '✗'} ({route.free_spots} fri)
                   </div>
+                  <button
+                    className="btn btn-secondary"
+                    style={{ marginTop: '8px', width: '100%' }}
+                    onClick={async () => {
+                      await routeToSpecificMarker({
+                        lon: Number(route.lon),
+                        lat: Number(route.lat),
+                        name: route.name || 'Tilfluktsrom'
+                      })
+                    }}
+                  >
+                    Få veibeskrivelse hit
+                  </button>
                 </div>
               ))}
             </div>
