@@ -1434,19 +1434,96 @@ app.post('/api/users/:userId/location', async (req, res) => {
   try {
     const { userId } = req.params;
     const { lon, lat } = req.body;
+    const lonNum = Number(lon);
+    const latNum = Number(lat);
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     
-    if (!lon || !lat) {
-      return res.status(400).json({ error: 'Missing lon/lat' });
+    if (!Number.isFinite(lonNum) || !Number.isFinite(latNum)) {
+      return res.status(400).json({ error: 'Missing or invalid lon/lat' });
+    }
+
+    // If this deployment uses UUID + FK schema, ensure user exists.
+    if (uuidRegex.test(userId)) {
+      await pool.query(`
+        INSERT INTO public.app_users (id, opt_tracking)
+        VALUES ($1::uuid, true)
+        ON CONFLICT (id) DO NOTHING
+      `, [userId]);
     }
     
     await pool.query(`
       INSERT INTO public.user_locations (user_id, location)
       VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 4326))
-    `, [userId, parseFloat(lon), parseFloat(lat)]);
+    `, [userId, lonNum, latNum]);
     
     res.json({ ok: true });
   } catch (error) {
+    console.error('Error saving user location:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: latest known position for each tracked user
+app.get('/api/admin/live-users', async (req, res) => {
+  try {
+    const columnCheck = await pool.query(`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'user_locations'
+        AND column_name IN ('timestamp', 'created_at')
+    `);
+
+    const columns = new Set(columnCheck.rows.map((r) => r.column_name));
+    const timeColumn = columns.has('timestamp')
+      ? 'timestamp'
+      : columns.has('created_at')
+        ? 'created_at'
+        : null;
+
+    const orderExpr = timeColumn ? `"${timeColumn}" DESC NULLS LAST, id DESC` : 'id DESC';
+    const selectTimeExpr = timeColumn ? `"${timeColumn}"` : 'NOW()';
+
+    const result = await pool.query(`
+      WITH latest AS (
+        SELECT DISTINCT ON (user_id)
+          user_id::text AS user_id,
+          location,
+          ${selectTimeExpr} AS last_seen
+        FROM public.user_locations
+        WHERE location IS NOT NULL
+        ORDER BY user_id, ${orderExpr}
+      )
+      SELECT
+        user_id,
+        ST_X(location) AS lon,
+        ST_Y(location) AS lat,
+        last_seen
+      FROM latest
+    `);
+
+    const features = result.rows.map((row) => ({
+      type: 'Feature',
+      geometry: {
+        type: 'Point',
+        coordinates: [Number(row.lon), Number(row.lat)]
+      },
+      properties: {
+        user_id: row.user_id,
+        last_seen: row.last_seen
+      }
+    }));
+
+    res.json({
+      type: 'FeatureCollection',
+      features
+    });
+  } catch (error) {
+    console.error('Error loading live users:', error);
+    res.json({
+      type: 'FeatureCollection',
+      features: []
+    });
   }
 });
 

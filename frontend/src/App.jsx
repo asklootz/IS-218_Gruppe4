@@ -171,6 +171,7 @@ function AdminPage({ onBack }) {
   const map = useRef(null)
   const staticLayersLoaded = useRef(false)
   const adminPopupBound = useRef(false)
+  const liveUsersInterval = useRef(null)
   const [radius, setRadius] = useState(1000)
   const [coverage, setCoverage] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -185,6 +186,7 @@ function AdminPage({ onBack }) {
     doctors: true,
     hospitals: true,
     safe_areas: true,
+    live_users: true,
     radius: false
   })
 
@@ -200,7 +202,13 @@ function AdminPage({ onBack }) {
 
     map.current.on('load', () => initializeAdminMap())
 
-    return () => map.current?.remove()
+    return () => {
+      if (liveUsersInterval.current) {
+        clearInterval(liveUsersInterval.current)
+        liveUsersInterval.current = null
+      }
+      map.current?.remove()
+    }
   }, [])
 
   const applyAdminLayerVisibility = () => {
@@ -221,6 +229,7 @@ function AdminPage({ onBack }) {
     setVisibility('doctors-layer', visibleLayers.doctors)
     setVisibility('hospitals-layer', visibleLayers.hospitals)
     setVisibility('safe-areas-layer', visibleLayers.safe_areas)
+    setVisibility('live-users-layer', visibleLayers.live_users)
     setVisibility('radius-fill', visibleLayers.radius)
     setVisibility('radius-line', visibleLayers.radius)
 
@@ -480,9 +489,47 @@ function AdminPage({ onBack }) {
     setLoading(false)
   }
 
+  const loadLiveUsers = async () => {
+    if (!map.current) return
+    try {
+      const res = await axios.get(`${API_BASE}/api/admin/live-users`)
+      const fc = res.data?.type === 'FeatureCollection'
+        ? res.data
+        : { type: 'FeatureCollection', features: [] }
+
+      if (!map.current.getSource('live-users')) {
+        map.current.addSource('live-users', { type: 'geojson', data: fc })
+        map.current.addLayer({
+          id: 'live-users-layer',
+          type: 'circle',
+          source: 'live-users',
+          paint: {
+            'circle-radius': 7,
+            'circle-color': '#0ea5e9',
+            'circle-stroke-width': 2,
+            'circle-stroke-color': '#ffffff'
+          }
+        })
+      } else {
+        map.current.getSource('live-users').setData(fc)
+      }
+
+      applyAdminLayerVisibility()
+    } catch (error) {
+      console.warn('Failed to load live users:', error.message)
+    }
+  }
+
   const initializeAdminMap = async () => {
     await loadStaticLayers()
     await loadCoverageAndRadius(radius)
+    await loadLiveUsers()
+
+    if (!liveUsersInterval.current) {
+      liveUsersInterval.current = setInterval(() => {
+        loadLiveUsers()
+      }, 10000)
+    }
 
     if (!adminPopupBound.current && map.current) {
       map.current.on('click', 'shelters-layer', (e) => {
@@ -648,10 +695,29 @@ function AdminPage({ onBack }) {
       map.current.on('mouseenter', 'safe-areas-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
       map.current.on('mouseleave', 'safe-areas-layer', () => { map.current.getCanvas().style.cursor = '' })
 
+      map.current.on('click', 'live-users-layer', (e) => {
+        const f = e.features?.[0]
+        if (!f) return
+        const p = f.properties || {}
+        const html = `
+          <div style="font-size:12px;line-height:1.4;">
+            <strong>📍 Aktiv bruker</strong><br/>
+            ID: ${p.user_id || '-'}<br/>
+            Sist oppdatert: ${p.last_seen ? new Date(p.last_seen).toLocaleString() : '-'}
+          </div>
+        `
+        new maplibregl.Popup({ closeButton: true })
+          .setLngLat(e.lngLat)
+          .setHTML(html)
+          .addTo(map.current)
+      })
+      map.current.on('mouseenter', 'live-users-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+      map.current.on('mouseleave', 'live-users-layer', () => { map.current.getCanvas().style.cursor = '' })
+
       // Add click handler to map for creating new safe areas
       map.current.on('click', (e) => {
         // Only query layers that exist
-        const layersToQuery = ['shelters-layer', 'fire_stations-layer', 'farms-layer', 'water_sources-layer', 'doctors-layer', 'hospitals-layer']
+        const layersToQuery = ['shelters-layer', 'fire_stations-layer', 'farms-layer', 'water_sources-layer', 'doctors-layer', 'hospitals-layer', 'live-users-layer']
         if (map.current.getLayer('safe-areas-layer')) {
           layersToQuery.push('safe-areas-layer')
         }
@@ -914,6 +980,14 @@ function AdminPage({ onBack }) {
               onChange={(e) => setVisibleLayers({ ...visibleLayers, safe_areas: e.target.checked })}
             />
             Trygge områder
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={visibleLayers.live_users}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, live_users: e.target.checked })}
+            />
+            Live brukere
           </label>
         </div>
       </div>
