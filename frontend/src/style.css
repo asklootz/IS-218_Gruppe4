@@ -104,6 +104,16 @@ body {
   box-shadow: 0 10px 25px rgba(34, 197, 94, 0.3);
 }
 
+.btn-simulate {
+  background: linear-gradient(135deg, #f97316 0%, #ea580c 100%);
+  color: white;
+}
+
+.btn-simulate:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 10px 25px rgba(249, 115, 22, 0.3);
+}
+
 .btn-primary {
   background: var(--primary);
   color: white;
@@ -133,6 +143,13 @@ body {
 
 .btn-close:hover {
   color: var(--text);
+}
+
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+  transform: none;
+  box-shadow: none;
 }
 
 /* ADMIN PAGE */
@@ -376,6 +393,75 @@ body {
   grid-template-columns: 320px 1fr;
   height: 100vh;
   gap: 0;
+}
+
+.simulate-container {
+  display: grid;
+  grid-template-columns: 360px 1fr;
+  height: 100vh;
+  gap: 0;
+}
+
+.simulate-panel {
+  background: white;
+  overflow-y: auto;
+  border-right: 1px solid #ddd;
+}
+
+.simulate-stats {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+
+.simulate-help {
+  color: var(--text-light);
+  font-size: 0.95rem;
+  line-height: 1.55;
+}
+
+.simulate-popup {
+  min-width: 220px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.simulate-popup strong {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.simulate-popup label {
+  display: block;
+  margin-bottom: 4px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.simulate-popup input {
+  width: 100%;
+  padding: 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  font-size: 0.95rem;
+}
+
+.simulate-popup button {
+  width: 100%;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 6px;
+  background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.simulate-popup p {
+  margin-top: 8px;
+  color: var(--text-light);
 }
 
 .user-panel {

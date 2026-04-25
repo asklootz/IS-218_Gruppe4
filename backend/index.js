@@ -2126,6 +2126,35 @@ app.post('/api/users/:userId/location', async (req, res) => {
   }
 });
 
+app.delete('/api/admin/mock-users', async (req, res) => {
+  try {
+    const { userIds } = req.body || {};
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const ids = Array.isArray(userIds)
+      ? userIds.map((id) => String(id).trim()).filter((id) => uuidRegex.test(id))
+      : [];
+
+    if (ids.length === 0) {
+      return res.json({ ok: true, deleted: 0 });
+    }
+
+    await pool.query(`
+      DELETE FROM public.user_locations
+      WHERE user_id = ANY($1::uuid[])
+    `, [ids]);
+
+    await pool.query(`
+      DELETE FROM public.app_users
+      WHERE id = ANY($1::uuid[])
+    `, [ids]);
+
+    res.json({ ok: true, deleted: ids.length });
+  } catch (error) {
+    console.error('Error deleting mock users:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Admin: latest known position for each tracked user
 app.get('/api/admin/live-users', async (req, res) => {
   try {

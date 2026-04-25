@@ -18,6 +18,7 @@ const API_BASE = (() => {
 })()
 const OSM_RASTER_STYLE = {
   version: 8,
+  glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
   sources: {
     osm: {
       type: 'raster',
@@ -115,8 +116,40 @@ function sheltersToFeatureCollection(shelters = []) {
   }
 }
 
+const MOCK_USER_STORAGE_KEY = 'simulateMockUserIds'
+
+function readStoredMockUserIds() {
+  try {
+    const value = JSON.parse(localStorage.getItem(MOCK_USER_STORAGE_KEY) || '[]')
+    return Array.isArray(value) ? value.filter((id) => typeof id === 'string') : []
+  } catch (error) {
+    return []
+  }
+}
+
+function writeStoredMockUserIds(ids) {
+  localStorage.setItem(MOCK_USER_STORAGE_KEY, JSON.stringify(ids))
+}
+
+function createMockUserPositions(lon, lat, count) {
+  const metersPerDegreeLat = 111320
+  const metersPerDegreeLon = Math.max(111320 * Math.cos((lat * Math.PI) / 180), 1)
+
+  return Array.from({ length: count }, (_, index) => {
+    const distanceMeters = 10 + (index % 8) * 7 + Math.random() * 12
+    const angle = Math.random() * Math.PI * 2
+
+    return {
+      lon: lon + (Math.cos(angle) * distanceMeters) / metersPerDegreeLon,
+      lat: lat + (Math.sin(angle) * distanceMeters) / metersPerDegreeLat,
+    }
+  })
+}
+
+
 function pageFromPath(pathname) {
   if (pathname === '/admin') return 'admin'
+  if (pathname === '/simulate') return 'simulate'
   if (pathname === '/bruker') return 'user'
   return 'home'
 }
@@ -126,7 +159,13 @@ function App() {
   const [userId] = useState(localStorage.getItem('userId') || uuidv4())
 
   const navigate = (targetPage) => {
-    const path = targetPage === 'admin' ? '/admin' : targetPage === 'user' ? '/bruker' : '/'
+    const path = targetPage === 'admin'
+      ? '/admin'
+      : targetPage === 'user'
+        ? '/bruker'
+        : targetPage === 'simulate'
+          ? '/simulate'
+          : '/'
     window.history.pushState({}, '', path)
     setPage(targetPage)
   }
@@ -147,6 +186,9 @@ function App() {
   if (page === 'user') {
     return <UserPage userId={userId} onBack={() => navigate('home')} />
   }
+  if (page === 'simulate') {
+    return <SimulatePage onBack={() => navigate('home')} />
+  }
 
   return (
     <div className="home-container">
@@ -159,6 +201,9 @@ function App() {
           </button>
           <button className="btn btn-user" onClick={() => navigate('user')}>
             👤 Brukervisning
+          </button>
+          <button className="btn btn-simulate" onClick={() => navigate('simulate')}>
+            🧪 Simuleringsvisning
           </button>
         </div>
       </div>
@@ -1163,6 +1208,694 @@ function AdminPage({ onBack }) {
             />
             Live brukere
           </label>
+        </div>
+      </div>
+
+      <div className="map-container" ref={mapContainer} />
+    </div>
+  )
+}
+
+function SimulatePage({ onBack }) {
+  const mapContainer = useRef(null)
+  const map = useRef(null)
+  const liveUsersInterval = useRef(null)
+  const markerLiveCountInterval = useRef(null)
+  const simulatePopupBound = useRef(false)
+  const sheltersGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
+  const safeAreasGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
+  const [mockUserIds, setMockUserIds] = useState(() => readStoredMockUserIds())
+  const [statusMessage, setStatusMessage] = useState('Klikk på kartet for å spawn mock-brukere.')
+  const [visibleLayers, setVisibleLayers] = useState({
+    shelters: true,
+    safe_areas: true,
+    live_users: true,
+    fire_stations: true,
+    farms: true,
+    water_sources: true,
+    doctors: true,
+    hospitals: true,
+  })
+
+  useEffect(() => {
+    if (!mapContainer.current) return
+
+    map.current = new maplibregl.Map({
+      container: mapContainer.current,
+      style: OSM_RASTER_STYLE,
+      center: [10.75, 59.91],
+      zoom: 10,
+    })
+
+    map.current.on('load', () => initializeSimulationMap())
+
+    return () => {
+      if (liveUsersInterval.current) {
+        clearInterval(liveUsersInterval.current)
+        liveUsersInterval.current = null
+      }
+      if (markerLiveCountInterval.current) {
+        clearInterval(markerLiveCountInterval.current)
+        markerLiveCountInterval.current = null
+      }
+      map.current?.remove()
+    }
+  }, [])
+
+  const clearMarkerLiveCountInterval = () => {
+    if (markerLiveCountInterval.current) {
+      clearInterval(markerLiveCountInterval.current)
+      markerLiveCountInterval.current = null
+    }
+  }
+
+  const bindLiveUserCountToPopup = ({ popup, endpoint, updateMs = 10000 }) => {
+    const popupElement = popup.getElement()
+    const countEl = popupElement?.querySelector('.live-users-count')
+    if (!countEl) return
+
+    clearMarkerLiveCountInterval()
+
+    const refreshCount = async () => {
+      try {
+        const res = await axios.get(endpoint)
+        const count = Number(res.data?.live_users_count || 0)
+        countEl.textContent = String(count)
+      } catch (error) {
+        countEl.textContent = '0'
+      }
+    }
+
+    refreshCount()
+    markerLiveCountInterval.current = setInterval(refreshCount, updateMs)
+    popup.on('close', clearMarkerLiveCountInterval)
+  }
+
+  const applyLiveCountsToSource = (sourceId, geojsonRef, counts = []) => {
+    if (!map.current || !map.current.getSource(sourceId)) return
+    const current = geojsonRef.current
+    if (!current || !Array.isArray(current.features)) return
+
+    const countMap = new Map(
+      (counts || []).map((row) => [Number(row.id), Number(row.live_users_count || 0)])
+    )
+
+    const updated = {
+      ...current,
+      features: current.features.map((feature) => {
+        const featureId = Number(feature?.properties?.id)
+        const count = Number.isFinite(featureId) ? (countMap.get(featureId) || 0) : 0
+        return {
+          ...feature,
+          properties: {
+            ...(feature.properties || {}),
+            live_users_count: count,
+          },
+        }
+      }),
+    }
+
+    geojsonRef.current = updated
+    map.current.getSource(sourceId).setData(updated)
+  }
+
+  const refreshMarkerLiveCounts = async () => {
+    if (!map.current) return
+    try {
+      const [shelterRes, safeAreasRes] = await Promise.all([
+        axios.get(`${API_BASE}/api/admin/shelters/live-users?radius=150`),
+        axios.get(`${API_BASE}/api/admin/safe-areas/live-users?radius=150`),
+      ])
+
+      applyLiveCountsToSource('shelters', sheltersGeoJsonRef, shelterRes.data?.counts || [])
+      applyLiveCountsToSource('safe-areas', safeAreasGeoJsonRef, safeAreasRes.data?.counts || [])
+    } catch (error) {
+      console.warn('Failed to refresh marker live counts:', error.message)
+    }
+  }
+
+  const applySimulationLayerVisibility = () => {
+    if (!map.current) return
+    const setVisibility = (layerId, visible) => {
+      if (map.current.getLayer(layerId)) {
+        map.current.setLayoutProperty(layerId, 'visibility', visible ? 'visible' : 'none')
+      }
+    }
+
+    setVisibility('shelters-layer', visibleLayers.shelters)
+    setVisibility('shelters-live-count-layer', visibleLayers.shelters)
+    setVisibility('safe-areas-layer', visibleLayers.safe_areas)
+    setVisibility('safe-areas-live-count-layer', visibleLayers.safe_areas)
+    setVisibility('live-users-layer', visibleLayers.live_users)
+    setVisibility('fire_stations-layer', visibleLayers.fire_stations)
+    setVisibility('farms-layer', visibleLayers.farms)
+    setVisibility('water_sources-layer', visibleLayers.water_sources)
+    setVisibility('doctors-layer', visibleLayers.doctors)
+    setVisibility('hospitals-layer', visibleLayers.hospitals)
+  }
+
+  const loadShelters = async () => {
+    try {
+      const res = await axios.get(`${API_BASE}/api/layers/shelters`)
+      const sheltersData = res.data?.features
+        ? res.data
+        : { type: 'FeatureCollection', features: [] }
+
+      sheltersGeoJsonRef.current = sheltersData
+
+      if (!map.current.getSource('shelters')) {
+        map.current.addSource('shelters', { type: 'geojson', data: sheltersData })
+        map.current.addLayer({
+          id: 'shelters-layer',
+          type: 'circle',
+          source: 'shelters',
+          paint: {
+            'circle-radius': 6,
+            'circle-color': [
+              'case',
+              ['==', ['get', 'enough_capacity'], true],
+              '#22c55e',
+              '#ef4444',
+            ],
+            'circle-stroke-width': 2,
+            'circle-stroke-color': '#fff',
+          },
+        })
+        map.current.addLayer({
+          id: 'shelters-live-count-layer',
+          type: 'symbol',
+          source: 'shelters',
+          layout: {
+            'text-field': ['to-string', ['coalesce', ['get', 'live_users_count'], 0]],
+            'text-size': 11,
+            'text-offset': [0, -1.6],
+            'text-allow-overlap': true,
+            'text-ignore-placement': true,
+          },
+          paint: {
+            'text-color': '#111827',
+            'text-halo-color': '#ffffff',
+            'text-halo-width': 1.2,
+          },
+        })
+      } else {
+        map.current.getSource('shelters').setData(sheltersData)
+      }
+    } catch (error) {
+      console.error('Error loading shelters for simulation:', error)
+    }
+  }
+
+  const loadSafeAreas = async () => {
+    try {
+      const res = await axios.get(`${API_BASE}/api/layers/safe-areas`)
+      const safeAreasData = res.data?.features
+        ? res.data
+        : { type: 'FeatureCollection', features: [] }
+
+      safeAreasGeoJsonRef.current = safeAreasData
+
+      if (!map.current.getSource('safe-areas')) {
+        map.current.addSource('safe-areas', { type: 'geojson', data: safeAreasData })
+        map.current.addLayer({
+          id: 'safe-areas-layer',
+          type: 'circle',
+          source: 'safe-areas',
+          paint: {
+            'circle-radius': 6,
+            'circle-color': '#8b5cf6',
+            'circle-stroke-width': 2,
+            'circle-stroke-color': '#fff',
+          },
+        })
+        map.current.addLayer({
+          id: 'safe-areas-live-count-layer',
+          type: 'symbol',
+          source: 'safe-areas',
+          layout: {
+            'text-field': ['to-string', ['coalesce', ['get', 'live_users_count'], 0]],
+            'text-size': 11,
+            'text-offset': [0, -1.6],
+            'text-allow-overlap': true,
+            'text-ignore-placement': true,
+          },
+          paint: {
+            'text-color': '#111827',
+            'text-halo-color': '#ffffff',
+            'text-halo-width': 1.2,
+          },
+        })
+      } else {
+        map.current.getSource('safe-areas').setData(safeAreasData)
+      }
+    } catch (error) {
+      console.warn('Failed to load safe areas for simulation:', error.message)
+      if (!map.current.getSource('safe-areas')) {
+        const emptySafeAreas = { type: 'FeatureCollection', features: [] }
+        safeAreasGeoJsonRef.current = emptySafeAreas
+        map.current.addSource('safe-areas', { type: 'geojson', data: emptySafeAreas })
+        map.current.addLayer({
+          id: 'safe-areas-layer',
+          type: 'circle',
+          source: 'safe-areas',
+          paint: {
+            'circle-radius': 6,
+            'circle-color': '#8b5cf6',
+            'circle-stroke-width': 2,
+            'circle-stroke-color': '#fff',
+          },
+        })
+        map.current.addLayer({
+          id: 'safe-areas-live-count-layer',
+          type: 'symbol',
+          source: 'safe-areas',
+          layout: {
+            'text-field': ['to-string', ['coalesce', ['get', 'live_users_count'], 0]],
+            'text-size': 11,
+            'text-offset': [0, -1.6],
+            'text-allow-overlap': true,
+            'text-ignore-placement': true,
+          },
+          paint: {
+            'text-color': '#111827',
+            'text-halo-color': '#ffffff',
+            'text-halo-width': 1.2,
+          },
+        })
+      }
+    }
+  }
+
+  const loadPointLayer = async ({ name, color }) => {
+    try {
+      const res = await axios.get(`${API_BASE}/api/layers/${name}`)
+      if (!res.data?.features || res.data.features.length === 0) return
+
+      if (!map.current.getSource(name)) {
+        map.current.addSource(name, { type: 'geojson', data: res.data })
+        map.current.addLayer({
+          id: `${name}-layer`,
+          type: 'circle',
+          source: name,
+          paint: {
+            'circle-radius': 5,
+            'circle-color': color,
+            'circle-stroke-width': 2,
+            'circle-stroke-color': '#fff',
+          },
+        })
+      } else {
+        map.current.getSource(name).setData(res.data)
+      }
+    } catch (error) {
+      console.warn(`Failed to load ${name} for simulation:`, error.message)
+    }
+  }
+
+  const loadLiveUsers = async () => {
+    if (!map.current) return
+    try {
+      const res = await axios.get(`${API_BASE}/api/admin/live-users`)
+      const fc = res.data?.type === 'FeatureCollection'
+        ? res.data
+        : { type: 'FeatureCollection', features: [] }
+
+      if (!map.current.getSource('live-users')) {
+        map.current.addSource('live-users', { type: 'geojson', data: fc })
+        map.current.addLayer({
+          id: 'live-users-layer',
+          type: 'circle',
+          source: 'live-users',
+          paint: {
+            'circle-radius': 7,
+            'circle-color': '#0ea5e9',
+            'circle-stroke-width': 2,
+            'circle-stroke-color': '#ffffff',
+          },
+        })
+      } else {
+        map.current.getSource('live-users').setData(fc)
+      }
+
+      await refreshMarkerLiveCounts()
+      applySimulationLayerVisibility()
+    } catch (error) {
+      console.warn('Failed to load live users for simulation:', error.message)
+    }
+  }
+
+  const initializeSimulationMap = async () => {
+    await loadShelters()
+    await loadSafeAreas()
+
+    const pointLayers = [
+      { name: 'fire_stations', color: '#ff6b6b' },
+      { name: 'farms', color: '#84cc16' },
+      { name: 'water_sources', color: '#06b6d4' },
+      { name: 'doctors', color: '#f97316' },
+      { name: 'hospitals', color: '#d946ef' },
+    ]
+
+    for (const layerConfig of pointLayers) {
+      await loadPointLayer(layerConfig)
+    }
+
+    await loadLiveUsers()
+
+    if (!liveUsersInterval.current) {
+      liveUsersInterval.current = setInterval(() => {
+        loadLiveUsers()
+      }, 10000)
+    }
+
+    if (!simulatePopupBound.current && map.current) {
+      map.current.on('click', 'shelters-layer', (e) => {
+        const f = e.features?.[0]
+        if (!f) return
+        const p = f.properties || {}
+        const shelterId = Number(p.id)
+        const html = `
+          <div style="font-size:12px;line-height:1.4;">
+            <strong>${p.name || 'Tilfluktsrom'}</strong><br/>
+            Kapasitet: ${p.capacity ?? 0}<br/>
+            Aktive brukere innen 150m: <strong class="live-users-count">Laster...</strong>
+          </div>
+        `
+        const popup = new maplibregl.Popup({ closeButton: true })
+          .setLngLat(e.lngLat)
+          .setHTML(html)
+          .addTo(map.current)
+
+        if (Number.isFinite(shelterId)) {
+          bindLiveUserCountToPopup({
+            popup,
+            endpoint: `${API_BASE}/api/admin/shelters/${shelterId}/live-users?radius=150`,
+          })
+        } else {
+          const countEl = popup.getElement()?.querySelector('.live-users-count')
+          if (countEl) countEl.textContent = '0'
+        }
+      })
+      map.current.on('mouseenter', 'shelters-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+      map.current.on('mouseleave', 'shelters-layer', () => { map.current.getCanvas().style.cursor = '' })
+
+      map.current.on('click', 'safe-areas-layer', (e) => {
+        const f = e.features?.[0]
+        if (!f) return
+        const p = f.properties || {}
+        const safeAreaId = Number(p.id)
+        const html = `
+          <div style="font-size:12px;line-height:1.4;">
+            <strong>🛡️ Trygt område</strong><br/>
+            <strong>${p.name || 'Trygt område'}</strong><br/>
+            Kapasitet: ${p.capacity ?? 0}<br/>
+            Aktive brukere innen 150m: <strong class="live-users-count">Laster...</strong>
+          </div>
+        `
+        const popup = new maplibregl.Popup({ closeButton: true })
+          .setLngLat(e.lngLat)
+          .setHTML(html)
+          .addTo(map.current)
+
+        if (Number.isFinite(safeAreaId)) {
+          bindLiveUserCountToPopup({
+            popup,
+            endpoint: `${API_BASE}/api/admin/safe-areas/${safeAreaId}/live-users?radius=150`,
+          })
+        } else {
+          const countEl = popup.getElement()?.querySelector('.live-users-count')
+          if (countEl) countEl.textContent = '0'
+        }
+      })
+      map.current.on('mouseenter', 'safe-areas-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+      map.current.on('mouseleave', 'safe-areas-layer', () => { map.current.getCanvas().style.cursor = '' })
+
+      pointLayers.forEach(({ name }) => {
+        map.current.on('click', `${name}-layer`, (e) => {
+          const f = e.features?.[0]
+          if (!f) return
+          const p = f.properties || {}
+          const label = {
+            fire_stations: '🚒 Brannstasjon',
+            farms: '🌾 Gård',
+            water_sources: '💧 Vannkilde',
+            doctors: '👨‍⚕️ Lege',
+            hospitals: '🏥 Sykehus',
+          }[name] || name
+          const html = `
+            <div style="font-size:12px;line-height:1.4;">
+              <strong>${label}</strong><br/>
+              ${p.name ? `<strong>${p.name}</strong><br/>` : ''}
+              ${p.website ? `<a href="${p.website}" target="_blank" rel="noreferrer">Besøk nettside</a><br/>` : ''}
+              ${p.phone ? `Telefon: ${p.phone}<br/>` : ''}
+            </div>
+          `
+          new maplibregl.Popup({ closeButton: true })
+            .setLngLat(e.lngLat)
+            .setHTML(html)
+            .addTo(map.current)
+        })
+        map.current.on('mouseenter', `${name}-layer`, () => { map.current.getCanvas().style.cursor = 'pointer' })
+        map.current.on('mouseleave', `${name}-layer`, () => { map.current.getCanvas().style.cursor = '' })
+      })
+
+      map.current.on('click', 'live-users-layer', (e) => {
+        const f = e.features?.[0]
+        if (!f) return
+        const p = f.properties || {}
+        const html = `
+          <div style="font-size:12px;line-height:1.4;">
+            <strong>📍 Aktiv bruker</strong><br/>
+            ID: ${p.user_id || '-'}<br/>
+            Sist oppdatert: ${p.last_seen ? new Date(p.last_seen).toLocaleString() : '-'}
+          </div>
+        `
+        new maplibregl.Popup({ closeButton: true })
+          .setLngLat(e.lngLat)
+          .setHTML(html)
+          .addTo(map.current)
+      })
+      map.current.on('mouseenter', 'live-users-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+      map.current.on('mouseleave', 'live-users-layer', () => { map.current.getCanvas().style.cursor = '' })
+
+      map.current.on('click', (e) => {
+        const candidateLayers = [
+          'shelters-layer',
+          'safe-areas-layer',
+          'fire_stations-layer',
+          'farms-layer',
+          'water_sources-layer',
+          'doctors-layer',
+          'hospitals-layer',
+          'live-users-layer',
+        ]
+        const layersToQuery = candidateLayers.filter((layerId) => map.current.getLayer(layerId))
+        const features = layersToQuery.length > 0
+          ? map.current.queryRenderedFeatures(e.point, { layers: layersToQuery })
+          : []
+
+        if (features.length > 0) return
+
+        const { lng: lon, lat } = e.lngLat
+        const html = `
+          <div class="simulate-popup">
+            <strong>Spawn mock users</strong>
+            <label for="mock-user-count">Antall brukere</label>
+            <input id="mock-user-count" type="number" min="1" max="250" value="10" />
+            <button id="spawn-mock-users-btn">Spawn users</button>
+            <p>Klikk på kartet for å legge brukerne rundt dette punktet.</p>
+          </div>
+        `
+        const popup = new maplibregl.Popup({ closeButton: true })
+          .setLngLat([lon, lat])
+          .setHTML(html)
+          .addTo(map.current)
+
+        const popupElement = popup.getElement()
+        const countInput = popupElement?.querySelector('#mock-user-count')
+        const spawnButton = popupElement?.querySelector('#spawn-mock-users-btn')
+
+        const spawnUsers = async () => {
+          const count = Math.min(250, Math.max(1, Number.parseInt(countInput?.value || '1', 10) || 1))
+          popup.remove()
+          await spawnMockUsers({ lon, lat, count })
+        }
+
+        if (spawnButton) {
+          spawnButton.addEventListener('click', spawnUsers)
+        }
+        if (countInput) {
+          countInput.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') {
+              spawnUsers()
+            }
+          })
+          countInput.focus()
+          countInput.select()
+        }
+      })
+
+      simulatePopupBound.current = true
+    }
+
+    applySimulationLayerVisibility()
+  }
+
+  const spawnMockUsers = async ({ lon, lat, count }) => {
+    const mockIds = Array.from({ length: count }, () => uuidv4())
+    const positions = createMockUserPositions(lon, lat, count)
+
+    setStatusMessage(`Spawning ${count} mock users...`)
+
+    try {
+      await Promise.all(
+        mockIds.map((mockId, index) =>
+          axios.post(`${API_BASE}/api/users/${mockId}/location`, {
+            lon: positions[index].lon,
+            lat: positions[index].lat,
+          })
+        )
+      )
+
+      setMockUserIds((currentIds) => {
+        const nextIds = [...currentIds, ...mockIds]
+        writeStoredMockUserIds(nextIds)
+        return nextIds
+      })
+
+      setStatusMessage(`Spawned ${count} mock users at the clicked location.`)
+      await loadLiveUsers()
+    } catch (error) {
+      console.error('Error spawning mock users:', error)
+      setStatusMessage('Failed to spawn mock users.')
+    }
+  }
+
+  const clearMockUsers = async () => {
+    if (mockUserIds.length === 0) {
+      setStatusMessage('No mock users to clear.')
+      return
+    }
+
+    try {
+      await axios.delete(`${API_BASE}/api/admin/mock-users`, {
+        data: { userIds: mockUserIds },
+      })
+
+      setMockUserIds([])
+      writeStoredMockUserIds([])
+      setStatusMessage('Cleared all mock users.')
+      await loadLiveUsers()
+    } catch (error) {
+      console.error('Error clearing mock users:', error)
+      setStatusMessage('Failed to clear mock users.')
+    }
+  }
+
+  useEffect(() => {
+    if (map.current?.isStyleLoaded()) {
+      applySimulationLayerVisibility()
+    }
+  }, [visibleLayers])
+
+  return (
+    <div className="simulate-container">
+      <div className="simulate-panel">
+        <div className="panel-header">
+          <h2>Simuleringsvisning</h2>
+          <button className="btn-close" onClick={onBack}>←</button>
+        </div>
+
+        <div className="panel-section">
+          <h3>Mock-brukere</h3>
+          <p className="location-info">{statusMessage}</p>
+          <div className="simulate-stats">
+            <div className="stat-card">
+              <div className="stat-value">{mockUserIds.length}</div>
+              <div className="stat-label">Mock brukere lagret</div>
+            </div>
+          </div>
+          <div className="button-group" style={{ marginTop: '12px' }}>
+            <button className="btn btn-secondary" onClick={clearMockUsers} disabled={mockUserIds.length === 0}>
+              Tøm mock-brukere
+            </button>
+          </div>
+        </div>
+
+        <div className="panel-section">
+          <h3>Lag</h3>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={visibleLayers.shelters}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, shelters: e.target.checked })}
+            />
+            Tilfluktsrom
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={visibleLayers.safe_areas}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, safe_areas: e.target.checked })}
+            />
+            Trygge områder
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={visibleLayers.live_users}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, live_users: e.target.checked })}
+            />
+            Live brukere
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={visibleLayers.fire_stations}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, fire_stations: e.target.checked })}
+            />
+            Brannstasjoner
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={visibleLayers.farms}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, farms: e.target.checked })}
+            />
+            Gårder
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={visibleLayers.water_sources}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, water_sources: e.target.checked })}
+            />
+            Vannkilder
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={visibleLayers.doctors}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, doctors: e.target.checked })}
+            />
+            Leger
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={visibleLayers.hospitals}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, hospitals: e.target.checked })}
+            />
+            Sykehus
+          </label>
+        </div>
+
+        <div className="panel-section">
+          <h3>Hvordan bruke</h3>
+          <p className="simulate-help">
+            Klikk et tomt punkt på kartet, velg antall brukere i popup-vinduet og spawn dem rundt klikket.
+            Bruk <strong>Tøm mock-brukere</strong> når du vil starte på nytt.
+          </p>
         </div>
       </div>
 
