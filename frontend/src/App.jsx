@@ -5,7 +5,17 @@ import axios from 'axios'
 import proj4 from 'proj4'
 import { v4 as uuidv4 } from 'uuid'
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3000'
+const API_BASE = (() => {
+  const configured = String(import.meta.env.VITE_API_URL || '').trim().replace(/\/$/, '')
+  if (!configured) return ''
+
+  // Avoid mixed-content/network issues when app runs on HTTPS from another device.
+  if (window.location.protocol === 'https:' && configured.startsWith('http://')) {
+    return ''
+  }
+
+  return configured
+})()
 const OSM_RASTER_STYLE = {
   version: 8,
   sources: {
@@ -917,6 +927,7 @@ function UserPage({ userId, onBack }) {
   const mapContainer = useRef(null)
   const map = useRef(null)
   const userPopupBound = useRef(false)
+  const layerRefreshInterval = useRef(null)
   const routeModeRef = useRef('walk')
   const userLocationRef = useRef(null)
   const [userLocation, setUserLocation] = useState(null)
@@ -1042,9 +1053,24 @@ function UserPage({ userId, onBack }) {
       loadShelters()
       loadUserLayers()
       loadSafeAreas()
+
+      // Backend startup can be delayed; keep retrying layer loads.
+      if (!layerRefreshInterval.current) {
+        layerRefreshInterval.current = setInterval(() => {
+          loadShelters()
+          loadUserLayers()
+          loadSafeAreas()
+        }, 15000)
+      }
     })
 
-    return () => map.current?.remove()
+    return () => {
+      if (layerRefreshInterval.current) {
+        clearInterval(layerRefreshInterval.current)
+        layerRefreshInterval.current = null
+      }
+      map.current?.remove()
+    }
   }, [])
 
   const loadShelters = async () => {
