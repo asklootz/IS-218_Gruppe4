@@ -46,8 +46,20 @@ if (!fs.existsSync(CACHE_DIR)) {
 
 const TILFLUKTSROM_WFS_BASE_URL = 'https://wfs.geonorge.no/skwms1/wfs.tilfluktsrom_offentlige';
 const TILFLUKTSROM_WFS_TYPE_NAME = 'app:Tilfluktsrom';
-const TILFLUKTSROM_WFS_GML_URL = `${TILFLUKTSROM_WFS_BASE_URL}?service=WFS&version=2.0.0&request=GetFeature&typeNames=${encodeURIComponent(TILFLUKTSROM_WFS_TYPE_NAME)}&srsName=urn:ogc:def:crs:EPSG::4326&outputFormat=${encodeURIComponent('application/gml+xml; version=3.2')}`;
+// BBOX limits the WFS request to the Agder region only, avoiding 504 timeouts from fetching all of Norway.
+const AGDER_WFS_BBOX_4326 = '7.0,57.8,9.5,59.0,EPSG:4326';
+const TILFLUKTSROM_WFS_GML_URL = `${TILFLUKTSROM_WFS_BASE_URL}?service=WFS&version=2.0.0&request=GetFeature&typeNames=${encodeURIComponent(TILFLUKTSROM_WFS_TYPE_NAME)}&srsName=EPSG:4326&outputFormat=${encodeURIComponent('application/gml+xml; version=3.2')}&BBOX=${AGDER_WFS_BBOX_4326}`;
 const TILFLUKTSROM_ZIP_FALLBACK_URL = 'https://nedlasting.geonorge.no/geonorge/Samfunnssikkerhet/TilfluktsromOffentlige/GeoJSON/Samfunnssikkerhet_0000_Norge_25833_TilfluktsromOffentlige_GeoJSON.zip';
+
+const POPULATION_WFS_BASE_URL = 'https://wfs.geonorge.no/skwms1/wfs.befolkningpagrunnkretsniva';
+const POPULATION_WFS_TYPE_NAME = 'app:BefolkningPåGrunnkrets';
+const POPULATION_WFS_GML_URL = `${POPULATION_WFS_BASE_URL}?service=WFS&version=2.0.0&request=GetFeature&typeNames=${encodeURIComponent(POPULATION_WFS_TYPE_NAME)}&srsName=EPSG:4326&outputFormat=${encodeURIComponent('text/xml; subtype=gml/3.2.1')}&BBOX=${AGDER_WFS_BBOX_4326}`;
+const POPULATION_ZIP_FALLBACK_URL = 'https://nedlasting.geonorge.no/geonorge/Befolkning/BefolkningPaGrunnkretsniva2025/GML/Befolkning_0000_Norge_25833_BefolkningPaGrunnkretsniva2025_GML.zip';
+
+const FIRESTATIONS_WFS_BASE_URL = 'https://wfs.geonorge.no/skwms1/wfs.brannstasjoner';
+const FIRESTATIONS_WFS_TYPE_NAME = 'app:Brannstasjon';
+const FIRESTATIONS_WFS_GML_URL = `${FIRESTATIONS_WFS_BASE_URL}?service=WFS&version=2.0.0&request=GetFeature&typeNames=${encodeURIComponent(FIRESTATIONS_WFS_TYPE_NAME)}&srsName=EPSG:4326&outputFormat=${encodeURIComponent('text/xml; subtype=gml/3.2.1')}&BBOX=${AGDER_WFS_BBOX_4326}`;
+const FIRESTATIONS_ZIP_FALLBACK_URL = 'https://nedlasting.geonorge.no/api/download/order/9e8cd748-a26f-4f93-8448-37a10fff8b35/ebba84f5-0e8c-4eb0-84e9-39e58cd40cf2';
 
 const KARTVERKET_API_BASE = 'https://api.kartverket.no/kommuneinfo/v1';
 const GEONORGE_COUNTIES_ZIP = 'https://nedlasting.geonorge.no/geonorge/Basisdata/Fylker/GeoJSON/Basisdata_0000_Norge_25833_Fylker_GeoJSON.zip';
@@ -248,6 +260,128 @@ function extractPointFromGmlNode(node) {
   };
 }
 
+function findFirstObjectWithPolygonGeometry(node) {
+  if (!node) return null;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findFirstObjectWithPolygonGeometry(item);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  if (typeof node !== 'object') return null;
+
+  if (node['gml:Polygon'] || node['gml32:Polygon'] || node['gml:Surface'] || node['gml:MultiSurface']) {
+    return node;
+  }
+
+  for (const value of Object.values(node)) {
+    const found = findFirstObjectWithPolygonGeometry(value);
+    if (found) return found;
+  }
+
+  return null;
+}
+
+function parsePosListCoordinates(posText) {
+  if (!posText) return [];
+  const values = String(posText).trim().split(/\s+/).map(Number).filter(Number.isFinite);
+  const coordinates = [];
+
+  for (let i = 0; i + 1 < values.length; i += 2) {
+    const normalized = normalizePointCoordinates([values[i], values[i + 1]]);
+    if (normalized) coordinates.push(normalized);
+  }
+
+  return coordinates;
+}
+
+function extractLinearRingCoordinates(ringContainer) {
+  const ringNode = ringContainer?.['gml:LinearRing'] || ringContainer;
+  const posListText =
+    xmlValue(ringNode?.['gml:posList']) ||
+    xmlValue(ringNode?.['gml:coordinates']);
+  return parsePosListCoordinates(posListText);
+}
+
+function extractPolygonCoordinates(polygonNode) {
+  const exteriorContainer = polygonNode?.['gml:exterior'];
+  const exterior = extractLinearRingCoordinates(exteriorContainer);
+  if (!Array.isArray(exterior) || exterior.length < 4) return null;
+
+  const rings = [exterior];
+  for (const interior of asArray(polygonNode?.['gml:interior'])) {
+    const interiorRing = extractLinearRingCoordinates(interior);
+    if (Array.isArray(interiorRing) && interiorRing.length >= 4) {
+      rings.push(interiorRing);
+    }
+  }
+
+  return rings;
+}
+
+function extractPolygonFromGmlNode(node) {
+  if (!node || typeof node !== 'object') return null;
+
+  const srid = extractSridFromSrsName(
+    node?.srsName ||
+    node?.['gml:srsName'] ||
+    node?.['gml:Polygon']?.srsName ||
+    node?.['gml:Polygon']?.['gml:srsName'] ||
+    node?.['gml:Surface']?.srsName ||
+    node?.['gml:Surface']?.['gml:srsName'] ||
+    node?.['gml:MultiSurface']?.srsName ||
+    node?.['gml:MultiSurface']?.['gml:srsName']
+  );
+
+  const polygonNode = node['gml:Polygon'] || node['gml32:Polygon'] || node;
+  const polygonCoords = extractPolygonCoordinates(polygonNode);
+  if (polygonCoords) {
+    return {
+      geometry: { type: 'Polygon', coordinates: polygonCoords },
+      srid,
+    };
+  }
+
+  const surfaceNode = node['gml:Surface'];
+  if (surfaceNode) {
+    const patch = asArray(surfaceNode?.['gml:patches']?.['gml:PolygonPatch'])[0];
+    const patchCoords = extractPolygonCoordinates(patch);
+    if (patchCoords) {
+      return {
+        geometry: { type: 'Polygon', coordinates: patchCoords },
+        srid,
+      };
+    }
+  }
+
+  const multiSurfaceNode = node['gml:MultiSurface'];
+  if (multiSurfaceNode) {
+    const polygons = [];
+    const surfaceMembers = asArray(multiSurfaceNode?.['gml:surfaceMember']);
+    for (const member of surfaceMembers) {
+      const memberPolygon = extractPolygonFromGmlNode(member);
+      if (!memberPolygon?.geometry) continue;
+
+      if (memberPolygon.geometry.type === 'Polygon') {
+        polygons.push(memberPolygon.geometry.coordinates);
+      } else if (memberPolygon.geometry.type === 'MultiPolygon') {
+        polygons.push(...memberPolygon.geometry.coordinates);
+      }
+    }
+
+    if (polygons.length > 0) {
+      return {
+        geometry: { type: 'MultiPolygon', coordinates: polygons },
+        srid,
+      };
+    }
+  }
+
+  return null;
+}
+
 function collectGmlFeaturesByLocalName(node, localName, results = []) {
   if (!node) return results;
   if (Array.isArray(node)) {
@@ -324,7 +458,145 @@ async function extractTilfluktsromFromGmlZip(buffer) {
 }
 
 async function extractTilfluktsromFromWfsGml(buffer) {
-  return extractTilfluktsromFromGmlZip(buffer);
+  try {
+    const xml = buffer.toString('utf8').replace(/^﻿/, '');
+    const parsed = await xml2js.parseStringPromise(xml, {
+      explicitArray: false,
+      mergeAttrs: true,
+      trim: true,
+    });
+
+    const stations = collectGmlFeaturesByLocalName(parsed, 'Tilfluktsrom');
+    const features = [];
+
+    for (const station of stations) {
+      const geometryNode = findFirstObjectWithPointGeometry(station);
+      const point = extractPointFromGmlNode(geometryNode);
+      if (!point || !point.coordinates) continue;
+
+      const properties = {
+        ...extractPrefixedFields(station, 'app:'),
+        gml_id: station?.['gml:id'] || undefined,
+      };
+
+      features.push({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: point.coordinates },
+        properties,
+      });
+    }
+
+    return { type: 'FeatureCollection', features };
+  } catch (error) {
+    console.error('WFS GML extraction error:', error.message);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
+function extractPopulationFeatureCollectionFromParsedGml(parsed) {
+  const rows = collectGmlFeaturesByLocalName(parsed, 'BefolkningPåGrunnkrets');
+  const features = [];
+
+  for (const row of rows) {
+    const areaNode = row?.['app:område'] || row?.['område'];
+    const geometryNode = areaNode || findFirstObjectWithPolygonGeometry(row);
+    const polygon = extractPolygonFromGmlNode(geometryNode);
+    if (!polygon?.geometry) continue;
+
+    const properties = {
+      ...extractPrefixedFields(row, 'app:'),
+      gml_id: row?.['gml:id'] || undefined,
+    };
+
+    if (properties.totalBefolkning !== undefined && properties.population === undefined) {
+      properties.population = properties.totalBefolkning;
+    }
+
+    features.push({
+      type: 'Feature',
+      geometry: polygon.geometry,
+      properties,
+    });
+  }
+
+  return { type: 'FeatureCollection', features };
+}
+
+async function extractPopulationFromWfsGml(buffer) {
+  try {
+    const xml = buffer.toString('utf8').replace(/^﻿/, '');
+    const parsed = await xml2js.parseStringPromise(xml, {
+      explicitArray: false,
+      mergeAttrs: true,
+      trim: true,
+    });
+
+    return extractPopulationFeatureCollectionFromParsedGml(parsed);
+  } catch (error) {
+    console.error('Population WFS GML extraction error:', error.message);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
+async function extractPopulationFromGmlZip(buffer) {
+  try {
+    const zip = new AdmZip(buffer);
+    const entries = zip.getEntries();
+    const gmlEntry = entries.find((entry) => {
+      const lower = String(entry.name || '').toLowerCase();
+      return !entry.isDirectory && lower.endsWith('.gml');
+    });
+
+    if (!gmlEntry) return { type: 'FeatureCollection', features: [] };
+
+    const xml = gmlEntry.getData().toString('utf8').replace(/^\uFEFF/, '');
+    const parsed = await xml2js.parseStringPromise(xml, {
+      explicitArray: false,
+      mergeAttrs: true,
+      trim: true,
+    });
+
+    return extractPopulationFeatureCollectionFromParsedGml(parsed);
+  } catch (error) {
+    console.error('Population ZIP GML extraction error:', error.message);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
+async function extractFireStationsFromWfsGml(buffer) {
+  try {
+    const xml = buffer.toString('utf8').replace(/^﻿/, '');
+    const parsed = await xml2js.parseStringPromise(xml, {
+      explicitArray: false,
+      mergeAttrs: true,
+      trim: true,
+    });
+
+    const stations = collectGmlFeaturesByLocalName(parsed, 'Brannstasjon');
+    const features = [];
+
+    for (const station of stations) {
+      const geometryNode = station?.['app:posisjon'] || station?.['posisjon'] || findFirstObjectWithPointGeometry(station);
+      const point = extractPointFromGmlNode(geometryNode);
+      if (!point || !point.coordinates) continue;
+
+      const properties = {
+        ...extractPrefixedFields(station, 'app:'),
+        gml_id: station?.['gml:id'] || undefined,
+      };
+
+      features.push({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: point.coordinates },
+        properties,
+      });
+    }
+
+    return { type: 'FeatureCollection', features };
+  } catch (error) {
+    console.error('Fire stations WFS GML extraction error:', error.message);
+    return { type: 'FeatureCollection', features: [] };
+  }
 }
 
 async function extractFireStationsFromGmlZip(buffer) {
@@ -430,8 +702,8 @@ async function cacheTilfluktsromGeoJson() {
   }
 
   try {
-    console.log('Downloading shelters from Geonorge WFS GML...');
-    const wfsBuffer = await downloadBuffer(TILFLUKTSROM_WFS_GML_URL);
+    console.log('Downloading shelters from Geonorge WFS GML (Agder BBOX)...');
+    const wfsBuffer = await downloadBuffer(TILFLUKTSROM_WFS_GML_URL, 60000);
     const wfsGeoJson = await extractTilfluktsromFromWfsGml(wfsBuffer);
     const transformedWfsGeoJson = await transformProjectedFeatureCollection(wfsGeoJson);
 
@@ -450,6 +722,94 @@ async function cacheTilfluktsromGeoJson() {
   const transformedFallback = await transformProjectedFeatureCollection(fallbackGeoJson);
   fs.writeFileSync(cacheFile, JSON.stringify(transformedFallback));
   return transformedFallback;
+}
+
+async function cachePopulationGeoJson() {
+  const cacheFile = path.join(CACHE_DIR, 'population.geojson');
+
+  if (fs.existsSync(cacheFile)) {
+    try {
+      const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+      if (Array.isArray(cached?.features) && cached.features.length > 0) {
+        return cached;
+      }
+      fs.unlinkSync(cacheFile);
+    } catch (error) {
+      fs.unlinkSync(cacheFile);
+    }
+  }
+
+  try {
+    console.log('Downloading population from Geonorge WFS GML (Agder BBOX)...');
+    const wfsBuffer = await downloadBuffer(POPULATION_WFS_GML_URL, 90000);
+    const wfsGeoJson = await extractPopulationFromWfsGml(wfsBuffer);
+    const transformedWfsGeoJson = await transformProjectedFeatureCollection(wfsGeoJson);
+
+    if (Array.isArray(transformedWfsGeoJson.features) && transformedWfsGeoJson.features.length > 0) {
+      fs.writeFileSync(cacheFile, JSON.stringify(transformedWfsGeoJson));
+      console.log(`✓ Population loaded from WFS GML: ${transformedWfsGeoJson.features.length}`);
+      return transformedWfsGeoJson;
+    }
+
+    console.warn('WFS GML returned no population features, falling back to nedlasting.geonorge.no zip...');
+  } catch (error) {
+    console.warn(`WFS population download failed, falling back to zip: ${error.message}`);
+  }
+
+  try {
+    const fallbackBuffer = await downloadBuffer(POPULATION_ZIP_FALLBACK_URL);
+    const fallbackGeoJson = await extractPopulationFromGmlZip(fallbackBuffer);
+    const transformedFallback = await transformProjectedFeatureCollection(fallbackGeoJson);
+    fs.writeFileSync(cacheFile, JSON.stringify(transformedFallback));
+    return transformedFallback;
+  } catch (error) {
+    console.error('Population fallback failed:', error.message);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
+async function cacheFireStationsGeoJson() {
+  const cacheFile = path.join(CACHE_DIR, 'firestations.geojson');
+
+  if (fs.existsSync(cacheFile)) {
+    try {
+      const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+      if (Array.isArray(cached?.features) && cached.features.length > 0) {
+        return cached;
+      }
+      fs.unlinkSync(cacheFile);
+    } catch (error) {
+      fs.unlinkSync(cacheFile);
+    }
+  }
+
+  try {
+    console.log('Downloading fire stations from Geonorge WFS GML (Agder BBOX)...');
+    const wfsBuffer = await downloadBuffer(FIRESTATIONS_WFS_GML_URL, 90000);
+    const wfsGeoJson = await extractFireStationsFromWfsGml(wfsBuffer);
+    const transformedWfsGeoJson = await transformProjectedFeatureCollection(wfsGeoJson);
+
+    if (Array.isArray(transformedWfsGeoJson.features) && transformedWfsGeoJson.features.length > 0) {
+      fs.writeFileSync(cacheFile, JSON.stringify(transformedWfsGeoJson));
+      console.log(`✓ Fire stations loaded from WFS GML: ${transformedWfsGeoJson.features.length}`);
+      return transformedWfsGeoJson;
+    }
+
+    console.warn('WFS GML returned no fire station features, falling back to nedlasting.geonorge.no zip...');
+  } catch (error) {
+    console.warn(`WFS fire station download failed, falling back to zip: ${error.message}`);
+  }
+
+  try {
+    const fallbackBuffer = await downloadBuffer(FIRESTATIONS_ZIP_FALLBACK_URL);
+    const fallbackGeoJson = await extractFireStationsFromGmlZip(fallbackBuffer);
+    const transformedFallback = await transformProjectedFeatureCollection(fallbackGeoJson);
+    fs.writeFileSync(cacheFile, JSON.stringify(transformedFallback));
+    return transformedFallback;
+  } catch (error) {
+    console.error('Fire stations fallback failed:', error.message);
+    return { type: 'FeatureCollection', features: [] };
+  }
 }
 
 function kartverketOmradeToGeometry(omrade) {
@@ -1238,10 +1598,8 @@ async function bootstrap() {
     try {
       console.log('Downloading population...');
       await pool.query('TRUNCATE public.population_cells');
-      const popGeo = await cacheGeoJsonFromZip('population',
-        'https://nedlasting.geonorge.no/geonorge/Befolkning/BefolkningPaGrunnkretsniva2025/GML/Befolkning_0000_Norge_25833_BefolkningPaGrunnkretsniva2025_GML.zip');
-      const transformed = await transformProjectedFeatureCollection(popGeo);
-      const count = await ingestPopulation(transformed);
+      const popGeo = await cachePopulationGeoJson();
+      const count = await ingestPopulation(popGeo);
       if (count > 0) {
         console.log(`✓ Population ingested: ${count}`);
       } else {
@@ -1260,10 +1618,7 @@ async function bootstrap() {
   if (existingFireStations === 0) {
     try {
       console.log('Downloading fire stations...');
-      const fireZip = await downloadBuffer(
-        'https://nedlasting.geonorge.no/api/download/order/9e8cd748-a26f-4f93-8448-37a10fff8b35/ebba84f5-0e8c-4eb0-84e9-39e58cd40cf2'
-      );
-      const fireGeo = await extractFireStationsFromGmlZip(fireZip);
+      const fireGeo = await cacheFireStationsGeoJson();
       const fireCount = await ingestFireStations(fireGeo);
       console.log(`✓ Fire stations ingested: ${fireCount}`);
     } catch (error) {
