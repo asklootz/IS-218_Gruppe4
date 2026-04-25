@@ -44,6 +44,11 @@ if (!fs.existsSync(CACHE_DIR)) {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
 }
 
+const TILFLUKTSROM_WFS_BASE_URL = 'https://wfs.geonorge.no/skwms1/wfs.tilfluktsrom_offentlige';
+const TILFLUKTSROM_WFS_TYPE_NAME = 'app:Tilfluktsrom';
+const TILFLUKTSROM_WFS_GML_URL = `${TILFLUKTSROM_WFS_BASE_URL}?service=WFS&version=2.0.0&request=GetFeature&typeNames=${encodeURIComponent(TILFLUKTSROM_WFS_TYPE_NAME)}&srsName=urn:ogc:def:crs:EPSG::4326&outputFormat=${encodeURIComponent('application/gml+xml; version=3.2')}`;
+const TILFLUKTSROM_ZIP_FALLBACK_URL = 'https://nedlasting.geonorge.no/geonorge/Samfunnssikkerhet/TilfluktsromOffentlige/GeoJSON/Samfunnssikkerhet_0000_Norge_25833_TilfluktsromOffentlige_GeoJSON.zip';
+
 // ========== DATA BOOTSTRAP UTILITIES ==========
 
 async function downloadBuffer(url, timeout = 300000) {
@@ -161,9 +166,161 @@ function extractPrefixedFields(record, prefix) {
   for (const [key, raw] of Object.entries(record)) {
     if (!String(key).startsWith(prefix)) continue;
     const clean = String(key).slice(prefix.length);
-    out[clean] = xmlValue(raw);
+    const value = xmlValue(raw);
+    if (value !== undefined) {
+      out[clean] = value;
+    }
   }
   return out;
+}
+
+function extractSridFromSrsName(srsName) {
+  const match = String(srsName || '').match(/(?:EPSG[:/]{1,2}|EPSG::)(\d+)/i);
+  return match ? Number(match[1]) : null;
+}
+
+function normalizePointCoordinates(coords) {
+  if (!Array.isArray(coords) || coords.length < 2) return null;
+  const first = Number(coords[0]);
+  const second = Number(coords[1]);
+  if (!Number.isFinite(first) || !Number.isFinite(second)) return null;
+
+  if (Math.abs(first) > 180 || Math.abs(second) > 180) {
+    return [first, second];
+  }
+
+  // WFS/GML sources may emit geographic coordinates as lat lon. Normalize to lon lat.
+  if (first > 40 && second < 40) {
+    return [second, first];
+  }
+
+  return [first, second];
+}
+
+function findFirstObjectWithPointGeometry(node) {
+  if (!node) return null;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findFirstObjectWithPointGeometry(item);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  if (typeof node !== 'object') return null;
+
+  const directPointText = xmlValue(node['gml:pos']) || xmlValue(node['gml:coordinates']) || xmlValue(node['gml:posList']);
+  if (directPointText) return node;
+
+  if (node['gml:Point'] || node['gml32:Point']) return node;
+
+  for (const value of Object.values(node)) {
+    const found = findFirstObjectWithPointGeometry(value);
+    if (found) return found;
+  }
+
+  return null;
+}
+
+function extractPointFromGmlNode(node) {
+  if (!node || typeof node !== 'object') return null;
+
+  const pointNode = node['gml:Point'] || node['gml32:Point'] || node;
+  const posText =
+    xmlValue(pointNode['gml:pos']) ||
+    xmlValue(pointNode['gml:coordinates']) ||
+    xmlValue(pointNode['gml:posList']) ||
+    xmlValue(pointNode['pos']);
+
+  if (!posText) return null;
+
+  const coords = posText.split(/\s+/).map(Number).filter(Number.isFinite);
+  const normalized = normalizePointCoordinates(coords);
+  if (!normalized) return null;
+
+  return {
+    coordinates: normalized,
+    srid: extractSridFromSrsName(pointNode.srsName || node.srsName || pointNode['gml:srsName'] || node['gml:srsName'])
+  };
+}
+
+function collectGmlFeaturesByLocalName(node, localName, results = []) {
+  if (!node) return results;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      collectGmlFeaturesByLocalName(item, localName, results);
+    }
+    return results;
+  }
+
+  if (typeof node !== 'object') return results;
+
+  for (const [key, value] of Object.entries(node)) {
+    const suffix = String(key).split(':').pop();
+    if (suffix && suffix.toLowerCase() === String(localName).toLowerCase()) {
+      for (const item of asArray(value)) {
+        if (item && typeof item === 'object') {
+          results.push(item);
+        }
+      }
+    }
+
+    collectGmlFeaturesByLocalName(value, localName, results);
+  }
+
+  return results;
+}
+
+async function extractTilfluktsromFromGmlZip(buffer) {
+  try {
+    const zip = new AdmZip(buffer);
+    const entries = zip.getEntries();
+    const gmlEntry = entries.find((entry) => {
+      const lower = String(entry.name || '').toLowerCase();
+      return !entry.isDirectory && lower.endsWith('.gml');
+    });
+
+    if (!gmlEntry) return { type: 'FeatureCollection', features: [] };
+
+    const xml = gmlEntry.getData().toString('utf8').replace(/^\uFEFF/, '');
+    const parsed = await xml2js.parseStringPromise(xml, {
+      explicitArray: false,
+      mergeAttrs: true,
+      trim: true,
+    });
+
+    const stations = collectGmlFeaturesByLocalName(parsed, 'Tilfluktsrom');
+    const features = [];
+
+    for (const station of stations) {
+      const geometryNode = findFirstObjectWithPointGeometry(station);
+      const point = extractPointFromGmlNode(geometryNode);
+      if (!point || !point.coordinates) continue;
+
+      const properties = {
+        ...extractPrefixedFields(station, 'app:'),
+        gml_id: station?.['gml:id'] || undefined,
+      };
+
+      features.push({
+        type: 'Feature',
+        geometry: {
+          type: 'Point',
+          coordinates: point.coordinates,
+        },
+        properties,
+      });
+    }
+
+    return { type: 'FeatureCollection', features };
+  } catch (error) {
+    console.error('GML extraction error:', error.message);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
+async function extractTilfluktsromFromWfsGml(buffer) {
+  return extractTilfluktsromFromGmlZip(buffer);
 }
 
 async function extractFireStationsFromGmlZip(buffer) {
@@ -251,6 +408,44 @@ async function cacheGeoJsonFromZip(layer, url) {
     console.error(`Failed to cache ${layer}:`, error.message);
     return { type: 'FeatureCollection', features: [] };
   }
+}
+
+async function cacheTilfluktsromGeoJson() {
+  const cacheFile = path.join(CACHE_DIR, 'shelters.geojson');
+
+  if (fs.existsSync(cacheFile)) {
+    try {
+      const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+      if (Array.isArray(cached?.features) && cached.features.length > 0) {
+        return cached;
+      }
+      fs.unlinkSync(cacheFile);
+    } catch (error) {
+      fs.unlinkSync(cacheFile);
+    }
+  }
+
+  try {
+    console.log('Downloading shelters from Geonorge WFS GML...');
+    const wfsBuffer = await downloadBuffer(TILFLUKTSROM_WFS_GML_URL);
+    const wfsGeoJson = await extractTilfluktsromFromWfsGml(wfsBuffer);
+    const transformedWfsGeoJson = await transformProjectedFeatureCollection(wfsGeoJson);
+
+    if (Array.isArray(transformedWfsGeoJson.features) && transformedWfsGeoJson.features.length > 0) {
+      fs.writeFileSync(cacheFile, JSON.stringify(transformedWfsGeoJson));
+      console.log(`✓ Shelters loaded from WFS GML: ${transformedWfsGeoJson.features.length}`);
+      return transformedWfsGeoJson;
+    }
+
+    console.warn('WFS GML returned no shelter features, falling back to nedlasting.geonorge.no zip...');
+  } catch (error) {
+    console.warn(`WFS shelter download failed, falling back to zip: ${error.message}`);
+  }
+
+  const fallbackGeoJson = await cacheGeoJsonFromZip('shelters', TILFLUKTSROM_ZIP_FALLBACK_URL);
+  const transformedFallback = await transformProjectedFeatureCollection(fallbackGeoJson);
+  fs.writeFileSync(cacheFile, JSON.stringify(transformedFallback));
+  return transformedFallback;
 }
 
 async function refreshBoundaryLayer(layer) {
@@ -909,10 +1104,8 @@ async function bootstrap() {
   if (existingShelters === 0) {
     try {
       console.log('Downloading shelters...');
-      const sheltersGeo = await cacheGeoJsonFromZip('shelters', 
-        'https://nedlasting.geonorge.no/geonorge/Samfunnssikkerhet/TilfluktsromOffentlige/GeoJSON/Samfunnssikkerhet_0000_Norge_25833_TilfluktsromOffentlige_GeoJSON.zip');
-      const transformed = await transformProjectedFeatureCollection(sheltersGeo);
-      const count = await ingestShelters(transformed);
+      const sheltersGeo = await cacheTilfluktsromGeoJson();
+      const count = await ingestShelters(sheltersGeo);
       console.log(`✓ Shelters ingested: ${count}`);
     } catch (error) {
       console.error('Shelters bootstrap failed:', error.message);
