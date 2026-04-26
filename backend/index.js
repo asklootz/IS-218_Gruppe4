@@ -3084,7 +3084,7 @@ app.delete('/api/admin/mock-users', async (req, res) => {
 
     await pool.query(`
       DELETE FROM public.user_locations
-      WHERE user_id = ANY($1::uuid[])
+      WHERE user_id::uuid = ANY($1::uuid[])
     `, [ids]);
 
     await pool.query(`
