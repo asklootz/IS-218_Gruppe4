@@ -470,6 +470,7 @@ function AdminPage({ onBack }) {
   const truckIconsLoaded = useRef(false)
   const truckJobsRef = useRef([])
   const selectedTruckIdRef = useRef(null)
+  const previewRouteRequestsRef = useRef(new Set())
   const [radius, setRadius] = useState(1000)
   const [coverage, setCoverage] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -502,6 +503,11 @@ function AdminPage({ onBack }) {
 
   useEffect(() => {
     selectedTruckIdRef.current = selectedTruckId
+  }, [selectedTruckId])
+
+  useEffect(() => {
+    if (!selectedTruckId) return
+    ensurePreviewRouteForTruck(selectedTruckId)
   }, [selectedTruckId])
 
   const clearLogisticsAnimation = () => {
@@ -579,6 +585,42 @@ function AdminPage({ onBack }) {
     }
     if (map.current.getSource('logistics-trucks')) {
       map.current.getSource('logistics-trucks').setData(nextPositions)
+    }
+  }
+
+  const ensurePreviewRouteForTruck = async (truckId) => {
+    if (!truckId) return null
+
+    const currentJob = truckJobsRef.current.find((job) => job.id === truckId)
+    if (!currentJob) return null
+
+    const hasPreviewGeometry = Array.isArray(currentJob.route?.geometry?.coordinates)
+      && currentJob.route.geometry.coordinates.length >= 2
+
+    if (hasPreviewGeometry) {
+      return currentJob
+    }
+
+    if (previewRouteRequestsRef.current.has(truckId)) {
+      return currentJob
+    }
+
+    previewRouteRequestsRef.current.add(truckId)
+    try {
+      const res = await axios.post(`${API_BASE}/api/admin/logistics/trucks/${truckId}/preview-route`)
+      const nextJobs = Array.isArray(res.data?.jobs) ? res.data.jobs : []
+      if (nextJobs.length > 0) {
+        truckJobsRef.current = nextJobs
+        setTruckJobs(nextJobs)
+        updateTruckMapSources(nextJobs)
+        return nextJobs.find((job) => job.id === truckId) || null
+      }
+      return currentJob
+    } catch (error) {
+      console.warn('Failed to preview truck route:', error.message)
+      return currentJob
+    } finally {
+      previewRouteRequestsRef.current.delete(truckId)
     }
   }
 
@@ -766,27 +808,29 @@ function AdminPage({ onBack }) {
       })
     }
 
-    const handleRouteLayerClick = (e) => {
+    const handleRouteLayerClick = async (e) => {
       const f = e.features?.[0]
       if (!f) return
       const truckId = f.properties?.truckId
       const job = truckJobsRef.current.find((entry) => entry.id === truckId)
       if (!job) return
       setSelectedTruckId(job.id)
-      showTruckRoutePopup(job, e.lngLat)
+      const previewedJob = await ensurePreviewRouteForTruck(job.id)
+      showTruckRoutePopup(previewedJob || job, e.lngLat)
     }
 
     map.current.on('click', 'logistics-routes-food-layer', handleRouteLayerClick)
     map.current.on('click', 'logistics-routes-water-layer', handleRouteLayerClick)
 
-    map.current.on('click', 'logistics-trucks-layer', (e) => {
+    map.current.on('click', 'logistics-trucks-layer', async (e) => {
       const f = e.features?.[0]
       if (!f) return
       const truckId = f.properties?.truckId
       const job = truckJobsRef.current.find((entry) => entry.id === truckId)
       if (!job) return
       setSelectedTruckId(job.id)
-      showTruckRoutePopup(job, e.lngLat)
+      const previewedJob = await ensurePreviewRouteForTruck(job.id)
+      showTruckRoutePopup(previewedJob || job, e.lngLat)
     })
 
     map.current.on('mouseenter', 'logistics-routes-food-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
@@ -1074,13 +1118,16 @@ function AdminPage({ onBack }) {
     })()
   }
 
-  const focusTruckRoute = (job) => {
+  const focusTruckRoute = async (job) => {
     if (!job) return
     setSelectedTruckId(job.id)
 
-    if (map.current && job.route?.geometry?.coordinates?.length) {
+    const previewedJob = await ensurePreviewRouteForTruck(job.id)
+    const routeJob = previewedJob || job
+
+    if (map.current && routeJob.route?.geometry?.coordinates?.length) {
       const bounds = new maplibregl.LngLatBounds()
-      job.route.geometry.coordinates.forEach(([lon, lat]) => bounds.extend([lon, lat]))
+      routeJob.route.geometry.coordinates.forEach(([lon, lat]) => bounds.extend([lon, lat]))
       map.current.fitBounds(bounds, { padding: 80, duration: 600, maxZoom: 15 })
     }
   }
@@ -1093,7 +1140,7 @@ function AdminPage({ onBack }) {
     map.current = new maplibregl.Map({
       container: mapContainer.current,
       style: OSM_RASTER_STYLE,
-      center: [10.75, 59.91],
+      center: [8.0000, 58.1467],
       zoom: 10
     })
 
@@ -2322,7 +2369,7 @@ function SimulatePage({ onBack }) {
     map.current = new maplibregl.Map({
       container: mapContainer.current,
       style: OSM_RASTER_STYLE,
-      center: [10.75, 59.91],
+      center: [8.0000, 58.1467],
       zoom: 10,
     })
 

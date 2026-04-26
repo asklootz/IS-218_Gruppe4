@@ -724,8 +724,8 @@ async function buildOrRefreshLogisticsPlan(settingsOverride = {}) {
     const routeSource = String(job.route?.source || '').toLowerCase();
     const hasRoadRoute = routeSource === 'valhalla' || routeSource === 'osrm';
 
-    // Keep existing moving/arrived routes only when they are already road-network based.
-    if (job.status !== 'planned' && hasGeometry && hasRoadRoute) {
+    // Keep existing routes that are already road-network based, including planned preview routes.
+    if (hasGeometry && hasRoadRoute) {
       enrichedJobs.push(job);
       continue;
     }
@@ -3038,6 +3038,60 @@ app.post('/api/admin/logistics/trucks/:truckId/dispatch', async (req, res) => {
     res.json(plan);
   } catch (error) {
     console.error('Error dispatching logistics truck:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/logistics/trucks/:truckId/preview-route', async (req, res) => {
+  try {
+    const { truckId } = req.params;
+    const state = await readLogisticsState();
+    const jobs = Array.isArray(state.plan?.jobs) ? clonePlanJobs(state.plan.jobs) : [];
+    const currentJob = jobs.find((job) => job.id === truckId);
+
+    if (!currentJob) {
+      return res.status(404).json({ error: 'Truck not found' });
+    }
+
+    if (hasRoadRouteGeometry(currentJob.route)) {
+      return res.json(state.plan);
+    }
+
+    const routeMode = String(state.settings?.routeMode || 'car');
+    const route = await computeRouteBetweenPoints({
+      originLon: currentJob.source?.lon,
+      originLat: currentJob.source?.lat,
+      destLon: currentJob.target?.lon,
+      destLat: currentJob.target?.lat,
+      mode: routeMode
+    });
+    const routeInfo = logisticsRouteSummary(route);
+
+    const plan = {
+      ...(state.plan || {}),
+      updated_at: new Date().toISOString(),
+      jobs: jobs.map((job) => {
+        if (job.id !== truckId) return job;
+        return {
+          ...job,
+          route,
+          etaMinutes: routeInfo.etaMinutes,
+          distanceKm: routeInfo.distanceKm,
+          etaLabel: routeInfo.etaLabel,
+          currentPosition: job.currentPosition || [job.source?.lon, job.source?.lat]
+        };
+      })
+    };
+
+    await saveLogisticsState({
+      plan,
+      snapshotKey: state.snapshot_key,
+      settings: state.settings || {}
+    });
+
+    res.json(plan);
+  } catch (error) {
+    console.error('Error previewing logistics truck route:', error);
     res.status(500).json({ error: error.message });
   }
 });
