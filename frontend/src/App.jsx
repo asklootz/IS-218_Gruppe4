@@ -587,16 +587,25 @@ function AdminPage({ onBack }) {
     if (movableJobs.length === 0) return
 
     try {
-      await Promise.all(movableJobs.map((job) => axios.patch(
+      const responses = await Promise.all(movableJobs.map((job) => axios.patch(
         `${API_BASE}/api/admin/logistics/trucks/${job.id}`,
         {
           status: job.status,
+          leg: job.leg || 'outbound',
           startedAt: job.startedAt || null,
           completedAt: job.completedAt || null,
           progress: job.progress || 0,
           currentPosition: job.currentPosition || [job.source?.lon, job.source?.lat]
         }
       )))
+
+      const latestPlan = responses.at(-1)?.data
+      const latestJobs = Array.isArray(latestPlan?.jobs) ? latestPlan.jobs : null
+      if (latestJobs) {
+        truckJobsRef.current = latestJobs
+        setTruckJobs(latestJobs)
+        updateTruckMapSources(latestJobs)
+      }
     } catch (error) {
       console.warn('Failed to sync truck progress:', error.message)
     }
@@ -794,14 +803,17 @@ function AdminPage({ onBack }) {
     if (!job) return
     const isMoving = job.status === 'moving'
     const isArrived = job.status === 'arrived'
+    const isReturning = isMoving && job.leg === 'return'
+    const destinationLabel = isReturning ? (job.source?.name || 'Unknown source') : (job.target?.name || 'Unknown destination')
+    const statusLabel = isArrived ? 'Arrived' : isReturning ? 'Returning' : isMoving ? 'Moving' : 'Planned'
     const html = `
       <div style="font-size:12px;line-height:1.45;min-width:240px;">
         <strong>${job.resourceType === 'water' ? '💧 Water truck' : '🍞 Food truck'}</strong><br/>
         Fra: ${job.source?.name || 'Unknown source'}<br/>
-        Til: ${job.target?.name || 'Unknown destination'}<br/>
+        Til: ${destinationLabel}<br/>
         Mengde: ${job.amount} units<br/>
         ETA: ${job.etaMinutes ? `${job.etaMinutes} min` : 'Calculating...'}<br/>
-        Status: ${isArrived ? 'Arrived' : isMoving ? 'Moving' : 'Planned'}<br/>
+        Status: ${statusLabel}<br/>
         <button id="dispatch-selected-truck" style="margin-top:8px;padding:6px 8px;background:${isMoving || isArrived ? '#9ca3af' : '#0ea5e9'};color:white;border:none;border-radius:4px;cursor:${isMoving || isArrived ? 'not-allowed' : 'pointer'};font-size:11px;width:100%;" ${isMoving || isArrived ? 'disabled' : ''}>${isMoving ? 'On route' : isArrived ? 'Completed' : 'Send truck'}</button>
       </div>
     `
@@ -2057,15 +2069,31 @@ function AdminPage({ onBack }) {
           <div className="panel-section">
             <h3>Valgt rute</h3>
             <div className="truck-detail-card">
+              {(() => {
+                const isSelectedMoving = selectedTruckJob.status === 'moving'
+                const isSelectedReturning = isSelectedMoving && selectedTruckJob.leg === 'return'
+                const selectedDestinationLabel = isSelectedReturning
+                  ? (selectedTruckJob.source?.name || '-')
+                  : (selectedTruckJob.target?.name || '-')
+                const selectedStatusLabel = selectedTruckJob.status === 'arrived'
+                  ? 'Ankommet'
+                  : isSelectedReturning
+                    ? 'På vei tilbake'
+                    : isSelectedMoving
+                      ? 'På vei'
+                      : 'Klar til sending'
+
+                return (
+                  <>
               <div className="truck-detail-title">
                 {selectedTruckJob.resourceType === 'water' ? '💧 Water truck' : '🍞 Food truck'}
               </div>
               <div className="truck-detail-row">Fra: {selectedTruckJob.source?.name || '-'}</div>
-              <div className="truck-detail-row">Til: {selectedTruckJob.target?.name || '-'}</div>
+              <div className="truck-detail-row">Til: {selectedDestinationLabel}</div>
               <div className="truck-detail-row">Mengde: {selectedTruckJob.amount} units</div>
               <div className="truck-detail-row">ETA: {selectedTruckJob.etaLabel || '—'}</div>
               <div className="truck-detail-row">
-                Status: {selectedTruckJob.status === 'arrived' ? 'Ankommet' : selectedTruckJob.status === 'moving' ? 'På vei' : 'Klar til sending'}
+                Status: {selectedStatusLabel}
               </div>
               <div className="truck-progress">
                 <div className="truck-progress-bar" style={{ width: `${Math.round((selectedTruckJob.progress || 0) * 100)}%` }} />
@@ -2079,6 +2107,9 @@ function AdminPage({ onBack }) {
                   {selectedTruckJob.status === 'moving' ? 'På vei' : selectedTruckJob.status === 'arrived' ? 'Fullført' : 'Send denne trucken'}
                 </button>
               </div>
+                  </>
+                )
+              })()}
             </div>
           </div>
         )}
@@ -2091,6 +2122,9 @@ function AdminPage({ onBack }) {
                 const isSelected = job.id === selectedTruckId
                 const isMoving = job.status === 'moving'
                 const isArrived = job.status === 'arrived'
+                const isReturning = isMoving && job.leg === 'return'
+                const destinationLabel = isReturning ? (job.source?.name || '-') : (job.target?.name || '-')
+                const statusLabel = isArrived ? 'Ankommet' : isReturning ? 'På vei tilbake' : isMoving ? 'På vei' : 'Klar'
 
                 return (
                   <div
@@ -2112,9 +2146,9 @@ function AdminPage({ onBack }) {
                     </div>
                     <div className="truck-route-body">
                       <div>Fra: {job.source?.name || '-'}</div>
-                      <div>Til: {job.target?.name || '-'}</div>
+                      <div>Til: {destinationLabel}</div>
                       <div>Mengde: {job.amount} units</div>
-                      <div>Status: {isArrived ? 'Ankommet' : isMoving ? 'På vei' : 'Klar'}</div>
+                      <div>Status: {statusLabel}</div>
                     </div>
                     <div className="truck-progress small">
                       <div className="truck-progress-bar" style={{ width: `${Math.round((job.progress || 0) * 100)}%` }} />

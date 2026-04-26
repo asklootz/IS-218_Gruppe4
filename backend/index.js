@@ -77,8 +77,31 @@ function clonePlanJobs(jobs = []) {
     ...job,
     source: job.source ? { ...job.source } : job.source,
     target: job.target ? { ...job.target } : job.target,
-    route: job.route ? { ...job.route, geometry: job.route.geometry ? { ...job.route.geometry } : job.route.geometry } : job.route
+    route: job.route ? { ...job.route, geometry: job.route.geometry ? { ...job.route.geometry } : job.route.geometry } : job.route,
+    outboundRoute: job.outboundRoute
+      ? { ...job.outboundRoute, geometry: job.outboundRoute.geometry ? { ...job.outboundRoute.geometry } : job.outboundRoute.geometry }
+      : job.outboundRoute,
+    returnRoute: job.returnRoute
+      ? { ...job.returnRoute, geometry: job.returnRoute.geometry ? { ...job.returnRoute.geometry } : job.returnRoute.geometry }
+      : job.returnRoute
   }));
+}
+
+function hasRoadRouteGeometry(route) {
+  const coordinates = route?.geometry?.coordinates;
+  const hasGeometry = Array.isArray(coordinates) && coordinates.length >= 2;
+  const routeSource = String(route?.source || '').toLowerCase();
+  const hasRoadRoute = routeSource === 'valhalla' || routeSource === 'osrm';
+  return hasGeometry && hasRoadRoute;
+}
+
+function logisticsRouteSummary(route) {
+  const etaMinutes = Math.max(1, Math.round(Number(route?.duration_s || 0) / 60));
+  return {
+    etaMinutes,
+    distanceKm: (Number(route?.distance_m || 0) / 1000).toFixed(2),
+    etaLabel: `${etaMinutes} min`
+  };
 }
 
 function logisticsSnapshotHash(snapshot, settings) {
@@ -2879,11 +2902,9 @@ app.post('/api/admin/logistics/dispatch-all', async (req, res) => {
         continue;
       }
 
-      const hasGeometry = Array.isArray(job.route?.geometry?.coordinates) && job.route.geometry.coordinates.length >= 2;
-      const routeSource = String(job.route?.source || '').toLowerCase();
-      const hasRoadRoute = routeSource === 'valhalla' || routeSource === 'osrm';
-
-      const route = hasGeometry && hasRoadRoute
+      const outboundRoute = hasRoadRouteGeometry(job.outboundRoute)
+        ? job.outboundRoute
+        : hasRoadRouteGeometry(job.route)
         ? job.route
         : await computeRouteBetweenPoints({
           originLon: job.source?.lon,
@@ -2893,12 +2914,27 @@ app.post('/api/admin/logistics/dispatch-all', async (req, res) => {
           mode: routeMode
         });
 
+      const returnRoute = hasRoadRouteGeometry(job.returnRoute)
+        ? job.returnRoute
+        : await computeRouteBetweenPoints({
+          originLon: job.target?.lon,
+          originLat: job.target?.lat,
+          destLon: job.source?.lon,
+          destLat: job.source?.lat,
+          mode: routeMode
+        });
+
+      const routeInfo = logisticsRouteSummary(outboundRoute);
+
       nextJobs.push({
         ...job,
-        route,
-        etaMinutes: Math.max(1, Math.round(Number(route.duration_s || 0) / 60)),
-        distanceKm: (Number(route.distance_m || 0) / 1000).toFixed(2),
-        etaLabel: `${Math.max(1, Math.round(Number(route.duration_s || 0) / 60))} min`,
+        route: outboundRoute,
+        outboundRoute,
+        returnRoute,
+        leg: 'outbound',
+        etaMinutes: routeInfo.etaMinutes,
+        distanceKm: routeInfo.distanceKm,
+        etaLabel: routeInfo.etaLabel,
         status: 'moving',
         startedAt,
         completedAt: null,
@@ -2951,11 +2987,9 @@ app.post('/api/admin/logistics/trucks/:truckId/dispatch', async (req, res) => {
       jobs: await Promise.all(jobs.map(async (job) => {
         if (job.id !== truckId) return job;
 
-        const hasGeometry = Array.isArray(job.route?.geometry?.coordinates) && job.route.geometry.coordinates.length >= 2;
-        const routeSource = String(job.route?.source || '').toLowerCase();
-        const hasRoadRoute = routeSource === 'valhalla' || routeSource === 'osrm';
-
-        const route = hasGeometry && hasRoadRoute
+        const outboundRoute = hasRoadRouteGeometry(job.outboundRoute)
+          ? job.outboundRoute
+          : hasRoadRouteGeometry(job.route)
           ? job.route
           : await computeRouteBetweenPoints({
             originLon: job.source?.lon,
@@ -2965,12 +2999,27 @@ app.post('/api/admin/logistics/trucks/:truckId/dispatch', async (req, res) => {
             mode: routeMode
           });
 
+        const returnRoute = hasRoadRouteGeometry(job.returnRoute)
+          ? job.returnRoute
+          : await computeRouteBetweenPoints({
+            originLon: job.target?.lon,
+            originLat: job.target?.lat,
+            destLon: job.source?.lon,
+            destLat: job.source?.lat,
+            mode: routeMode
+          });
+
+        const routeInfo = logisticsRouteSummary(outboundRoute);
+
         return {
           ...job,
-          route,
-          etaMinutes: Math.max(1, Math.round(Number(route.duration_s || 0) / 60)),
-          distanceKm: (Number(route.distance_m || 0) / 1000).toFixed(2),
-          etaLabel: `${Math.max(1, Math.round(Number(route.duration_s || 0) / 60))} min`,
+          route: outboundRoute,
+          outboundRoute,
+          returnRoute,
+          leg: 'outbound',
+          etaMinutes: routeInfo.etaMinutes,
+          distanceKm: routeInfo.distanceKm,
+          etaLabel: routeInfo.etaLabel,
           status: 'moving',
           startedAt: Date.now(),
           completedAt: null,
@@ -3008,17 +3057,65 @@ app.patch('/api/admin/logistics/trucks/:truckId', async (req, res) => {
     const plan = {
       ...(state.plan || {}),
       updated_at: new Date().toISOString(),
-      jobs: jobs.map((job) => {
+      jobs: await Promise.all(jobs.map(async (job) => {
         if (job.id !== truckId) return job;
+
+        const requestedStatus = status || job.status;
+        const requestedLeg = String(req.body?.leg || job.leg || 'outbound');
+
+        if (requestedStatus === 'arrived' && requestedLeg === 'outbound') {
+          const routeMode = String(state.settings?.routeMode || 'car');
+          const returnRoute = hasRoadRouteGeometry(job.returnRoute)
+            ? job.returnRoute
+            : await computeRouteBetweenPoints({
+              originLon: job.target?.lon,
+              originLat: job.target?.lat,
+              destLon: job.source?.lon,
+              destLat: job.source?.lat,
+              mode: routeMode
+            });
+          const routeInfo = logisticsRouteSummary(returnRoute);
+
+          return {
+            ...job,
+            route: returnRoute,
+            returnRoute,
+            outboundRoute: job.outboundRoute || job.route || null,
+            leg: 'return',
+            status: 'moving',
+            startedAt: Date.now(),
+            completedAt: null,
+            progress: 0,
+            etaMinutes: routeInfo.etaMinutes,
+            distanceKm: routeInfo.distanceKm,
+            etaLabel: routeInfo.etaLabel,
+            currentPosition: [job.target?.lon, job.target?.lat]
+          };
+        }
+
+        if (requestedStatus === 'arrived' && requestedLeg === 'return') {
+          return {
+            ...job,
+            status: 'planned',
+            leg: 'outbound',
+            route: job.outboundRoute || null,
+            startedAt: null,
+            completedAt: null,
+            progress: 0,
+            currentPosition: [job.source?.lon, job.source?.lat]
+          };
+        }
+
         return {
           ...job,
-          status: status || job.status,
+          status: requestedStatus,
+          leg: requestedLeg,
           startedAt: startedAt || job.startedAt || null,
           completedAt: completedAt || job.completedAt || null,
           currentPosition: req.body?.currentPosition || job.currentPosition || [job.source?.lon, job.source?.lat],
           progress: Number.isFinite(Number(req.body?.progress)) ? Number(req.body.progress) : job.progress || 0
         };
-      })
+      }))
     };
 
     await saveLogisticsState({
