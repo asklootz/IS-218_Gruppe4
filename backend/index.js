@@ -2798,31 +2798,81 @@ app.get('/api/routing/nearest-shelters', async (req, res) => {
     // Speed modes in km/h
     const speeds = { walk: 5, bike: 20, car: 60 };
     const speed = speeds[mode] || 5;
-    
-    const result = await pool.query(`
-      SELECT 
+
+    const { latestUsersCte } = await buildLatestUsersSubquery();
+    const safeAreaExistsResult = await pool.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = 'safe_areas'
+      ) AS exists
+    `);
+
+    const shelterResult = await pool.query(`
+      ${latestUsersCte}
+      SELECT
         s.id,
         s.shelter_id,
+        'shelter'::text AS kind,
         s.name,
-        s.capacity,
+        COALESCE(s.capacity, 0)::int AS capacity,
         ST_X(s.location) AS lon,
         ST_Y(s.location) AS lat,
         ST_DistanceSphere(ST_MakePoint($1::float, $2::float), s.location) AS distance_m,
-        COALESCE(SUM(p.population), 0) AS population_nearby,
-        s.capacity - COALESCE(SUM(p.population), 0) AS free_spots
+        COUNT(lu.user_id)::int AS live_users_count
       FROM tilfluktsromoffentlige.tilfluktsrom s
-      LEFT JOIN public.population_cells p ON ST_DWithin(s.location::geography, p.location::geography, 1000)
+      LEFT JOIN latest lu ON ST_DWithin(lu.location::geography, s.location::geography, 150)
       WHERE ST_Intersects(s.location, ${agderGeom})
       GROUP BY s.id, s.shelter_id, s.name, s.capacity, s.location
-      ORDER BY ${strategy === 'hasSpace' ? 'free_spots DESC, distance_m' : 'distance_m'}
-      LIMIT 20
     `, [parseFloat(lon), parseFloat(lat)]);
-    
-    const shelters = result.rows.map(s => ({
-      ...s,
-      distance_km: (s.distance_m / 1000).toFixed(2),
-      travel_time_minutes: Math.round((s.distance_m / 1000) / speed * 60)
-    }));
+
+    let safeAreaRows = [];
+    if (safeAreaExistsResult.rows[0]?.exists) {
+      const safeAreaResult = await pool.query(`
+        ${latestUsersCte}
+        SELECT
+          sa.id,
+          NULL::text AS shelter_id,
+          'safe_area'::text AS kind,
+          sa.name,
+          COALESCE(sa.capacity, 0)::int AS capacity,
+          ST_X(sa.location) AS lon,
+          ST_Y(sa.location) AS lat,
+          ST_DistanceSphere(ST_MakePoint($1::float, $2::float), sa.location) AS distance_m,
+          COUNT(lu.user_id)::int AS live_users_count
+        FROM public.safe_areas sa
+        LEFT JOIN latest lu ON ST_DWithin(lu.location::geography, sa.location::geography, 150)
+        WHERE ST_Intersects(sa.location, ${agderGeom})
+        GROUP BY sa.id, sa.name, sa.capacity, sa.location
+      `, [parseFloat(lon), parseFloat(lat)]);
+      safeAreaRows = safeAreaResult.rows || [];
+    }
+
+    const candidates = [...(shelterResult.rows || []), ...safeAreaRows]
+      .map((row) => {
+        const capacity = Number(row.capacity || 0);
+        const liveUsersCount = Number(row.live_users_count || 0);
+        const distanceMeters = Number(row.distance_m || 0);
+        const freeSpots = capacity - liveUsersCount;
+
+        return {
+          ...row,
+          distance_m: distanceMeters,
+          live_users_count: liveUsersCount,
+          free_spots: freeSpots,
+          has_space: liveUsersCount < capacity,
+          distance_km: (distanceMeters / 1000).toFixed(2),
+          travel_time_minutes: Math.max(1, Math.round((distanceMeters / 1000) / speed * 60))
+        };
+      });
+
+    const filtered = strategy === 'hasSpace'
+      ? candidates.filter((candidate) => candidate.has_space)
+      : candidates;
+
+    const shelters = filtered
+      .sort((a, b) => a.distance_m - b.distance_m)
+      .slice(0, 20);
     
     res.json({ mode, strategy, shelters });
   } catch (error) {

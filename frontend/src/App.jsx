@@ -2499,7 +2499,7 @@ function SimulatePage({ onBack }) {
             'circle-radius': 6,
             'circle-color': [
               'case',
-              ['==', ['get', 'enough_capacity'], true],
+              ['<', ['coalesce', ['get', 'live_users_count'], 0], ['coalesce', ['get', 'capacity'], 0]],
               '#22c55e',
               '#ef4444',
             ],
@@ -2549,7 +2549,12 @@ function SimulatePage({ onBack }) {
           source: 'safe-areas',
           paint: {
             'circle-radius': 6,
-            'circle-color': '#8b5cf6',
+            'circle-color': [
+              'case',
+              ['<', ['coalesce', ['get', 'live_users_count'], 0], ['coalesce', ['get', 'capacity'], 0]],
+              '#22c55e',
+              '#ef4444',
+            ],
             'circle-stroke-width': 2,
             'circle-stroke-color': '#fff',
           },
@@ -2586,7 +2591,12 @@ function SimulatePage({ onBack }) {
           source: 'safe-areas',
           paint: {
             'circle-radius': 6,
-            'circle-color': '#8b5cf6',
+            'circle-color': [
+              'case',
+              ['<', ['coalesce', ['get', 'live_users_count'], 0], ['coalesce', ['get', 'capacity'], 0]],
+              '#22c55e',
+              '#ef4444',
+            ],
             'circle-stroke-width': 2,
             'circle-stroke-color': '#fff',
           },
@@ -3212,8 +3222,24 @@ function UserPage({ userId, onBack }) {
 
   const loadShelters = async () => {
     try {
-      const res = await axios.get(`${API_BASE}/api/admin/coverage?radius=1000`)
-      const shelterFc = sheltersToFeatureCollection(res.data?.shelters || [])
+      const [coverageRes, liveCountsRes] = await Promise.all([
+        axios.get(`${API_BASE}/api/admin/coverage?radius=1000`),
+        axios.get(`${API_BASE}/api/admin/shelters/live-users?radius=150`)
+      ])
+
+      const shelterFc = sheltersToFeatureCollection(coverageRes.data?.shelters || [])
+      const liveCountByShelterId = new Map(
+        (liveCountsRes.data?.counts || []).map((row) => [Number(row.id), Number(row.live_users_count || 0)])
+      )
+
+      shelterFc.features = shelterFc.features.map((feature) => ({
+        ...feature,
+        properties: {
+          ...feature.properties,
+          live_users_count: liveCountByShelterId.get(Number(feature.properties?.id)) || 0
+        }
+      }))
+
       if (map.current && shelterFc.features.length > 0) {
         if (!map.current.getSource('shelters')) {
           map.current.addSource('shelters', { type: 'geojson', data: shelterFc })
@@ -3225,7 +3251,7 @@ function UserPage({ userId, onBack }) {
               'circle-radius': 8,
               'circle-color': [
                 'case',
-                ['==', ['get', 'enough_capacity'], true],
+                ['<', ['coalesce', ['get', 'live_users_count'], 0], ['coalesce', ['get', 'capacity'], 0]],
                 '#22c55e',
                 '#ef4444'
               ],
@@ -3242,13 +3268,17 @@ function UserPage({ userId, onBack }) {
             const f = e.features?.[0]
             if (!f) return
             const p = f.properties || {}
+            const liveUsersCount = Number(p.live_users_count || 0)
+            const capacity = Number(p.capacity || 0)
+            const hasRoom = liveUsersCount < capacity
             const html = `
               <div style="font-size:12px;line-height:1.4;">
                 <strong>${p.name || 'Tilfluktsrom'}</strong><br/>
-                Kapasitet: ${p.capacity ?? 0}<br/>
+                Kapasitet: ${capacity}<br/>
+                Aktive brukere: ${liveUsersCount}<br/>
                 Befolkning i område: ${p.cluster_population ?? 0}<br/>
                 Ledige plasser i område: ${p.cluster_free_spaces ?? 0}<br/>
-                Status: ${(p.enough_capacity === true || p.enough_capacity === 'true') ? 'Nok plass' : 'Ikke nok plass'}<br/>
+                Status: ${hasRoom ? 'Nok plass' : 'Fullt / over kapasitet'}<br/>
                 <button class="route-to-marker-btn" style="margin-top:8px;padding:6px 8px;background:#0ea5e9;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;">Få veibeskrivelse hit</button>
               </div>
             `
@@ -3319,17 +3349,41 @@ function UserPage({ userId, onBack }) {
 
   const loadSafeAreas = async () => {
     try {
-      const res = await axios.get(`${API_BASE}/api/layers/safe-areas`)
-      if (map.current && res.data.features && res.data.features.length > 0) {
+      const [safeAreasRes, liveCountsRes] = await Promise.all([
+        axios.get(`${API_BASE}/api/layers/safe-areas`),
+        axios.get(`${API_BASE}/api/admin/safe-areas/live-users?radius=150`)
+      ])
+
+      const safeAreasData = {
+        ...safeAreasRes.data,
+        features: [...(safeAreasRes.data?.features || [])]
+      }
+      const liveCountBySafeAreaId = new Map(
+        (liveCountsRes.data?.counts || []).map((row) => [Number(row.id), Number(row.live_users_count || 0)])
+      )
+      safeAreasData.features = safeAreasData.features.map((feature) => ({
+        ...feature,
+        properties: {
+          ...(feature.properties || {}),
+          live_users_count: liveCountBySafeAreaId.get(Number(feature.properties?.id)) || 0
+        }
+      }))
+
+      if (map.current && safeAreasData.features && safeAreasData.features.length > 0) {
         if (!map.current.getSource('safe-areas-user')) {
-          map.current.addSource('safe-areas-user', { type: 'geojson', data: res.data })
+          map.current.addSource('safe-areas-user', { type: 'geojson', data: safeAreasData })
           map.current.addLayer({
             id: 'safe-areas-user-layer',
             type: 'circle',
             source: 'safe-areas-user',
             paint: {
               'circle-radius': 8,
-              'circle-color': '#8b5cf6',
+              'circle-color': [
+                'case',
+                ['<', ['coalesce', ['get', 'live_users_count'], 0], ['coalesce', ['get', 'capacity'], 0]],
+                '#22c55e',
+                '#ef4444'
+              ],
               'circle-stroke-width': 2,
               'circle-stroke-color': '#fff'
             }
@@ -3339,11 +3393,16 @@ function UserPage({ userId, onBack }) {
             const f = e.features?.[0]
             if (!f) return
             const p = f.properties || {}
+            const liveUsersCount = Number(p.live_users_count || 0)
+            const capacity = Number(p.capacity || 0)
+            const hasRoom = liveUsersCount < capacity
             const html = `
               <div style="font-size:12px;line-height:1.4;">
                 <strong>🛡️ Trygt område</strong><br/>
                 <strong>${p.name}</strong><br/>
-                  Kapasitet: ${p.capacity ?? 0}<br/>
+                  Kapasitet: ${capacity}<br/>
+                  Aktive brukere: ${liveUsersCount}<br/>
+                  Status: ${hasRoom ? 'Nok plass' : 'Fullt / over kapasitet'}<br/>
                   <button class="route-to-marker-btn" style="margin-top:8px;padding:6px 8px;background:#0ea5e9;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;">Få veibeskrivelse hit</button>
               </div>
             `
@@ -3373,7 +3432,7 @@ function UserPage({ userId, onBack }) {
           map.current.on('mouseenter', 'safe-areas-user-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
           map.current.on('mouseleave', 'safe-areas-user-layer', () => { map.current.getCanvas().style.cursor = '' })
         } else {
-          map.current.getSource('safe-areas-user').setData(res.data)
+          map.current.getSource('safe-areas-user').setData(safeAreasData)
         }
       }
     } catch (error) {
@@ -3553,17 +3612,17 @@ function UserPage({ userId, onBack }) {
 
         {routes && (
           <div className="panel-section">
-            <h3>Nærmeste tilfluktsrom</h3>
+            <h3>Nærmeste tilfluktsrom / tryggsone</h3>
             <div className="routes-list">
               {routes.slice(0, 6).map((route, i) => (
                 <div key={i} className="route-card">
-                  <div className="route-name">{route.name}</div>
+                  <div className="route-name">{route.name} {route.kind === 'safe_area' ? '(Tryggsone)' : '(Tilfluktsrom)'}</div>
                   <div className="route-info">
                     <span>📏 {route.distance_km} km</span>
                     <span>⏱ {route.travel_time_minutes} min</span>
                   </div>
                   <div className="route-capacity">
-                    Kapasitet: {route.free_spots > 0 ? '✓' : '✗'} ({route.free_spots} fri)
+                    Kapasitet: {Number(route.live_users_count || 0) < Number(route.capacity || 0) ? '✓' : '✗'} ({Number(route.capacity || 0) - Number(route.live_users_count || 0)} fri)
                   </div>
                   <button
                     className="btn btn-secondary"
