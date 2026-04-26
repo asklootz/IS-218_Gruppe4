@@ -3032,7 +3032,9 @@ function SimulatePage({ onBack }) {
 
 function UserPage({ userId, onBack }) {
   const mapContainer = useRef(null)
+  const routeControlsRef = useRef(null)
   const map = useRef(null)
+  const hasAutoFollowInitialized = useRef(false)
   const userPopupBound = useRef(false)
   const layerRefreshInterval = useRef(null)
   const routeModeRef = useRef('walk')
@@ -3044,13 +3046,7 @@ function UserPage({ userId, onBack }) {
   const [routes, setRoutes] = useState(null)
   const [activeRoute, setActiveRoute] = useState(null)
   const [tracking, setTracking] = useState(false)
-  const [visibleLayers, setVisibleLayers] = useState({
-    shelters: true,
-    safe_areas: true,
-    counties: false,
-    municipalities: false,
-    roads: true
-  })
+  const [routeMenuOpen, setRouteMenuOpen] = useState(false)
 
   const startTracking = () => {
     if (!navigator.geolocation) {
@@ -3129,8 +3125,9 @@ function UserPage({ userId, onBack }) {
 
   // Automatically enable follow mode once user location is obtained
   useEffect(() => {
-    if (userLocation && map.current && !following) {
+    if (userLocation && map.current && !hasAutoFollowInitialized.current) {
       setFollowing(true)
+      hasAutoFollowInitialized.current = true
       map.current.flyTo({
         center: [userLocation.lon, userLocation.lat],
         zoom: 14
@@ -3147,6 +3144,24 @@ function UserPage({ userId, onBack }) {
   }, [userLocation])
 
   useEffect(() => {
+    if (!routeMenuOpen) return
+
+    const handleOutsidePointer = (event) => {
+      if (routeControlsRef.current && !routeControlsRef.current.contains(event.target)) {
+        setRouteMenuOpen(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handleOutsidePointer)
+    document.addEventListener('touchstart', handleOutsidePointer)
+
+    return () => {
+      document.removeEventListener('mousedown', handleOutsidePointer)
+      document.removeEventListener('touchstart', handleOutsidePointer)
+    }
+  }, [routeMenuOpen])
+
+  useEffect(() => {
     if (!mapContainer.current) return
 
     map.current = new maplibregl.Map({
@@ -3155,6 +3170,17 @@ function UserPage({ userId, onBack }) {
       center: [8.2707, 58.1456],
       zoom: 11
     })
+
+    const disableFollowOnUserGesture = (event) => {
+      const hasOriginalEvent = event && 'originalEvent' in event
+      if (!hasOriginalEvent || !event.originalEvent) return
+      setFollowing((prev) => (prev ? false : prev))
+    }
+
+    map.current.on('dragstart', disableFollowOnUserGesture)
+    map.current.on('zoomstart', disableFollowOnUserGesture)
+    map.current.on('rotatestart', disableFollowOnUserGesture)
+    map.current.on('pitchstart', disableFollowOnUserGesture)
 
     map.current.on('load', () => {
       loadShelters()
@@ -3176,6 +3202,10 @@ function UserPage({ userId, onBack }) {
         clearInterval(layerRefreshInterval.current)
         layerRefreshInterval.current = null
       }
+      map.current?.off('dragstart', disableFollowOnUserGesture)
+      map.current?.off('zoomstart', disableFollowOnUserGesture)
+      map.current?.off('rotatestart', disableFollowOnUserGesture)
+      map.current?.off('pitchstart', disableFollowOnUserGesture)
       map.current?.remove()
     }
   }, [])
@@ -3265,6 +3295,7 @@ function UserPage({ userId, onBack }) {
           id: 'counties-user-line',
           type: 'line',
           source: 'counties-user',
+          layout: { visibility: 'none' },
           paint: { 'line-color': '#1d4ed8', 'line-width': 2, 'line-opacity': 0.95 }
         })
       }
@@ -3277,6 +3308,7 @@ function UserPage({ userId, onBack }) {
           id: 'municipalities-user-line',
           type: 'line',
           source: 'municipalities-user',
+          layout: { visibility: 'none' },
           paint: { 'line-color': '#0afcd3', 'line-width': 2, 'line-opacity': 0.9 }
         })
       }
@@ -3348,24 +3380,6 @@ function UserPage({ userId, onBack }) {
       console.error('Error loading safe areas:', error)
     }
   }
-
-  useEffect(() => {
-    if (!map.current) return
-    const setVisibility = (layerId, visible) => {
-      if (map.current.getLayer(layerId)) {
-        map.current.setLayoutProperty(layerId, 'visibility', visible ? 'visible' : 'none')
-      }
-    }
-    setVisibility('shelters-layer', visibleLayers.shelters)
-    setVisibility('safe-areas-user-layer', visibleLayers.safe_areas)
-    setVisibility('counties-user-line', visibleLayers.counties)
-    setVisibility('municipalities-user-line', visibleLayers.municipalities)
-    setVisibility('osm-base', visibleLayers.roads)
-
-    if (map.current.getLayer('municipalities-user-line') && map.current.getLayer('counties-user-line')) {
-      map.current.moveLayer('municipalities-user-line', 'counties-user-line')
-    }
-  }, [visibleLayers])
 
   const routeToSpecificMarker = async ({ lon, lat, name }) => {
     const origin = userLocationRef.current
@@ -3490,6 +3504,7 @@ function UserPage({ userId, onBack }) {
           source: routeRes.data.source,
           steps: routeRes.data.steps || []
         })
+        setRouteMenuOpen(false)
       }
     } catch (error) {
       console.error('Routing error:', error)
@@ -3512,71 +3527,6 @@ function UserPage({ userId, onBack }) {
         <div className="panel-header">
           <h2>Brukervisning</h2>
           <button className="btn-close" onClick={onBack}>←</button>
-        </div>
-
-        {userLocation && (
-          <div className="panel-section">
-            <p className="location-info">
-              📍 {userLocation.lat.toFixed(4)}, {userLocation.lon.toFixed(4)}
-            </p>
-          </div>
-        )}
-
-        <div className="panel-section">
-          <h3>Rutingsomvalg</h3>
-          <div className="form-group">
-            <label>Transportmiddel:</label>
-            <select value={routeMode} onChange={(e) => setRouteMode(e.target.value)}>
-              <option value="walk">🚶 Til fots</option>
-              <option value="bike">🚴 Sykkel</option>
-              <option value="car">🚗 Bil</option>
-            </select>
-          </div>
-
-          <div className="form-group">
-            <label>Strategi:</label>
-            <select value={routeStrategy} onChange={(e) => setRouteStrategy(e.target.value)}>
-              <option value="nearest">Nærmeste</option>
-              <option value="hasSpace">Med ledig plass</option>
-            </select>
-          </div>
-
-          <button className="btn btn-primary" onClick={handleComputeRoute}>
-            🎯 Finn rute
-          </button>
-        </div>
-
-        <div className="panel-section">
-          <button
-            className={`btn ${following ? 'btn-primary' : 'btn-secondary'}`}
-            onClick={handleFollowUser}
-          >
-            {following ? '📍 Følg bruker (på)' : '📍 Følg bruker (av)'}
-          </button>
-        </div>
-
-        <div className="panel-section">
-          <h3>Lagvalg</h3>
-          <label className="checkbox-label">
-            <input type="checkbox" checked={visibleLayers.shelters} onChange={(e) => setVisibleLayers({ ...visibleLayers, shelters: e.target.checked })} />
-            Tilfluktsrom
-          </label>
-          <label className="checkbox-label">
-            <input type="checkbox" checked={visibleLayers.safe_areas} onChange={(e) => setVisibleLayers({ ...visibleLayers, safe_areas: e.target.checked })} />
-            Trygge områder
-          </label>
-          <label className="checkbox-label">
-            <input type="checkbox" checked={visibleLayers.counties} onChange={(e) => setVisibleLayers({ ...visibleLayers, counties: e.target.checked })} />
-            Fylker
-          </label>
-          <label className="checkbox-label">
-            <input type="checkbox" checked={visibleLayers.municipalities} onChange={(e) => setVisibleLayers({ ...visibleLayers, municipalities: e.target.checked })} />
-            Kommuner
-          </label>
-          <label className="checkbox-label">
-            <input type="checkbox" checked={visibleLayers.roads} onChange={(e) => setVisibleLayers({ ...visibleLayers, roads: e.target.checked })} />
-            Vegnett (OSM baselag)
-          </label>
         </div>
 
         {activeRoute && (
@@ -3635,7 +3585,59 @@ function UserPage({ userId, onBack }) {
         )}
       </div>
 
-      <div className="map-container" ref={mapContainer} />
+      <div className="map-container user-map-container">
+        <div className="map-canvas" ref={mapContainer} />
+
+        <button className="user-map-back-btn" onClick={onBack} aria-label="Tilbake">
+          ←
+        </button>
+
+        <div className="user-map-controls" aria-label="Rutingskontroller" ref={routeControlsRef}>
+          <button
+            className="route-menu-toggle"
+            onClick={() => setRouteMenuOpen((open) => !open)}
+            aria-expanded={routeMenuOpen}
+            aria-controls="route-options-menu"
+            title="Ruteinnstillinger"
+          >
+            ☰
+          </button>
+
+          <button
+            className={`follow-pin-btn ${following ? 'is-active' : ''}`}
+            onClick={handleFollowUser}
+            title={following ? 'Følger bruker' : 'Følg bruker'}
+            aria-label={following ? 'Følger bruker' : 'Følg bruker'}
+          >
+            📍
+          </button>
+
+          {routeMenuOpen && (
+            <div id="route-options-menu" className="route-options-menu">
+              <div className="form-group">
+                <label>Transportmiddel:</label>
+                <select value={routeMode} onChange={(e) => setRouteMode(e.target.value)}>
+                  <option value="walk">🚶 Til fots</option>
+                  <option value="bike">🚴 Sykkel</option>
+                  <option value="car">🚗 Bil</option>
+                </select>
+              </div>
+
+              <div className="form-group">
+                <label>Strategi:</label>
+                <select value={routeStrategy} onChange={(e) => setRouteStrategy(e.target.value)}>
+                  <option value="nearest">Nærmeste</option>
+                  <option value="hasSpace">Med ledig plass</option>
+                </select>
+              </div>
+
+              <button className="btn btn-primary" onClick={handleComputeRoute}>
+                🎯 Finn rute
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   )
 }
