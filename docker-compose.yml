@@ -26,6 +26,7 @@ services:
       DATABASE_URL: "postgresql://postgres:password@postgres:5432/gis"
       NODE_ENV: production
       PORT: 3000
+      VALHALLA_URL: ${VALHALLA_URL:-https://valhalla1.openstreetmap.de/route}
     ports:
       - "3000:3000"
     depends_on:

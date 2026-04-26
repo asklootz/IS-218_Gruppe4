@@ -39,6 +39,35 @@ function toFiniteNumber(value, fallback = 0) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+const VALHALLA_ROUTE_URL = String(process.env.VALHALLA_URL || 'https://valhalla1.openstreetmap.de/route').trim();
+const ROUTER_TIMEOUT_MS = 15000;
+
+function waitMs(durationMs) {
+  return new Promise((resolve) => setTimeout(resolve, durationMs));
+}
+
+async function requestWithRetry(requestFn, { attempts = 3, baseDelayMs = 350 } = {}) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await requestFn();
+    } catch (error) {
+      lastError = error;
+      const status = Number(error?.response?.status || 0);
+      const shouldRetry = status === 429 || status >= 500;
+
+      if (!shouldRetry || attempt >= attempts) {
+        throw error;
+      }
+
+      await waitMs(baseDelayMs * attempt);
+    }
+  }
+
+  throw lastError || new Error('Request failed');
+}
+
 function logisticsJobKey(resourceType, targetType, targetId) {
   return `${resourceType}:${targetType}:${targetId}`;
 }
@@ -240,11 +269,151 @@ function assignLiveUsersToNearestSinks(liveUsers, sinks) {
 }
 
 async function computeRouteBetweenPoints({ originLon, originLat, destLon, destLat, mode = 'walk' }) {
-  const profile = mode === 'car' ? 'driving' : mode === 'bike' ? 'bike' : 'foot';
-  const osrmUrl = `https://router.project-osrm.org/route/v1/${profile}/${originLon},${originLat};${destLon},${destLat}?overview=full&geometries=geojson&steps=true`;
+  const valhallaCosting = mode === 'car' ? 'auto' : mode === 'bike' ? 'bicycle' : 'pedestrian';
+  const osrmProfile = mode === 'car' ? 'driving' : mode === 'bike' ? 'bike' : 'foot';
+
+  const decodePolyline = (encoded, precision = 6) => {
+    if (typeof encoded !== 'string' || !encoded.length) return [];
+
+    let index = 0;
+    let lat = 0;
+    let lon = 0;
+    const factor = Math.pow(10, precision);
+    const coordinates = [];
+
+    while (index < encoded.length) {
+      let result = 0;
+      let shift = 0;
+      let byte;
+
+      do {
+        byte = encoded.charCodeAt(index++) - 63;
+        result |= (byte & 0x1f) << shift;
+        shift += 5;
+      } while (byte >= 0x20 && index < encoded.length + 1);
+
+      const latDelta = (result & 1) ? ~(result >> 1) : (result >> 1);
+      lat += latDelta;
+
+      result = 0;
+      shift = 0;
+      do {
+        byte = encoded.charCodeAt(index++) - 63;
+        result |= (byte & 0x1f) << shift;
+        shift += 5;
+      } while (byte >= 0x20 && index < encoded.length + 1);
+
+      const lonDelta = (result & 1) ? ~(result >> 1) : (result >> 1);
+      lon += lonDelta;
+
+      coordinates.push([lon / factor, lat / factor]);
+    }
+
+    return coordinates;
+  };
+
+  const normalizeValhallaCoordinates = (shape) => {
+    if (Array.isArray(shape)) {
+      return shape
+        .map((point) => {
+          if (!Array.isArray(point) || point.length < 2) return null;
+          const lon = Number(point[0]);
+          const lat = Number(point[1]);
+          if (!Number.isFinite(lon) || !Number.isFinite(lat)) return null;
+          return [lon, lat];
+        })
+        .filter(Boolean);
+    }
+
+    if (shape && typeof shape === 'object' && Array.isArray(shape.coordinates)) {
+      return normalizeValhallaCoordinates(shape.coordinates);
+    }
+
+    if (typeof shape === 'string') {
+      return decodePolyline(shape, 6);
+    }
+
+    return [];
+  };
+
+  const mergeLegCoordinates = (legs) => {
+    const merged = [];
+    for (const leg of legs) {
+      const legCoordinates = normalizeValhallaCoordinates(leg?.shape);
+      if (!legCoordinates.length) continue;
+      if (!merged.length) {
+        merged.push(...legCoordinates);
+      } else {
+        merged.push(...legCoordinates.slice(1));
+      }
+    }
+    return merged;
+  };
+
+  const valhallaStepsFromLegs = (legs) => {
+    return legs
+      .flatMap((leg) => leg?.maneuvers || [])
+      .slice(0, 12)
+      .map((maneuver) => ({
+        distance_m: Math.round(toFiniteNumber(maneuver?.length, 0) * 1000),
+        duration_s: Math.round(toFiniteNumber(maneuver?.time, 0)),
+        instruction: maneuver?.instruction || 'Fortsett'
+      }));
+  };
+
+  const osrmUrl = `https://router.project-osrm.org/route/v1/${osrmProfile}/${originLon},${originLat};${destLon},${destLat}?overview=full&geometries=geojson&steps=true`;
 
   try {
-    const response = await axios.get(osrmUrl, { timeout: 15000 });
+    const response = await requestWithRetry(
+      () => axios.post(
+        VALHALLA_ROUTE_URL,
+        {
+          locations: [
+            { lon: originLon, lat: originLat, type: 'break' },
+            { lon: destLon, lat: destLat, type: 'break' }
+          ],
+          costing: valhallaCosting,
+          shape_format: 'geojson',
+          directions_options: {
+            units: 'kilometers',
+            language: 'nb-NO'
+          }
+        },
+        {
+          timeout: ROUTER_TIMEOUT_MS,
+          headers: { 'Content-Type': 'application/json' }
+        }
+      ),
+      { attempts: 3, baseDelayMs: 500 }
+    );
+
+    const trip = response.data?.trip;
+    const legs = Array.isArray(trip?.legs) ? trip.legs : [];
+    const summary = trip?.summary || {};
+    const coordinates = mergeLegCoordinates(legs);
+
+    if (coordinates.length < 2) throw new Error('No route geometry from Valhalla');
+
+    return {
+      mode,
+      source: 'valhalla',
+      distance_m: Math.round(toFiniteNumber(summary.length, 0) * 1000),
+      duration_s: Math.round(toFiniteNumber(summary.time, 0)),
+      geometry: {
+        type: 'LineString',
+        coordinates
+      },
+      steps: valhallaStepsFromLegs(legs)
+    };
+  } catch (valhallaError) {
+    console.warn(`Valhalla routing failed (${mode}):`, valhallaError.message);
+  }
+
+  try {
+    const response = await requestWithRetry(
+      () => axios.get(osrmUrl, { timeout: ROUTER_TIMEOUT_MS }),
+      { attempts: 3, baseDelayMs: 500 }
+    );
     const route = response.data?.routes?.[0];
     if (!route || !route.geometry?.coordinates) throw new Error('No route from OSRM');
 
@@ -268,7 +437,8 @@ async function computeRouteBetweenPoints({ originLon, originLat, destLon, destLa
       },
       steps
     };
-  } catch (proxyError) {
+  } catch (osrmError) {
+    console.warn(`OSRM routing failed (${mode}):`, osrmError.message);
     const distance = haversineMeters(originLat, originLon, destLat, destLon);
     const speedKmh = mode === 'car' ? 60 : mode === 'bike' ? 20 : 5;
     const durationS = Math.round((distance / 1000) / speedKmh * 3600);
@@ -461,7 +631,18 @@ async function buildOrRefreshLogisticsPlan(settingsOverride = {}) {
   const snapshot = await fetchLogisticsSnapshot();
   const snapshotKey = logisticsSnapshotHash(snapshot, settings);
 
-  if (storedState.snapshot_key === snapshotKey && Array.isArray(storedState.plan?.jobs)) {
+  const storedJobs = Array.isArray(storedState.plan?.jobs) ? storedState.plan.jobs : [];
+  const requiresRoadRouteRefresh = storedJobs.some((job) => {
+    // Only enforce road-route refresh for active trucks. Planned trucks are routed on dispatch.
+    if (!job || !['moving', 'arrived'].includes(job.status)) return false;
+    const coordinates = job.route?.geometry?.coordinates;
+    const hasGeometry = Array.isArray(coordinates) && coordinates.length >= 2;
+    const routeSource = String(job.route?.source || '').toLowerCase();
+    const hasRoadRoute = routeSource === 'valhalla' || routeSource === 'osrm';
+    return !hasGeometry || !hasRoadRoute;
+  });
+
+  if (storedState.snapshot_key === snapshotKey && Array.isArray(storedState.plan?.jobs) && !requiresRoadRouteRefresh) {
     return {
       plan: storedState.plan,
       snapshotKey,
@@ -513,10 +694,32 @@ async function buildOrRefreshLogisticsPlan(settingsOverride = {}) {
   });
 
   const jobsToEnrich = [...fixedJobs, ...foodJobs, ...waterJobs];
-  const enrichedJobs = await Promise.all(jobsToEnrich.map(async (job) => {
-    if (job.route?.geometry?.coordinates?.length && job.status !== 'planned') {
-      return job;
+  const enrichedJobs = [];
+
+  for (const job of jobsToEnrich) {
+    const hasGeometry = Array.isArray(job.route?.geometry?.coordinates) && job.route.geometry.coordinates.length >= 2;
+    const routeSource = String(job.route?.source || '').toLowerCase();
+    const hasRoadRoute = routeSource === 'valhalla' || routeSource === 'osrm';
+
+    // Keep existing moving/arrived routes only when they are already road-network based.
+    if (job.status !== 'planned' && hasGeometry && hasRoadRoute) {
+      enrichedJobs.push(job);
+      continue;
     }
+
+    const shouldComputeRoute = job.status !== 'planned';
+    if (!shouldComputeRoute) {
+      enrichedJobs.push({
+        ...job,
+        route: null,
+        etaMinutes: null,
+        distanceKm: null,
+        etaLabel: null,
+        currentPosition: job.currentPosition || [job.source.lon, job.source.lat]
+      });
+      continue;
+    }
+
     const route = await computeRouteBetweenPoints({
       originLon: job.source.lon,
       originLat: job.source.lat,
@@ -524,15 +727,19 @@ async function buildOrRefreshLogisticsPlan(settingsOverride = {}) {
       destLat: job.target.lat,
       mode: settings.routeMode
     });
-    return {
+
+    enrichedJobs.push({
       ...job,
       route,
       etaMinutes: Math.max(1, Math.round(Number(route.duration_s || 0) / 60)),
       distanceKm: (Number(route.distance_m || 0) / 1000).toFixed(2),
       etaLabel: `${Math.max(1, Math.round(Number(route.duration_s || 0) / 60))} min`,
       currentPosition: job.currentPosition || [job.source.lon, job.source.lat]
-    };
-  }));
+    });
+
+    // Throttle outbound router requests to avoid provider rate limits on large plans.
+    await waitMs(120);
+  }
 
   const plan = {
     version: snapshotKey,
@@ -2600,7 +2807,7 @@ app.get('/api/routing/nearest-shelters', async (req, res) => {
   }
 });
 
-// User: road-based route guidance (OSRM style)
+// User: road-based route guidance (Valhalla first, then OSRM fallback)
 app.get('/api/routing/route', async (req, res) => {
   try {
     const originLon = Number(req.query.originLon);
@@ -2663,17 +2870,44 @@ app.post('/api/admin/logistics/dispatch-all', async (req, res) => {
     const state = await readLogisticsState();
     const jobs = Array.isArray(state.plan?.jobs) ? clonePlanJobs(state.plan.jobs) : [];
     const startedAt = Date.now();
-    const nextJobs = jobs.map((job) => {
-      if (job.status === 'arrived' || job.status === 'moving') return job;
-      return {
+    const routeMode = String(state.settings?.routeMode || 'car');
+    const nextJobs = [];
+
+    for (const job of jobs) {
+      if (job.status === 'arrived' || job.status === 'moving') {
+        nextJobs.push(job);
+        continue;
+      }
+
+      const hasGeometry = Array.isArray(job.route?.geometry?.coordinates) && job.route.geometry.coordinates.length >= 2;
+      const routeSource = String(job.route?.source || '').toLowerCase();
+      const hasRoadRoute = routeSource === 'valhalla' || routeSource === 'osrm';
+
+      const route = hasGeometry && hasRoadRoute
+        ? job.route
+        : await computeRouteBetweenPoints({
+          originLon: job.source?.lon,
+          originLat: job.source?.lat,
+          destLon: job.target?.lon,
+          destLat: job.target?.lat,
+          mode: routeMode
+        });
+
+      nextJobs.push({
         ...job,
+        route,
+        etaMinutes: Math.max(1, Math.round(Number(route.duration_s || 0) / 60)),
+        distanceKm: (Number(route.distance_m || 0) / 1000).toFixed(2),
+        etaLabel: `${Math.max(1, Math.round(Number(route.duration_s || 0) / 60))} min`,
         status: 'moving',
         startedAt,
         completedAt: null,
         progress: 0,
         currentPosition: [job.source?.lon, job.source?.lat]
-      };
-    });
+      });
+
+      await waitMs(120);
+    }
 
     const plan = {
       ...(state.plan || {}),
@@ -2709,20 +2943,41 @@ app.post('/api/admin/logistics/trucks/:truckId/dispatch', async (req, res) => {
       return res.json(state.plan);
     }
 
+    const routeMode = String(state.settings?.routeMode || 'car');
+
     const plan = {
       ...(state.plan || {}),
       updated_at: new Date().toISOString(),
-      jobs: jobs.map((job) => {
+      jobs: await Promise.all(jobs.map(async (job) => {
         if (job.id !== truckId) return job;
+
+        const hasGeometry = Array.isArray(job.route?.geometry?.coordinates) && job.route.geometry.coordinates.length >= 2;
+        const routeSource = String(job.route?.source || '').toLowerCase();
+        const hasRoadRoute = routeSource === 'valhalla' || routeSource === 'osrm';
+
+        const route = hasGeometry && hasRoadRoute
+          ? job.route
+          : await computeRouteBetweenPoints({
+            originLon: job.source?.lon,
+            originLat: job.source?.lat,
+            destLon: job.target?.lon,
+            destLat: job.target?.lat,
+            mode: routeMode
+          });
+
         return {
           ...job,
+          route,
+          etaMinutes: Math.max(1, Math.round(Number(route.duration_s || 0) / 60)),
+          distanceKm: (Number(route.distance_m || 0) / 1000).toFixed(2),
+          etaLabel: `${Math.max(1, Math.round(Number(route.duration_s || 0) / 60))} min`,
           status: 'moving',
           startedAt: Date.now(),
           completedAt: null,
           progress: 0,
           currentPosition: [job.source?.lon, job.source?.lat]
         };
-      })
+      }))
     };
 
     await saveLogisticsState({
