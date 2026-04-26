@@ -386,6 +386,129 @@ body {
   gap: 8px;
 }
 
+.logistics-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.logistics-actions {
+  margin-top: 8px;
+}
+
+.logistics-help {
+  margin-top: 10px;
+  font-size: 0.88rem;
+  color: var(--text-light);
+}
+
+.logistics-error {
+  margin-top: 8px;
+  color: #b91c1c;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.truck-detail-card {
+  background: linear-gradient(135deg, #f8fafc 0%, #eef2ff 100%);
+  border: 1px solid #dbe4ff;
+  border-radius: 12px;
+  padding: 14px;
+}
+
+.truck-detail-title {
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+.truck-detail-row {
+  font-size: 0.9rem;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+
+.truck-detail-actions {
+  margin-top: 12px;
+}
+
+.truck-route-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.truck-route-card {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  text-align: left;
+  background: var(--light);
+  border: 1px solid #dbe4ff;
+  border-radius: 12px;
+  padding: 12px;
+  cursor: pointer;
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.truck-route-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 20px rgba(15, 23, 42, 0.08);
+}
+
+.truck-route-card.active {
+  border-color: var(--primary);
+  box-shadow: 0 10px 24px rgba(14, 165, 233, 0.18);
+}
+
+.truck-route-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.truck-route-body {
+  display: grid;
+  gap: 3px;
+  font-size: 0.88rem;
+  color: var(--text-light);
+}
+
+.truck-route-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.truck-route-distance {
+  font-size: 0.85rem;
+  color: var(--text-light);
+  font-weight: 600;
+}
+
+.truck-progress {
+  width: 100%;
+  height: 8px;
+  background: #e5e7eb;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.truck-progress.small {
+  height: 6px;
+}
+
+.truck-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #0ea5e9 0%, #22c55e 100%);
+  border-radius: 999px;
+  transition: width 0.5s ease;
+}
+
 /* USER PAGE */
 
 .user-container {

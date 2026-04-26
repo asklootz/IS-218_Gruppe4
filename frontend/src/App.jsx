@@ -146,6 +146,248 @@ function createMockUserPositions(lon, lat, count) {
   })
 }
 
+const DEFAULT_LOGISTICS_SETTINGS = {
+  foodUnitsPerPerson: 1,
+  waterUnitsPerPerson: 2,
+  foodTruckCapacity: 120,
+  waterTruckCapacity: 200,
+  routeMode: 'car'
+}
+
+function toFiniteNumber(value, fallback = 0) {
+  const numberValue = Number(value)
+  return Number.isFinite(numberValue) ? numberValue : fallback
+}
+
+function getPointCoordinate(feature) {
+  const coordinates = feature?.geometry?.coordinates
+  if (!Array.isArray(coordinates) || coordinates.length < 2) return null
+  const lon = Number(coordinates[0])
+  const lat = Number(coordinates[1])
+  if (!Number.isFinite(lon) || !Number.isFinite(lat)) return null
+  return { lon, lat }
+}
+
+function haversineMeters(lon1, lat1, lon2, lat2) {
+  const earthRadius = 6371000
+  const dLat = ((lat2 - lat1) * Math.PI) / 180
+  const dLon = ((lon2 - lon1) * Math.PI) / 180
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) *
+    Math.sin(dLon / 2) * Math.sin(dLon / 2)
+  return 2 * earthRadius * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
+function interpolatePointAlongLine(coordinates, progress) {
+  if (!Array.isArray(coordinates) || coordinates.length === 0) return null
+  if (coordinates.length === 1) return coordinates[0]
+
+  const clampedProgress = Math.min(1, Math.max(0, progress))
+  const segmentLengths = []
+  let totalLength = 0
+
+  for (let index = 0; index < coordinates.length - 1; index += 1) {
+    const start = coordinates[index]
+    const end = coordinates[index + 1]
+    const segmentLength = haversineMeters(start[0], start[1], end[0], end[1])
+    segmentLengths.push(segmentLength)
+    totalLength += segmentLength
+  }
+
+  if (totalLength <= 0) return coordinates[0]
+
+  const targetDistance = totalLength * clampedProgress
+  let traversed = 0
+
+  for (let index = 0; index < segmentLengths.length; index += 1) {
+    const start = coordinates[index]
+    const end = coordinates[index + 1]
+    const segmentLength = segmentLengths[index]
+
+    if (traversed + segmentLength >= targetDistance) {
+      const segmentProgress = segmentLength === 0 ? 0 : (targetDistance - traversed) / segmentLength
+      return [
+        start[0] + (end[0] - start[0]) * segmentProgress,
+        start[1] + (end[1] - start[1]) * segmentProgress
+      ]
+    }
+
+    traversed += segmentLength
+  }
+
+  return coordinates[coordinates.length - 1]
+}
+
+function trimLineByProgress(coordinates, progress) {
+  if (!Array.isArray(coordinates) || coordinates.length === 0) return []
+  if (coordinates.length === 1) return [coordinates[0]]
+
+  const clampedProgress = Math.min(1, Math.max(0, progress))
+  if (clampedProgress <= 0) return coordinates
+  if (clampedProgress >= 1) return [coordinates[coordinates.length - 1]]
+
+  const segmentLengths = []
+  let totalLength = 0
+
+  for (let index = 0; index < coordinates.length - 1; index += 1) {
+    const start = coordinates[index]
+    const end = coordinates[index + 1]
+    const segmentLength = haversineMeters(start[0], start[1], end[0], end[1])
+    segmentLengths.push(segmentLength)
+    totalLength += segmentLength
+  }
+
+  if (totalLength <= 0) return [coordinates[coordinates.length - 1]]
+
+  const targetDistance = totalLength * clampedProgress
+  let traversed = 0
+
+  for (let index = 0; index < segmentLengths.length; index += 1) {
+    const start = coordinates[index]
+    const end = coordinates[index + 1]
+    const segmentLength = segmentLengths[index]
+
+    if (traversed + segmentLength >= targetDistance) {
+      const segmentProgress = segmentLength === 0 ? 0 : (targetDistance - traversed) / segmentLength
+      const currentPoint = [
+        start[0] + (end[0] - start[0]) * segmentProgress,
+        start[1] + (end[1] - start[1]) * segmentProgress
+      ]
+
+      return [currentPoint, ...coordinates.slice(index + 1)]
+    }
+
+    traversed += segmentLength
+  }
+
+  return [coordinates[coordinates.length - 1]]
+}
+
+function buildGreedyTruckJobs({ sinks, sources, resourceType, unitsPerPerson, truckCapacity }) {
+  const validSinks = (sinks || [])
+    .map((sink) => ({ ...sink, live_users_count: toFiniteNumber(sink.live_users_count, 0) }))
+    .filter((sink) => sink.live_users_count > 0)
+    .sort((a, b) => b.live_users_count - a.live_users_count)
+
+  const validSources = (sources || [])
+    .map((source) => {
+      const coordinate = getPointCoordinate(source)
+      return coordinate ? { ...source, lon: coordinate.lon, lat: coordinate.lat } : null
+    })
+    .filter(Boolean)
+
+  const sourceLoadCounts = new Map()
+  const jobs = []
+
+  for (const sink of validSinks) {
+    const totalDemand = Math.max(0, Math.round(sink.live_users_count * unitsPerPerson))
+    let remainingDemand = totalDemand
+
+    while (remainingDemand > 0 && validSources.length > 0) {
+      const loadAmount = Math.min(truckCapacity, remainingDemand)
+      let selectedSource = null
+      let selectedScore = Number.POSITIVE_INFINITY
+
+      for (const source of validSources) {
+        const sourceKey = String(source.id ?? source.name ?? `${source.lon},${source.lat}`)
+        const assignedLoads = sourceLoadCounts.get(sourceKey) || 0
+        const distanceMeters = haversineMeters(source.lon, source.lat, sink.lon, sink.lat)
+        const score = distanceMeters + assignedLoads * 15000
+
+        if (score < selectedScore) {
+          selectedScore = score
+          selectedSource = source
+        }
+      }
+
+      if (!selectedSource) break
+
+      const sourceKey = String(selectedSource.id ?? selectedSource.name ?? `${selectedSource.lon},${selectedSource.lat}`)
+      sourceLoadCounts.set(sourceKey, (sourceLoadCounts.get(sourceKey) || 0) + 1)
+
+      jobs.push({
+        id: uuidv4(),
+        resourceType,
+        source: {
+          id: selectedSource.id,
+          name: selectedSource.name,
+          lon: selectedSource.lon,
+          lat: selectedSource.lat
+        },
+        target: {
+          id: sink.id,
+          name: sink.name,
+          lon: sink.lon,
+          lat: sink.lat,
+          kind: sink.kind,
+          live_users_count: sink.live_users_count
+        },
+        amount: loadAmount,
+        truckCapacity,
+        demand: totalDemand,
+        unitsPerPerson,
+        sourceScore: Math.round(selectedScore),
+        status: 'planned',
+        progress: 0,
+        startedAt: null,
+        completedAt: null,
+        route: null,
+        currentPosition: [selectedSource.lon, selectedSource.lat]
+      })
+
+      remainingDemand -= loadAmount
+    }
+  }
+
+  return jobs
+}
+
+function createLogisticsGeoJson(jobs) {
+  return {
+    type: 'FeatureCollection',
+    features: (jobs || []).flatMap((job) => {
+      const routeFeature = job.route?.geometry?.coordinates?.length
+        ? {
+            type: 'Feature',
+            geometry: job.route.geometry,
+            properties: {
+              truckId: job.id,
+              resourceType: job.resourceType,
+              amount: job.amount,
+              status: job.status,
+              sourceName: job.source?.name,
+              targetName: job.target?.name,
+              etaMinutes: job.etaMinutes || null
+            }
+          }
+        : null
+
+      const positionFeature = job.currentPosition
+        ? {
+            type: 'Feature',
+            geometry: {
+              type: 'Point',
+              coordinates: job.currentPosition
+            },
+            properties: {
+              truckId: job.id,
+              resourceType: job.resourceType,
+              amount: job.amount,
+              status: job.status,
+              sourceName: job.source?.name,
+              targetName: job.target?.name,
+              etaMinutes: job.etaMinutes || null,
+              progress: Math.round((job.progress || 0) * 100)
+            }
+          }
+        : null
+
+      return [routeFeature, positionFeature].filter(Boolean)
+    })
+  }
+}
+
 
 function pageFromPath(pathname) {
   if (pathname === '/admin') return 'admin'
@@ -220,9 +462,23 @@ function AdminPage({ onBack }) {
   const markerLiveCountInterval = useRef(null)
   const sheltersGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
   const safeAreasGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
+  const truckRoutesGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
+  const truckPositionsGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
+  const logisticsAnimationInterval = useRef(null)
+  const logisticsRefreshInterval = useRef(null)
+  const logisticsLayersLoaded = useRef(false)
+  const truckIconsLoaded = useRef(false)
+  const truckJobsRef = useRef([])
+  const selectedTruckIdRef = useRef(null)
   const [radius, setRadius] = useState(1000)
   const [coverage, setCoverage] = useState(null)
   const [loading, setLoading] = useState(false)
+  const [logisticsLoading, setLogisticsLoading] = useState(false)
+  const [logisticsStatus, setLogisticsStatus] = useState('Planer mock-truckruter fra gårder og vannkilder.')
+  const [logisticsError, setLogisticsError] = useState('')
+  const [logisticsSettings, setLogisticsSettings] = useState(DEFAULT_LOGISTICS_SETTINGS)
+  const [truckJobs, setTruckJobs] = useState([])
+  const [selectedTruckId, setSelectedTruckId] = useState(null)
   const [visibleLayers, setVisibleLayers] = useState({
     shelters: true,
     population: false,
@@ -235,8 +491,589 @@ function AdminPage({ onBack }) {
     hospitals: true,
     safe_areas: true,
     live_users: true,
+    logistics_food_routes: true,
+    logistics_water_routes: true,
     radius: false
   })
+
+  useEffect(() => {
+    truckJobsRef.current = truckJobs
+  }, [truckJobs])
+
+  useEffect(() => {
+    selectedTruckIdRef.current = selectedTruckId
+  }, [selectedTruckId])
+
+  const clearLogisticsAnimation = () => {
+    if (logisticsAnimationInterval.current) {
+      clearInterval(logisticsAnimationInterval.current)
+      logisticsAnimationInterval.current = null
+    }
+  }
+
+  const updateTruckMapSources = (jobs) => {
+    if (!map.current) return
+
+    const routeFeatures = []
+    const positionFeatures = []
+
+    for (const job of jobs || []) {
+      const routeCoordinates = job.route?.geometry?.coordinates
+      if (Array.isArray(routeCoordinates) && routeCoordinates.length > 0 && job.status !== 'arrived') {
+        const visibleCoordinates = job.status === 'moving'
+          ? trimLineByProgress(routeCoordinates, toFiniteNumber(job.progress, 0))
+          : routeCoordinates
+
+        if (visibleCoordinates.length >= 2) {
+        routeFeatures.push({
+          type: 'Feature',
+          geometry: {
+            type: 'LineString',
+            coordinates: visibleCoordinates,
+          },
+          properties: {
+            truckId: job.id,
+            resourceType: job.resourceType,
+            amount: job.amount,
+            status: job.status,
+            sourceName: job.source?.name,
+            targetName: job.target?.name,
+            etaMinutes: job.etaMinutes || null,
+            selected: job.id === selectedTruckIdRef.current
+          }
+        })
+        }
+      }
+
+      const currentPosition = job.currentPosition || [job.source?.lon, job.source?.lat]
+      if (Array.isArray(currentPosition) && currentPosition.length >= 2) {
+        positionFeatures.push({
+          type: 'Feature',
+          geometry: {
+            type: 'Point',
+            coordinates: currentPosition
+          },
+          properties: {
+            truckId: job.id,
+            resourceType: job.resourceType,
+            amount: job.amount,
+            status: job.status,
+            sourceName: job.source?.name,
+            targetName: job.target?.name,
+            etaMinutes: job.etaMinutes || null,
+            progress: Math.round((job.progress || 0) * 100),
+            selected: job.id === selectedTruckIdRef.current
+          }
+        })
+      }
+    }
+
+    const nextRoutes = { type: 'FeatureCollection', features: routeFeatures }
+    const nextPositions = { type: 'FeatureCollection', features: positionFeatures }
+
+    truckRoutesGeoJsonRef.current = nextRoutes
+    truckPositionsGeoJsonRef.current = nextPositions
+
+    if (map.current.getSource('logistics-routes')) {
+      map.current.getSource('logistics-routes').setData(nextRoutes)
+    }
+    if (map.current.getSource('logistics-trucks')) {
+      map.current.getSource('logistics-trucks').setData(nextPositions)
+    }
+  }
+
+  const syncTruckProgressToBackend = async (jobs) => {
+    const movableJobs = (jobs || []).filter((job) => ['moving', 'arrived'].includes(job.status))
+    if (movableJobs.length === 0) return
+
+    try {
+      await Promise.all(movableJobs.map((job) => axios.patch(
+        `${API_BASE}/api/admin/logistics/trucks/${job.id}`,
+        {
+          status: job.status,
+          startedAt: job.startedAt || null,
+          completedAt: job.completedAt || null,
+          progress: job.progress || 0,
+          currentPosition: job.currentPosition || [job.source?.lon, job.source?.lat]
+        }
+      )))
+    } catch (error) {
+      console.warn('Failed to sync truck progress:', error.message)
+    }
+  }
+
+  const loadPersistedLogisticsPlan = async () => {
+    try {
+      const res = await axios.get(`${API_BASE}/api/admin/logistics/plan`)
+      const jobs = Array.isArray(res.data?.jobs) ? res.data.jobs : []
+      truckJobsRef.current = jobs
+      setTruckJobs(jobs)
+      setSelectedTruckId((currentSelected) => currentSelected || jobs[0]?.id || null)
+      setLogisticsStatus(jobs.length > 0 ? `Laster lagret plan med ${jobs.length} ruter.` : 'Ingen lagret forsyningsplan ennå.')
+      updateTruckMapSources(jobs)
+
+      if (jobs.some((job) => job.status === 'moving')) {
+        startLogisticsAnimation()
+      }
+    } catch (error) {
+      console.warn('Failed to load persisted logistics plan:', error.message)
+    }
+  }
+
+  const ensureTruckIcons = async () => {
+    if (!map.current || truckIconsLoaded.current) return
+
+    const svgToDataUri = (svg) => `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`
+    const loadSvgImage = (id, svg) => new Promise((resolve, reject) => {
+      if (map.current.hasImage(id)) {
+        resolve()
+        return
+      }
+
+      const image = new Image()
+      image.onload = () => {
+        if (!map.current.hasImage(id)) {
+          map.current.addImage(id, image)
+        }
+        resolve()
+      }
+      image.onerror = reject
+      image.src = svgToDataUri(svg)
+    })
+
+    await Promise.all([
+      loadSvgImage(
+        'food-truck-icon',
+        `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64"><path d="M14 26c0-6 4.9-11 11-11h14c6.1 0 11 5 11 11v15H14V26z" fill="#8b5e34"/><rect x="12" y="34" width="40" height="14" rx="4" fill="#a8733f"/><circle cx="22" cy="50" r="6" fill="#111827"/><circle cx="22" cy="50" r="3" fill="#d1d5db"/><circle cx="44" cy="50" r="6" fill="#111827"/><circle cx="44" cy="50" r="3" fill="#d1d5db"/></svg>`
+      ),
+      loadSvgImage(
+        'water-truck-icon',
+        `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64"><path d="M32 8c-7.5 9.3-15 17.4-15 27.1C17 44.4 24.2 52 32 52s15-7.6 15-16.9C47 25.4 39.5 17.3 32 8z" fill="#0ea5e9" stroke="#075985" stroke-width="2"/><rect x="18" y="34" width="28" height="10" rx="3" fill="#38bdf8" opacity="0.85"/></svg>`
+      )
+    ])
+
+    truckIconsLoaded.current = true
+  }
+
+  const ensureLogisticsLayers = async () => {
+    if (!map.current || logisticsLayersLoaded.current) return
+
+    await ensureTruckIcons()
+
+    if (!map.current.getSource('logistics-routes')) {
+      map.current.addSource('logistics-routes', {
+        type: 'geojson',
+        data: truckRoutesGeoJsonRef.current
+      })
+      map.current.addLayer({
+        id: 'logistics-routes-food-layer',
+        type: 'line',
+        source: 'logistics-routes',
+        filter: ['==', ['get', 'resourceType'], 'food'],
+        paint: {
+          'line-color': '#8b5e34',
+          'line-width': [
+            'case',
+            ['==', ['get', 'selected'], true],
+            6,
+            ['==', ['get', 'status'], 'moving'],
+            5,
+            3
+          ],
+          'line-opacity': [
+            'case',
+            ['==', ['get', 'selected'], true],
+            0.95,
+            ['==', ['get', 'status'], 'arrived'],
+            0.35,
+            0.7
+          ]
+        }
+      })
+
+      map.current.addLayer({
+        id: 'logistics-routes-water-layer',
+        type: 'line',
+        source: 'logistics-routes',
+        filter: ['==', ['get', 'resourceType'], 'water'],
+        paint: {
+          'line-color': '#0ea5e9',
+          'line-width': [
+            'case',
+            ['==', ['get', 'selected'], true],
+            6,
+            ['==', ['get', 'status'], 'moving'],
+            5,
+            3
+          ],
+          'line-opacity': [
+            'case',
+            ['==', ['get', 'selected'], true],
+            0.95,
+            ['==', ['get', 'status'], 'arrived'],
+            0.35,
+            0.7
+          ]
+        }
+      })
+    }
+
+    if (!map.current.getSource('logistics-trucks')) {
+      map.current.addSource('logistics-trucks', {
+        type: 'geojson',
+        data: truckPositionsGeoJsonRef.current
+      })
+      map.current.addLayer({
+        id: 'logistics-trucks-layer',
+        type: 'symbol',
+        source: 'logistics-trucks',
+        layout: {
+          'icon-image': [
+            'case',
+            ['==', ['get', 'resourceType'], 'water'],
+            'water-truck-icon',
+            'food-truck-icon'
+          ],
+          'icon-size': 0.45,
+          'icon-allow-overlap': true,
+          'icon-ignore-placement': true,
+          'text-field': ['to-string', ['get', 'amount']],
+          'text-size': 10,
+          'text-offset': [0, 1.35],
+          'text-allow-overlap': true,
+          'text-ignore-placement': true
+        },
+        paint: {
+          'text-color': '#111827',
+          'text-halo-color': '#ffffff',
+          'text-halo-width': 1.2,
+          'icon-opacity': [
+            'case',
+            ['==', ['get', 'status'], 'arrived'],
+            0.45,
+            1
+          ]
+        }
+      })
+    }
+
+    const handleRouteLayerClick = (e) => {
+      const f = e.features?.[0]
+      if (!f) return
+      const truckId = f.properties?.truckId
+      const job = truckJobsRef.current.find((entry) => entry.id === truckId)
+      if (!job) return
+      setSelectedTruckId(job.id)
+      showTruckRoutePopup(job, e.lngLat)
+    }
+
+    map.current.on('click', 'logistics-routes-food-layer', handleRouteLayerClick)
+    map.current.on('click', 'logistics-routes-water-layer', handleRouteLayerClick)
+
+    map.current.on('click', 'logistics-trucks-layer', (e) => {
+      const f = e.features?.[0]
+      if (!f) return
+      const truckId = f.properties?.truckId
+      const job = truckJobsRef.current.find((entry) => entry.id === truckId)
+      if (!job) return
+      setSelectedTruckId(job.id)
+      showTruckRoutePopup(job, e.lngLat)
+    })
+
+    map.current.on('mouseenter', 'logistics-routes-food-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+    map.current.on('mouseleave', 'logistics-routes-food-layer', () => { map.current.getCanvas().style.cursor = '' })
+    map.current.on('mouseenter', 'logistics-routes-water-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+    map.current.on('mouseleave', 'logistics-routes-water-layer', () => { map.current.getCanvas().style.cursor = '' })
+    map.current.on('mouseenter', 'logistics-trucks-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+    map.current.on('mouseleave', 'logistics-trucks-layer', () => { map.current.getCanvas().style.cursor = '' })
+
+    logisticsLayersLoaded.current = true
+  }
+
+  const showTruckRoutePopup = (job, lngLat) => {
+    if (!job) return
+    const isMoving = job.status === 'moving'
+    const isArrived = job.status === 'arrived'
+    const html = `
+      <div style="font-size:12px;line-height:1.45;min-width:240px;">
+        <strong>${job.resourceType === 'water' ? '💧 Water truck' : '🍞 Food truck'}</strong><br/>
+        Fra: ${job.source?.name || 'Unknown source'}<br/>
+        Til: ${job.target?.name || 'Unknown destination'}<br/>
+        Mengde: ${job.amount} units<br/>
+        ETA: ${job.etaMinutes ? `${job.etaMinutes} min` : 'Calculating...'}<br/>
+        Status: ${isArrived ? 'Arrived' : isMoving ? 'Moving' : 'Planned'}<br/>
+        <button id="dispatch-selected-truck" style="margin-top:8px;padding:6px 8px;background:${isMoving || isArrived ? '#9ca3af' : '#0ea5e9'};color:white;border:none;border-radius:4px;cursor:${isMoving || isArrived ? 'not-allowed' : 'pointer'};font-size:11px;width:100%;" ${isMoving || isArrived ? 'disabled' : ''}>${isMoving ? 'On route' : isArrived ? 'Completed' : 'Send truck'}</button>
+      </div>
+    `
+    const popup = new maplibregl.Popup({ closeButton: true })
+      .setLngLat(lngLat || [job.target?.lon || job.source?.lon, job.target?.lat || job.source?.lat])
+      .setHTML(html)
+      .addTo(map.current)
+
+    const dispatchButton = popup.getElement()?.querySelector('#dispatch-selected-truck')
+    if (dispatchButton && !isMoving && !isArrived) {
+      dispatchButton.addEventListener('click', async () => {
+        popup.remove()
+        await dispatchTruck(job.id)
+      })
+    }
+  }
+
+  const startLogisticsAnimation = () => {
+    if (logisticsAnimationInterval.current) return
+
+    logisticsAnimationInterval.current = setInterval(() => {
+      const now = Date.now()
+      const currentJobs = truckJobsRef.current
+      const nextJobs = currentJobs.map((job) => {
+        if (job.status !== 'moving' || !job.route?.geometry?.coordinates?.length || !job.startedAt) {
+          return job
+        }
+
+        const durationMs = Math.max(1000, Number(job.route.duration_s || 0) * 1000)
+        const progress = Math.min(1, (now - job.startedAt) / durationMs)
+        const currentPosition = interpolatePointAlongLine(job.route.geometry.coordinates, progress)
+
+        if (progress >= 1) {
+          return {
+            ...job,
+            progress: 1,
+            currentPosition,
+            status: 'arrived',
+            completedAt: now
+          }
+        }
+
+        return {
+          ...job,
+          progress,
+          currentPosition
+        }
+      })
+
+      truckJobsRef.current = nextJobs
+      setTruckJobs(nextJobs)
+      updateTruckMapSources(nextJobs)
+      syncTruckProgressToBackend(nextJobs)
+
+      if (!nextJobs.some((job) => job.status === 'moving')) {
+        clearLogisticsAnimation()
+      }
+    }, 1000)
+  }
+
+  const fetchRouteForTruck = async (job) => {
+    const response = await axios.get(`${API_BASE}/api/routing/route`, {
+      params: {
+        originLon: job.source.lon,
+        originLat: job.source.lat,
+        destLon: job.target.lon,
+        destLat: job.target.lat,
+        mode: logisticsSettings.routeMode
+      }
+    })
+
+    const route = response.data || {}
+    const etaMinutes = Math.max(1, Math.round(Number(route.duration_s || 0) / 60))
+
+    return {
+      ...job,
+      route,
+      etaMinutes,
+      etaLabel: `${etaMinutes} min`,
+      distanceKm: (Number(route.distance_m || 0) / 1000).toFixed(2),
+      currentPosition: [job.source.lon, job.source.lat]
+    }
+  }
+
+  const loadLogisticsInputs = async () => {
+    const [sheltersRes, shelterCountsRes, safeAreasRes, safeAreaCountsRes, farmsRes, waterRes] = await Promise.all([
+      axios.get(`${API_BASE}/api/layers/shelters`),
+      axios.get(`${API_BASE}/api/admin/shelters/live-users?radius=150`),
+      axios.get(`${API_BASE}/api/layers/safe-areas`),
+      axios.get(`${API_BASE}/api/admin/safe-areas/live-users?radius=150`),
+      axios.get(`${API_BASE}/api/layers/farms`),
+      axios.get(`${API_BASE}/api/layers/water_sources`)
+    ])
+
+    const shelterCountMap = new Map((shelterCountsRes.data?.counts || []).map((row) => [Number(row.id), Number(row.live_users_count || 0)]))
+    const safeAreaCountMap = new Map((safeAreaCountsRes.data?.counts || []).map((row) => [Number(row.id), Number(row.live_users_count || 0)]))
+
+    const shelters = (sheltersRes.data?.features || [])
+      .map((feature) => {
+        const coordinate = getPointCoordinate(feature)
+        if (!coordinate) return null
+        return {
+          id: Number(feature.properties?.id),
+          name: feature.properties?.name || `Shelter ${feature.properties?.id}`,
+          lon: coordinate.lon,
+          lat: coordinate.lat,
+          live_users_count: shelterCountMap.get(Number(feature.properties?.id)) || 0,
+          kind: 'shelter'
+        }
+      })
+      .filter(Boolean)
+
+    const safeAreas = (safeAreasRes.data?.features || [])
+      .map((feature) => {
+        const coordinate = getPointCoordinate(feature)
+        if (!coordinate) return null
+        return {
+          id: Number(feature.properties?.id),
+          name: feature.properties?.name || `Safe area ${feature.properties?.id}`,
+          lon: coordinate.lon,
+          lat: coordinate.lat,
+          live_users_count: safeAreaCountMap.get(Number(feature.properties?.id)) || 0,
+          kind: 'safe_area'
+        }
+      })
+      .filter(Boolean)
+
+    const foodSources = (farmsRes.data?.features || [])
+      .map((feature) => {
+        const coordinate = getPointCoordinate(feature)
+        if (!coordinate) return null
+        return {
+          id: Number(feature.properties?.id),
+          name: feature.properties?.name || `Farm ${feature.properties?.id}`,
+          lon: coordinate.lon,
+          lat: coordinate.lat,
+          kind: 'farm'
+        }
+      })
+      .filter(Boolean)
+
+    const waterSources = (waterRes.data?.features || [])
+      .map((feature) => {
+        const coordinate = getPointCoordinate(feature)
+        if (!coordinate) return null
+        return {
+          id: Number(feature.properties?.id),
+          name: feature.properties?.name || `Water source ${feature.properties?.id}`,
+          lon: coordinate.lon,
+          lat: coordinate.lat,
+          kind: 'water_source'
+        }
+      })
+      .filter(Boolean)
+
+    return {
+      sinks: [...shelters, ...safeAreas],
+      foodSources,
+      waterSources
+    }
+  }
+
+  const buildLogisticsPlan = async () => {
+    setLogisticsLoading(true)
+    setLogisticsError('')
+    setLogisticsStatus('Beregner truckruter og fordeler last...')
+
+    try {
+      const res = await axios.post(`${API_BASE}/api/admin/logistics/plan`, {
+        settings: logisticsSettings
+      })
+      const plannedJobs = Array.isArray(res.data?.jobs) ? res.data.jobs : []
+
+      setTruckJobs(plannedJobs)
+      truckJobsRef.current = plannedJobs
+      setSelectedTruckId(plannedJobs[0]?.id || null)
+      updateTruckMapSources(plannedJobs)
+      setLogisticsStatus(
+        plannedJobs.length > 0
+          ? `Plan ferdig: ${plannedJobs.length} mock-trucker klare.`
+          : 'Ingen mock-trucker kunne planlegges. Legg mock-brukere nær en tilfluktsrom eller tryggsone, eller prøv å beregne på nytt etter at det finnes behov.'
+      )
+      if (plannedJobs[0]?.route?.geometry?.coordinates?.length) {
+        const bounds = new maplibregl.LngLatBounds()
+        plannedJobs[0].route.geometry.coordinates.forEach(([lon, lat]) => bounds.extend([lon, lat]))
+        map.current?.fitBounds(bounds, { padding: 80, duration: 600 })
+      }
+    } catch (error) {
+      console.error('Error building logistics plan:', error)
+      setLogisticsError('Kunne ikke bygge forsyningsplanen. Se konsollen for detaljer.')
+      setLogisticsStatus('Planlegging feilet.')
+    } finally {
+      setLogisticsLoading(false)
+    }
+  }
+
+  const dispatchTruck = async (truckId) => {
+    try {
+      const res = await axios.post(`${API_BASE}/api/admin/logistics/trucks/${truckId}/dispatch`)
+      const nextJobs = Array.isArray(res.data?.jobs) ? res.data.jobs : []
+      const currentJob = nextJobs.find((job) => job.id === truckId)
+
+      truckJobsRef.current = nextJobs
+      setTruckJobs(nextJobs)
+      updateTruckMapSources(nextJobs)
+      setSelectedTruckId(truckId)
+      setLogisticsStatus(currentJob ? `Truck ${currentJob.id} er sendt.` : 'Truck er sendt.')
+      if (nextJobs.some((job) => job.status === 'moving')) {
+        startLogisticsAnimation()
+      }
+    } catch (error) {
+      console.error('Error dispatching logistics truck:', error)
+      setLogisticsError('Kunne ikke sende trucken.')
+    }
+  }
+
+  const dispatchAllTrucks = async () => {
+    if (truckJobsRef.current.length === 0) return
+
+    try {
+      const res = await axios.post(`${API_BASE}/api/admin/logistics/dispatch-all`)
+      const nextJobs = Array.isArray(res.data?.jobs) ? res.data.jobs : []
+
+      truckJobsRef.current = nextJobs
+      setTruckJobs(nextJobs)
+      updateTruckMapSources(nextJobs)
+      setLogisticsStatus('Alle mock-trucker er sendt.')
+      if (nextJobs.some((job) => job.status === 'moving')) {
+        startLogisticsAnimation()
+      }
+    } catch (error) {
+      console.error('Error dispatching all logistics trucks:', error)
+      setLogisticsError('Kunne ikke sende alle truckene.')
+    }
+  }
+
+  const clearLogisticsPlan = () => {
+    ;(async () => {
+      try {
+        await axios.delete(`${API_BASE}/api/admin/logistics/plan`)
+        clearLogisticsAnimation()
+        truckJobsRef.current = []
+        setTruckJobs([])
+        truckRoutesGeoJsonRef.current = { type: 'FeatureCollection', features: [] }
+        truckPositionsGeoJsonRef.current = { type: 'FeatureCollection', features: [] }
+        setSelectedTruckId(null)
+        setLogisticsStatus('Forsyningsplan fjernet.')
+        if (map.current?.getSource('logistics-routes')) {
+          map.current.getSource('logistics-routes').setData(truckRoutesGeoJsonRef.current)
+        }
+        if (map.current?.getSource('logistics-trucks')) {
+          map.current.getSource('logistics-trucks').setData(truckPositionsGeoJsonRef.current)
+        }
+      } catch (error) {
+        console.error('Error clearing logistics plan:', error)
+        setLogisticsError('Kunne ikke tømme planen.')
+      }
+    })()
+  }
+
+  const focusTruckRoute = (job) => {
+    if (!job) return
+    setSelectedTruckId(job.id)
+
+    if (map.current && job.route?.geometry?.coordinates?.length) {
+      const bounds = new maplibregl.LngLatBounds()
+      job.route.geometry.coordinates.forEach(([lon, lat]) => bounds.extend([lon, lat]))
+      map.current.fitBounds(bounds, { padding: 80, duration: 600, maxZoom: 15 })
+    }
+  }
+
+  const selectedTruckJob = selectedTruckId ? truckJobs.find((job) => job.id === selectedTruckId) : null
 
   useEffect(() => {
     if (!mapContainer.current) return
@@ -258,6 +1095,14 @@ function AdminPage({ onBack }) {
       if (markerLiveCountInterval.current) {
         clearInterval(markerLiveCountInterval.current)
         markerLiveCountInterval.current = null
+      }
+      if (logisticsAnimationInterval.current) {
+        clearInterval(logisticsAnimationInterval.current)
+        logisticsAnimationInterval.current = null
+      }
+      if (logisticsRefreshInterval.current) {
+        clearInterval(logisticsRefreshInterval.current)
+        logisticsRefreshInterval.current = null
       }
       map.current?.remove()
     }
@@ -356,6 +1201,8 @@ function AdminPage({ onBack }) {
     setVisibility('safe-areas-layer', visibleLayers.safe_areas)
     setVisibility('safe-areas-live-count-layer', visibleLayers.safe_areas)
     setVisibility('live-users-layer', visibleLayers.live_users)
+    setVisibility('logistics-routes-food-layer', visibleLayers.logistics_food_routes)
+    setVisibility('logistics-routes-water-layer', visibleLayers.logistics_water_routes)
     setVisibility('radius-fill', visibleLayers.radius)
     setVisibility('radius-line', visibleLayers.radius)
 
@@ -708,10 +1555,18 @@ function AdminPage({ onBack }) {
     await loadStaticLayers()
     await loadCoverageAndRadius(radius)
     await loadLiveUsers()
+    await ensureLogisticsLayers()
+    await loadPersistedLogisticsPlan()
 
     if (!liveUsersInterval.current) {
       liveUsersInterval.current = setInterval(() => {
         loadLiveUsers()
+      }, 10000)
+    }
+
+    if (!logisticsRefreshInterval.current) {
+      logisticsRefreshInterval.current = setInterval(() => {
+        loadPersistedLogisticsPlan()
       }, 10000)
     }
 
@@ -927,6 +1782,9 @@ function AdminPage({ onBack }) {
       map.current.on('click', (e) => {
         const candidateLayers = [
           'shelters-layer',
+          'logistics-routes-food-layer',
+          'logistics-routes-water-layer',
+          'logistics-trucks-layer',
           'fire_stations-layer',
           'farms-layer',
           'water_sources-layer',
@@ -1001,6 +1859,28 @@ function AdminPage({ onBack }) {
       applyAdminLayerVisibility()
     }
   }, [visibleLayers])
+
+  useEffect(() => {
+    if (map.current?.isStyleLoaded() && logisticsLayersLoaded.current) {
+      updateTruckMapSources(truckJobs)
+    }
+  }, [truckJobs, selectedTruckId])
+
+  useEffect(() => {
+    if (!map.current?.isStyleLoaded()) return
+
+    const timer = setTimeout(() => {
+      buildLogisticsPlan()
+    }, 600)
+
+    return () => clearTimeout(timer)
+  }, [
+    logisticsSettings.foodUnitsPerPerson,
+    logisticsSettings.waterUnitsPerPerson,
+    logisticsSettings.foodTruckCapacity,
+    logisticsSettings.waterTruckCapacity,
+    logisticsSettings.routeMode,
+  ])
 
   const handleExportCSV = async () => {
     try {
@@ -1111,6 +1991,155 @@ function AdminPage({ onBack }) {
         </div>
 
         <div className="panel-section">
+          <h3>Forsyningslogistikk</h3>
+          <div className="logistics-grid">
+            <div className="form-group">
+              <label>Mat per person</label>
+              <input
+                type="number"
+                min="1"
+                step="1"
+                value={logisticsSettings.foodUnitsPerPerson}
+                onChange={(e) => setLogisticsSettings({ ...logisticsSettings, foodUnitsPerPerson: Number(e.target.value) || 1 })}
+              />
+            </div>
+            <div className="form-group">
+              <label>Vann per person</label>
+              <input
+                type="number"
+                min="1"
+                step="1"
+                value={logisticsSettings.waterUnitsPerPerson}
+                onChange={(e) => setLogisticsSettings({ ...logisticsSettings, waterUnitsPerPerson: Number(e.target.value) || 1 })}
+              />
+            </div>
+            <div className="form-group">
+              <label>Mattruck kapasitet</label>
+              <input
+                type="number"
+                min="1"
+                step="1"
+                value={logisticsSettings.foodTruckCapacity}
+                onChange={(e) => setLogisticsSettings({ ...logisticsSettings, foodTruckCapacity: Number(e.target.value) || 1 })}
+              />
+            </div>
+            <div className="form-group">
+              <label>Vanntank kapasitet</label>
+              <input
+                type="number"
+                min="1"
+                step="1"
+                value={logisticsSettings.waterTruckCapacity}
+                onChange={(e) => setLogisticsSettings({ ...logisticsSettings, waterTruckCapacity: Number(e.target.value) || 1 })}
+              />
+            </div>
+          </div>
+
+          <p className="location-info">{logisticsStatus}</p>
+          {logisticsError && <p className="logistics-error">{logisticsError}</p>}
+
+          <div className="button-group logistics-actions">
+            <button className="btn btn-secondary" onClick={dispatchAllTrucks} disabled={truckJobs.length === 0}>
+              Send alle
+            </button>
+            <button className="btn btn-secondary" onClick={clearLogisticsPlan} disabled={truckJobs.length === 0}>
+              Tøm plan
+            </button>
+          </div>
+
+          <p className="logistics-help">
+            Planen beregnes automatisk og fordeler mat fra nærmeste gårder og vann fra nærmeste vannkilder basert på
+            antall personer ved tilfluktsrom og trygge soner.
+          </p>
+        </div>
+
+        {selectedTruckJob && (
+          <div className="panel-section">
+            <h3>Valgt rute</h3>
+            <div className="truck-detail-card">
+              <div className="truck-detail-title">
+                {selectedTruckJob.resourceType === 'water' ? '💧 Water truck' : '🍞 Food truck'}
+              </div>
+              <div className="truck-detail-row">Fra: {selectedTruckJob.source?.name || '-'}</div>
+              <div className="truck-detail-row">Til: {selectedTruckJob.target?.name || '-'}</div>
+              <div className="truck-detail-row">Mengde: {selectedTruckJob.amount} units</div>
+              <div className="truck-detail-row">ETA: {selectedTruckJob.etaLabel || '—'}</div>
+              <div className="truck-detail-row">
+                Status: {selectedTruckJob.status === 'arrived' ? 'Ankommet' : selectedTruckJob.status === 'moving' ? 'På vei' : 'Klar til sending'}
+              </div>
+              <div className="truck-progress">
+                <div className="truck-progress-bar" style={{ width: `${Math.round((selectedTruckJob.progress || 0) * 100)}%` }} />
+              </div>
+              <div className="truck-detail-actions">
+                <button
+                  className="btn btn-primary"
+                  onClick={() => dispatchTruck(selectedTruckJob.id)}
+                  disabled={selectedTruckJob.status === 'moving' || selectedTruckJob.status === 'arrived'}
+                >
+                  {selectedTruckJob.status === 'moving' ? 'På vei' : selectedTruckJob.status === 'arrived' ? 'Fullført' : 'Send denne trucken'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {truckJobs.length > 0 && (
+          <div className="panel-section">
+            <h3>Truckruter</h3>
+            <div className="truck-route-list">
+              {truckJobs.map((job) => {
+                const isSelected = job.id === selectedTruckId
+                const isMoving = job.status === 'moving'
+                const isArrived = job.status === 'arrived'
+
+                return (
+                  <div
+                    key={job.id}
+                    className={`truck-route-card ${isSelected ? 'active' : ''}`}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => focusTruckRoute(job)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault()
+                        focusTruckRoute(job)
+                      }
+                    }}
+                  >
+                    <div className="truck-route-header">
+                      <span>{job.resourceType === 'water' ? '💧 Water' : '🍞 Food'}</span>
+                      <span>{job.etaLabel || '—'}</span>
+                    </div>
+                    <div className="truck-route-body">
+                      <div>Fra: {job.source?.name || '-'}</div>
+                      <div>Til: {job.target?.name || '-'}</div>
+                      <div>Mengde: {job.amount} units</div>
+                      <div>Status: {isArrived ? 'Ankommet' : isMoving ? 'På vei' : 'Klar'}</div>
+                    </div>
+                    <div className="truck-progress small">
+                      <div className="truck-progress-bar" style={{ width: `${Math.round((job.progress || 0) * 100)}%` }} />
+                    </div>
+                    <div className="truck-route-actions">
+                      <span className="truck-route-distance">{job.distanceKm || '—'} km</span>
+                      <button
+                        className="btn btn-secondary"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          dispatchTruck(job.id)
+                        }}
+                        disabled={isMoving || isArrived}
+                      >
+                        {isMoving ? 'Tracking' : isArrived ? 'Done' : 'Send'}
+                      </button>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
+        <div className="panel-section">
           <h3>Lag</h3>
           <label className="checkbox-label">
             <input
@@ -1207,6 +2236,22 @@ function AdminPage({ onBack }) {
               onChange={(e) => setVisibleLayers({ ...visibleLayers, live_users: e.target.checked })}
             />
             Live brukere
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={visibleLayers.logistics_food_routes}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, logistics_food_routes: e.target.checked })}
+            />
+            Mattruter
+          </label>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={visibleLayers.logistics_water_routes}
+              onChange={(e) => setVisibleLayers({ ...visibleLayers, logistics_water_routes: e.target.checked })}
+            />
+            Vannruter
           </label>
         </div>
       </div>

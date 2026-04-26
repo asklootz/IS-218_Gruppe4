@@ -9,6 +9,7 @@ const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const axios = require('axios');
+const crypto = require('crypto');
 const AdmZip = require('adm-zip');
 const xml2js = require('xml2js');
 const { v4: uuidv4 } = require('uuid');
@@ -31,6 +32,569 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
     Math.sin(dLon / 2) * Math.sin(dLon / 2);
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return R * c;
+}
+
+function toFiniteNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function logisticsJobKey(resourceType, targetType, targetId) {
+  return `${resourceType}:${targetType}:${targetId}`;
+}
+
+function clonePlanJobs(jobs = []) {
+  return jobs.map((job) => ({
+    ...job,
+    source: job.source ? { ...job.source } : job.source,
+    target: job.target ? { ...job.target } : job.target,
+    route: job.route ? { ...job.route, geometry: job.route.geometry ? { ...job.route.geometry } : job.route.geometry } : job.route
+  }));
+}
+
+function logisticsSnapshotHash(snapshot, settings) {
+  return crypto.createHash('sha1').update(JSON.stringify({ snapshot, settings })).digest('hex');
+}
+
+function interpolatePointAlongLine(coordinates, progress) {
+  if (!Array.isArray(coordinates) || coordinates.length === 0) return null;
+  if (coordinates.length === 1) return coordinates[0];
+
+  const clampedProgress = Math.min(1, Math.max(0, progress));
+  const segmentLengths = [];
+  let totalLength = 0;
+
+  for (let index = 0; index < coordinates.length - 1; index += 1) {
+    const start = coordinates[index];
+    const end = coordinates[index + 1];
+    const segmentLength = haversineMeters(start[1], start[0], end[1], end[0]);
+    segmentLengths.push(segmentLength);
+    totalLength += segmentLength;
+  }
+
+  if (totalLength <= 0) return coordinates[0];
+
+  const targetDistance = totalLength * clampedProgress;
+  let traversed = 0;
+
+  for (let index = 0; index < segmentLengths.length; index += 1) {
+    const start = coordinates[index];
+    const end = coordinates[index + 1];
+    const segmentLength = segmentLengths[index];
+
+    if (traversed + segmentLength >= targetDistance) {
+      const segmentProgress = segmentLength === 0 ? 0 : (targetDistance - traversed) / segmentLength;
+      return [
+        start[0] + (end[0] - start[0]) * segmentProgress,
+        start[1] + (end[1] - start[1]) * segmentProgress
+      ];
+    }
+
+    traversed += segmentLength;
+  }
+
+  return coordinates[coordinates.length - 1];
+}
+
+function getFeaturePoint(feature) {
+  const coordinates = feature?.geometry?.coordinates;
+  if (!Array.isArray(coordinates) || coordinates.length < 2) return null;
+  const lon = Number(coordinates[0]);
+  const lat = Number(coordinates[1]);
+  if (!Number.isFinite(lon) || !Number.isFinite(lat)) return null;
+  return { lon, lat };
+}
+
+function createLogisticsJobId() {
+  return uuidv4();
+}
+
+function buildTruckJobsFromDemand({ sinks, sources, resourceType, truckCapacity, settings }) {
+  const validSinks = (sinks || [])
+    .map((sink) => ({ ...sink, remainingDemand: toFiniteNumber(sink.remainingDemand, 0) }))
+    .filter((sink) => sink.remainingDemand > 0)
+    .sort((a, b) => b.remainingDemand - a.remainingDemand);
+
+  const validSources = (sources || [])
+    .map((source) => {
+      const point = getFeaturePoint(source);
+      if (point) {
+        return { ...source, lon: point.lon, lat: point.lat };
+      }
+
+      // Snapshot sources are plain objects ({ lon, lat }) rather than GeoJSON features.
+      const lon = toFiniteNumber(source?.lon, Number.NaN);
+      const lat = toFiniteNumber(source?.lat, Number.NaN);
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
+        return null;
+      }
+
+      return { ...source, lon, lat };
+    })
+    .filter(Boolean);
+
+  const sourceLoadCounts = new Map();
+  const jobs = [];
+
+  for (const sink of validSinks) {
+    let remainingDemand = sink.remainingDemand;
+
+    while (remainingDemand > 0 && validSources.length > 0) {
+      const loadAmount = Math.min(truckCapacity, remainingDemand);
+      let selectedSource = null;
+      let selectedScore = Number.POSITIVE_INFINITY;
+
+      for (const source of validSources) {
+        const sourceKey = String(source.id ?? source.name ?? `${source.lon},${source.lat}`);
+        const assignedLoads = sourceLoadCounts.get(sourceKey) || 0;
+        const distanceMeters = haversineMeters(source.lat, source.lon, sink.lat, sink.lon);
+        const score = distanceMeters + assignedLoads * 15000;
+
+        if (score < selectedScore) {
+          selectedScore = score;
+          selectedSource = source;
+        }
+      }
+
+      if (!selectedSource) break;
+
+      const sourceKey = String(selectedSource.id ?? selectedSource.name ?? `${selectedSource.lon},${selectedSource.lat}`);
+      sourceLoadCounts.set(sourceKey, (sourceLoadCounts.get(sourceKey) || 0) + 1);
+
+      jobs.push({
+        id: createLogisticsJobId(),
+        resourceType,
+        source: {
+          id: selectedSource.id,
+          name: selectedSource.name,
+          lon: selectedSource.lon,
+          lat: selectedSource.lat
+        },
+        target: {
+          id: sink.id,
+          name: sink.name,
+          kind: sink.kind,
+          lon: sink.lon,
+          lat: sink.lat,
+          live_users_count: sink.live_users_count
+        },
+        amount: loadAmount,
+        truckCapacity,
+        demand: sink.remainingDemand,
+        unitsPerPerson: settings[resourceType === 'water' ? 'waterUnitsPerPerson' : 'foodUnitsPerPerson'],
+        sourceScore: Math.round(selectedScore),
+        status: 'planned',
+        progress: 0,
+        startedAt: null,
+        completedAt: null,
+        route: null,
+        currentPosition: [selectedSource.lon, selectedSource.lat]
+      });
+
+      remainingDemand -= loadAmount;
+    }
+  }
+
+  return jobs;
+}
+
+function assignLiveUsersToNearestSinks(liveUsers, sinks) {
+  const sinkCounts = new Map();
+
+  for (const user of liveUsers || []) {
+    const userLon = toFiniteNumber(user.lon, Number.NaN);
+    const userLat = toFiniteNumber(user.lat, Number.NaN);
+
+    if (!Number.isFinite(userLon) || !Number.isFinite(userLat)) {
+      continue;
+    }
+
+    let nearestSink = null;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+
+    for (const sink of sinks || []) {
+      const sinkLon = toFiniteNumber(sink.lon, Number.NaN);
+      const sinkLat = toFiniteNumber(sink.lat, Number.NaN);
+
+      if (!Number.isFinite(sinkLon) || !Number.isFinite(sinkLat)) {
+        continue;
+      }
+
+      const distanceMeters = haversineMeters(userLat, userLon, sinkLat, sinkLon);
+
+      if (distanceMeters < nearestDistance) {
+        nearestDistance = distanceMeters;
+        nearestSink = sink;
+      }
+    }
+
+    if (!nearestSink) {
+      continue;
+    }
+
+    const sinkKey = logisticsJobKey('nearest', nearestSink.kind || 'sink', nearestSink.id);
+    sinkCounts.set(sinkKey, (sinkCounts.get(sinkKey) || 0) + 1);
+  }
+
+  return sinkCounts;
+}
+
+async function computeRouteBetweenPoints({ originLon, originLat, destLon, destLat, mode = 'walk' }) {
+  const profile = mode === 'car' ? 'driving' : mode === 'bike' ? 'bike' : 'foot';
+  const osrmUrl = `https://router.project-osrm.org/route/v1/${profile}/${originLon},${originLat};${destLon},${destLat}?overview=full&geometries=geojson&steps=true`;
+
+  try {
+    const response = await axios.get(osrmUrl, { timeout: 15000 });
+    const route = response.data?.routes?.[0];
+    if (!route || !route.geometry?.coordinates) throw new Error('No route from OSRM');
+
+    const steps = (route.legs || [])
+      .flatMap((leg) => leg.steps || [])
+      .slice(0, 12)
+      .map((step) => ({
+        distance_m: Math.round(step.distance || 0),
+        duration_s: Math.round(step.duration || 0),
+        instruction: step.name || step.maneuver?.instruction || 'Fortsett'
+      }));
+
+    return {
+      mode,
+      source: 'osrm',
+      distance_m: Math.round(route.distance || 0),
+      duration_s: Math.round(route.duration || 0),
+      geometry: {
+        type: 'LineString',
+        coordinates: route.geometry.coordinates
+      },
+      steps
+    };
+  } catch (proxyError) {
+    const distance = haversineMeters(originLat, originLon, destLat, destLon);
+    const speedKmh = mode === 'car' ? 60 : mode === 'bike' ? 20 : 5;
+    const durationS = Math.round((distance / 1000) / speedKmh * 3600);
+
+    return {
+      mode,
+      source: 'fallback-straight-line',
+      distance_m: Math.round(distance),
+      duration_s: durationS,
+      geometry: {
+        type: 'LineString',
+        coordinates: [[originLon, originLat], [destLon, destLat]]
+      },
+      steps: [
+        { distance_m: Math.round(distance), duration_s: durationS, instruction: 'Gå mot valgt mål' }
+      ]
+    };
+  }
+}
+
+async function ensureLogisticsStateTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.mock_logistics_state (
+      id INT PRIMARY KEY DEFAULT 1,
+      plan JSONB NOT NULL DEFAULT '{}'::jsonb,
+      snapshot_key TEXT,
+      settings JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await pool.query(`
+    INSERT INTO public.mock_logistics_state (id, plan, snapshot_key, settings)
+    VALUES (1, '{}'::jsonb, NULL, '{}'::jsonb)
+    ON CONFLICT (id) DO NOTHING
+  `);
+}
+
+async function readLogisticsState() {
+  await ensureLogisticsStateTable();
+  const result = await pool.query(`
+    SELECT id, plan, snapshot_key, settings, updated_at
+    FROM public.mock_logistics_state
+    WHERE id = 1
+  `);
+
+  return result.rows[0] || {
+    id: 1,
+    plan: { jobs: [] },
+    snapshot_key: null,
+    settings: {},
+    updated_at: null
+  };
+}
+
+async function saveLogisticsState({ plan, snapshotKey, settings }) {
+  await ensureLogisticsStateTable();
+  await pool.query(`
+    UPDATE public.mock_logistics_state
+    SET plan = $1::jsonb,
+        snapshot_key = $2,
+        settings = $3::jsonb,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = 1
+  `, [JSON.stringify(plan), snapshotKey, JSON.stringify(settings)]);
+}
+
+async function fetchLogisticsSnapshot() {
+  const { latestUsersCte } = await buildLatestUsersSubquery();
+
+  const [shelterResult, safeAreaExistsResult, farmResult, waterResult, liveUsersResult] = await Promise.all([
+    pool.query(`
+      ${latestUsersCte}
+      SELECT
+        s.id,
+        s.shelter_id,
+        s.name,
+        ST_X(s.location) AS lon,
+        ST_Y(s.location) AS lat,
+        COUNT(lu.user_id)::int AS live_users_count
+      FROM tilfluktsromoffentlige.tilfluktsrom s
+      LEFT JOIN latest lu ON ST_DWithin(lu.location::geography, s.location::geography, 150)
+      GROUP BY s.id, s.shelter_id, s.name, s.location
+      ORDER BY s.id
+    `),
+    pool.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = 'safe_areas'
+      ) AS exists
+    `),
+    pool.query(`
+      SELECT id, name, ST_X(location) AS lon, ST_Y(location) AS lat
+      FROM overture.farms
+      ORDER BY id
+    `),
+    pool.query(`
+      SELECT id, name, ST_X(location) AS lon, ST_Y(location) AS lat
+      FROM overture.water_sources
+      ORDER BY id
+    `),
+    pool.query(`
+      ${latestUsersCte}
+      SELECT
+        user_id,
+        ST_X(location) AS lon,
+        ST_Y(location) AS lat
+      FROM latest
+    `)
+  ]);
+
+  let safeAreaRows = [];
+  if (safeAreaExistsResult.rows[0]?.exists) {
+    const safeAreaResult = await pool.query(`
+      ${latestUsersCte}
+      SELECT
+        sa.id,
+        sa.name,
+        ST_X(sa.location) AS lon,
+        ST_Y(sa.location) AS lat,
+        COUNT(lu.user_id)::int AS live_users_count
+      FROM public.safe_areas sa
+      LEFT JOIN latest lu ON ST_DWithin(lu.location::geography, sa.location::geography, 150)
+      GROUP BY sa.id, sa.name, sa.location
+      ORDER BY sa.id
+    `);
+    safeAreaRows = safeAreaResult.rows || [];
+  }
+
+  const sinks = [
+    ...(shelterResult.rows || []).map((row) => ({
+      id: Number(row.id),
+      name: row.name,
+      kind: 'shelter',
+      lon: Number(row.lon),
+      lat: Number(row.lat),
+      live_users_count: Number(row.live_users_count || 0)
+    })),
+    ...(safeAreaRows.map((row) => ({
+      id: Number(row.id),
+      name: row.name,
+      kind: 'safe_area',
+      lon: Number(row.lon),
+      lat: Number(row.lat),
+      live_users_count: Number(row.live_users_count || 0)
+    })))
+  ];
+
+  const foodSources = (farmResult.rows || []).map((row) => ({
+    id: String(row.id),
+    name: row.name,
+    lon: Number(row.lon),
+    lat: Number(row.lat)
+  }));
+
+  const waterSources = (waterResult.rows || []).map((row) => ({
+    id: String(row.id),
+    name: row.name,
+    lon: Number(row.lon),
+    lat: Number(row.lat)
+  }));
+
+  const liveUsers = (liveUsersResult.rows || []).map((row) => ({
+    user_id: String(row.user_id),
+    lon: Number(row.lon),
+    lat: Number(row.lat)
+  }));
+
+  return {
+    sinks,
+    foodSources,
+    waterSources,
+    liveUsers
+  };
+}
+
+async function buildOrRefreshLogisticsPlan(settingsOverride = {}) {
+  const storedState = await readLogisticsState();
+  const settings = {
+    foodUnitsPerPerson: 1,
+    waterUnitsPerPerson: 2,
+    foodTruckCapacity: 120,
+    waterTruckCapacity: 200,
+    routeMode: 'car',
+    ...(storedState.settings || {}),
+    ...settingsOverride
+  };
+
+  const snapshot = await fetchLogisticsSnapshot();
+  const snapshotKey = logisticsSnapshotHash(snapshot, settings);
+
+  if (storedState.snapshot_key === snapshotKey && Array.isArray(storedState.plan?.jobs)) {
+    return {
+      plan: storedState.plan,
+      snapshotKey,
+      settings
+    };
+  }
+
+  const existingJobs = Array.isArray(storedState.plan?.jobs) ? clonePlanJobs(storedState.plan.jobs) : [];
+  const fixedJobs = existingJobs.filter((job) => ['moving', 'arrived'].includes(job.status));
+  const committedByKey = new Map();
+
+  for (const job of fixedJobs) {
+    const key = logisticsJobKey(job.resourceType, job.target?.kind || 'sink', job.target?.id);
+    committedByKey.set(key, (committedByKey.get(key) || 0) + toFiniteNumber(job.amount, 0));
+  }
+
+  const nearestSinkCounts = assignLiveUsersToNearestSinks(snapshot.liveUsers, snapshot.sinks);
+
+  const sinksForFood = snapshot.sinks.map((sink) => {
+    const nearestCount = nearestSinkCounts.get(logisticsJobKey('nearest', sink.kind, sink.id)) || 0;
+    const key = logisticsJobKey('food', sink.kind, sink.id);
+    const demand = Math.max(0, Math.round(toFiniteNumber(nearestCount, 0) * toFiniteNumber(settings.foodUnitsPerPerson, 1)));
+    const remainingDemand = Math.max(0, demand - (committedByKey.get(key) || 0));
+    return { ...sink, remainingDemand };
+  });
+
+  const sinksForWater = snapshot.sinks.map((sink) => {
+    const nearestCount = nearestSinkCounts.get(logisticsJobKey('nearest', sink.kind, sink.id)) || 0;
+    const key = logisticsJobKey('water', sink.kind, sink.id);
+    const demand = Math.max(0, Math.round(toFiniteNumber(nearestCount, 0) * toFiniteNumber(settings.waterUnitsPerPerson, 2)));
+    const remainingDemand = Math.max(0, demand - (committedByKey.get(key) || 0));
+    return { ...sink, remainingDemand };
+  });
+
+  const foodJobs = buildTruckJobsFromDemand({
+    sinks: sinksForFood,
+    sources: snapshot.foodSources,
+    resourceType: 'food',
+    truckCapacity: toFiniteNumber(settings.foodTruckCapacity, 120),
+    settings
+  });
+
+  const waterJobs = buildTruckJobsFromDemand({
+    sinks: sinksForWater,
+    sources: snapshot.waterSources,
+    resourceType: 'water',
+    truckCapacity: toFiniteNumber(settings.waterTruckCapacity, 200),
+    settings
+  });
+
+  const jobsToEnrich = [...fixedJobs, ...foodJobs, ...waterJobs];
+  const enrichedJobs = await Promise.all(jobsToEnrich.map(async (job) => {
+    if (job.route?.geometry?.coordinates?.length && job.status !== 'planned') {
+      return job;
+    }
+    const route = await computeRouteBetweenPoints({
+      originLon: job.source.lon,
+      originLat: job.source.lat,
+      destLon: job.target.lon,
+      destLat: job.target.lat,
+      mode: settings.routeMode
+    });
+    return {
+      ...job,
+      route,
+      etaMinutes: Math.max(1, Math.round(Number(route.duration_s || 0) / 60)),
+      distanceKm: (Number(route.distance_m || 0) / 1000).toFixed(2),
+      etaLabel: `${Math.max(1, Math.round(Number(route.duration_s || 0) / 60))} min`,
+      currentPosition: job.currentPosition || [job.source.lon, job.source.lat]
+    };
+  }));
+
+  const plan = {
+    version: snapshotKey,
+    generated_at: new Date().toISOString(),
+    settings,
+    jobs: enrichedJobs
+  };
+
+  await saveLogisticsState({ plan, snapshotKey, settings });
+
+  return { plan, snapshotKey, settings };
+}
+
+async function updateLogisticsTruck(truckId, update) {
+  const state = await readLogisticsState();
+  const jobs = Array.isArray(state.plan?.jobs) ? clonePlanJobs(state.plan.jobs) : [];
+  const nextJobs = jobs.map((job) => {
+    if (job.id !== truckId) return job;
+    return {
+      ...job,
+      ...update,
+      source: update.source ? { ...update.source } : job.source,
+      target: update.target ? { ...update.target } : job.target,
+      route: update.route ? { ...update.route, geometry: update.route.geometry ? { ...update.route.geometry } : update.route.geometry } : job.route
+    };
+  });
+
+  const plan = {
+    ...(state.plan || {}),
+    updated_at: new Date().toISOString(),
+    jobs: nextJobs
+  };
+
+  await saveLogisticsState({
+    plan,
+    snapshotKey: state.snapshot_key,
+    settings: state.settings || {}
+  });
+
+  return plan;
+}
+
+let logisticsRefreshInFlight = false;
+let logisticsRefreshQueued = false;
+
+async function queueLogisticsRefresh(reason = 'mutation') {
+  if (logisticsRefreshInFlight) {
+    logisticsRefreshQueued = true;
+    return;
+  }
+
+  logisticsRefreshInFlight = true;
+  try {
+    do {
+      logisticsRefreshQueued = false;
+      await buildOrRefreshLogisticsPlan();
+    } while (logisticsRefreshQueued);
+  } catch (error) {
+    console.warn(`Automatic logistics refresh failed (${reason}):`, error.message);
+  } finally {
+    logisticsRefreshInFlight = false;
+  }
 }
 
 // Database configuration
@@ -1232,6 +1796,8 @@ async function initSchema() {
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_user_locations_user_id ON public.user_locations(user_id)
     `);
+
+    await ensureLogisticsStateTable();
     
     console.log('✓ Database schema initialized');
   } catch (error) {
@@ -1720,6 +2286,13 @@ async function bootstrap() {
   } catch (error) {
     console.error('Municipalities cache failed:', error.message);
   }
+
+  try {
+    await buildOrRefreshLogisticsPlan();
+    console.log('✓ Logistics plan initialized at startup');
+  } catch (error) {
+    console.warn('Startup logistics plan initialization failed:', error.message);
+  }
   
   console.log('✓ Bootstrap complete');
 }
@@ -2039,55 +2612,169 @@ app.get('/api/routing/route', async (req, res) => {
     if (![originLon, originLat, destLon, destLat].every(Number.isFinite)) {
       return res.status(400).json({ error: 'Missing or invalid coordinates' });
     }
-
-    const profile = mode === 'car' ? 'driving' : mode === 'bike' ? 'bike' : 'foot';
-    const osrmUrl = `https://router.project-osrm.org/route/v1/${profile}/${originLon},${originLat};${destLon},${destLat}?overview=full&geometries=geojson&steps=true`;
-
-    try {
-      const response = await axios.get(osrmUrl, { timeout: 15000 });
-      const route = response.data?.routes?.[0];
-      if (!route || !route.geometry?.coordinates) throw new Error('No route from OSRM');
-
-      const steps = (route.legs || [])
-        .flatMap((leg) => leg.steps || [])
-        .slice(0, 12)
-        .map((step) => ({
-          distance_m: Math.round(step.distance || 0),
-          duration_s: Math.round(step.duration || 0),
-          instruction: step.name || step.maneuver?.instruction || 'Fortsett'
-        }));
-
-      return res.json({
-        mode,
-        source: 'osrm',
-        distance_m: Math.round(route.distance || 0),
-        duration_s: Math.round(route.duration || 0),
-        geometry: {
-          type: 'LineString',
-          coordinates: route.geometry.coordinates
-        },
-        steps
-      });
-    } catch (proxyError) {
-      const distance = haversineMeters(originLat, originLon, destLat, destLon);
-      const speedKmh = mode === 'car' ? 60 : mode === 'bike' ? 20 : 5;
-      const durationS = Math.round((distance / 1000) / speedKmh * 3600);
-
-      return res.json({
-        mode,
-        source: 'fallback-straight-line',
-        distance_m: Math.round(distance),
-        duration_s: durationS,
-        geometry: {
-          type: 'LineString',
-          coordinates: [[originLon, originLat], [destLon, destLat]]
-        },
-        steps: [
-          { distance_m: Math.round(distance), duration_s: durationS, instruction: 'Gå mot valgt tilfluktsrom' }
-        ]
-      });
-    }
+    const route = await computeRouteBetweenPoints({ originLon, originLat, destLon, destLat, mode });
+    res.json(route);
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/logistics/plan', async (req, res) => {
+  try {
+    const state = await readLogisticsState();
+    const snapshot = await buildOrRefreshLogisticsPlan(state.settings || {});
+    res.json(snapshot.plan);
+  } catch (error) {
+    console.error('Error loading logistics plan:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/logistics/plan', async (req, res) => {
+  try {
+    const settings = req.body?.settings || req.body || {};
+    const snapshot = await buildOrRefreshLogisticsPlan(settings);
+    res.json(snapshot.plan);
+  } catch (error) {
+    console.error('Error building logistics plan:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/admin/logistics/plan', async (req, res) => {
+  try {
+    await ensureLogisticsStateTable();
+    await pool.query(`
+      UPDATE public.mock_logistics_state
+      SET plan = '{}'::jsonb,
+          snapshot_key = NULL,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+    `);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error clearing logistics plan:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/logistics/dispatch-all', async (req, res) => {
+  try {
+    const state = await readLogisticsState();
+    const jobs = Array.isArray(state.plan?.jobs) ? clonePlanJobs(state.plan.jobs) : [];
+    const startedAt = Date.now();
+    const nextJobs = jobs.map((job) => {
+      if (job.status === 'arrived' || job.status === 'moving') return job;
+      return {
+        ...job,
+        status: 'moving',
+        startedAt,
+        completedAt: null,
+        progress: 0,
+        currentPosition: [job.source?.lon, job.source?.lat]
+      };
+    });
+
+    const plan = {
+      ...(state.plan || {}),
+      jobs: nextJobs,
+      updated_at: new Date().toISOString()
+    };
+
+    await saveLogisticsState({
+      plan,
+      snapshotKey: state.snapshot_key,
+      settings: state.settings || {}
+    });
+
+    res.json(plan);
+  } catch (error) {
+    console.error('Error dispatching all logistics trucks:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/logistics/trucks/:truckId/dispatch', async (req, res) => {
+  try {
+    const { truckId } = req.params;
+    const state = await readLogisticsState();
+    const jobs = Array.isArray(state.plan?.jobs) ? clonePlanJobs(state.plan.jobs) : [];
+    const currentJob = jobs.find((job) => job.id === truckId);
+
+    if (!currentJob) {
+      return res.status(404).json({ error: 'Truck not found' });
+    }
+
+    if (currentJob.status === 'moving' || currentJob.status === 'arrived') {
+      return res.json(state.plan);
+    }
+
+    const plan = {
+      ...(state.plan || {}),
+      updated_at: new Date().toISOString(),
+      jobs: jobs.map((job) => {
+        if (job.id !== truckId) return job;
+        return {
+          ...job,
+          status: 'moving',
+          startedAt: Date.now(),
+          completedAt: null,
+          progress: 0,
+          currentPosition: [job.source?.lon, job.source?.lat]
+        };
+      })
+    };
+
+    await saveLogisticsState({
+      plan,
+      snapshotKey: state.snapshot_key,
+      settings: state.settings || {}
+    });
+
+    res.json(plan);
+  } catch (error) {
+    console.error('Error dispatching logistics truck:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.patch('/api/admin/logistics/trucks/:truckId', async (req, res) => {
+  try {
+    const { truckId } = req.params;
+    const { status, startedAt, completedAt } = req.body || {};
+    const state = await readLogisticsState();
+    const jobs = Array.isArray(state.plan?.jobs) ? clonePlanJobs(state.plan.jobs) : [];
+    const currentJob = jobs.find((job) => job.id === truckId);
+
+    if (!currentJob) {
+      return res.status(404).json({ error: 'Truck not found' });
+    }
+
+    const plan = {
+      ...(state.plan || {}),
+      updated_at: new Date().toISOString(),
+      jobs: jobs.map((job) => {
+        if (job.id !== truckId) return job;
+        return {
+          ...job,
+          status: status || job.status,
+          startedAt: startedAt || job.startedAt || null,
+          completedAt: completedAt || job.completedAt || null,
+          currentPosition: req.body?.currentPosition || job.currentPosition || [job.source?.lon, job.source?.lat],
+          progress: Number.isFinite(Number(req.body?.progress)) ? Number(req.body.progress) : job.progress || 0
+        };
+      })
+    };
+
+    await saveLogisticsState({
+      plan,
+      snapshotKey: state.snapshot_key,
+      settings: state.settings || {}
+    });
+
+    res.json(plan);
+  } catch (error) {
+    console.error('Error updating logistics truck:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -2118,6 +2805,8 @@ app.post('/api/users/:userId/location', async (req, res) => {
       INSERT INTO public.user_locations (user_id, location)
       VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 4326))
     `, [userId, lonNum, latNum]);
+
+    queueLogisticsRefresh('user-location');
     
     res.json({ ok: true });
   } catch (error) {
@@ -2147,6 +2836,8 @@ app.delete('/api/admin/mock-users', async (req, res) => {
       DELETE FROM public.app_users
       WHERE id = ANY($1::uuid[])
     `, [ids]);
+
+    queueLogisticsRefresh('mock-users-cleared');
 
     res.json({ ok: true, deleted: ids.length });
   } catch (error) {
@@ -2419,6 +3110,8 @@ app.post('/api/admin/safe-areas', async (req, res) => {
       VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 4326), $4)
       RETURNING id, name, ST_X(location) as lon, ST_Y(location) as lat, capacity, created_at
     `, [name, parseFloat(lon), parseFloat(lat), parseInt(capacity) || 0]);
+
+    queueLogisticsRefresh('safe-area-created');
     
     res.json(result.rows[0]);
   } catch (error) {
@@ -2504,6 +3197,8 @@ app.delete('/api/admin/safe-areas/:id', async (req, res) => {
     `);
     
     await pool.query('DELETE FROM public.safe_areas WHERE id = $1', [id]);
+
+    queueLogisticsRefresh('safe-area-deleted');
     
     res.json({ ok: true });
   } catch (error) {
