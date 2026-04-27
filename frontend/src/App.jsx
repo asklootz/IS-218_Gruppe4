@@ -23,6 +23,7 @@ const OSM_RASTER_STYLE = {
     osm: {
       type: 'raster',
       tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+      maxzoom: 19,
       tileSize: 256,
       attribution: '© OpenStreetMap contributors'
     }
@@ -157,6 +158,15 @@ const DEFAULT_LOGISTICS_SETTINGS = {
 function toFiniteNumber(value, fallback = 0) {
   const numberValue = Number(value)
   return Number.isFinite(numberValue) ? numberValue : fallback
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
 }
 
 function getPointCoordinate(feature) {
@@ -460,8 +470,14 @@ function AdminPage({ onBack }) {
   const adminPopupBound = useRef(false)
   const liveUsersInterval = useRef(null)
   const markerLiveCountInterval = useRef(null)
+  const helpRequestsInterval = useRef(null)
+  const helpRequestPulseInterval = useRef(null)
   const sheltersGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
   const safeAreasGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
+  const helpRequestsGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
+  const helpRequestDetailsByIdRef = useRef(new Map())
+  const helpRequestMarkersRef = useRef(new Map())
+  const lastHelpRequestCountRef = useRef(0)
   const truckRoutesGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
   const truckPositionsGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
   const logisticsAnimationInterval = useRef(null)
@@ -1141,7 +1157,8 @@ function AdminPage({ onBack }) {
       container: mapContainer.current,
       style: OSM_RASTER_STYLE,
       center: [8.0000, 58.1467],
-      zoom: 10
+      zoom: 10,
+      maxZoom: 19
     })
 
     map.current.on('load', () => initializeAdminMap())
@@ -1163,6 +1180,18 @@ function AdminPage({ onBack }) {
         clearInterval(logisticsRefreshInterval.current)
         logisticsRefreshInterval.current = null
       }
+      if (helpRequestsInterval.current) {
+        clearInterval(helpRequestsInterval.current)
+        helpRequestsInterval.current = null
+      }
+      if (helpRequestPulseInterval.current) {
+        clearInterval(helpRequestPulseInterval.current)
+        helpRequestPulseInterval.current = null
+      }
+      for (const marker of helpRequestMarkersRef.current.values()) {
+        marker.remove()
+      }
+      helpRequestMarkersRef.current.clear()
       map.current?.remove()
     }
   }, [])
@@ -1260,6 +1289,9 @@ function AdminPage({ onBack }) {
     setVisibility('safe-areas-layer', visibleLayers.safe_areas)
     setVisibility('safe-areas-live-count-layer', visibleLayers.safe_areas)
     setVisibility('live-users-layer', visibleLayers.live_users)
+    setVisibility('help-requests-glow-layer', true)
+    setVisibility('help-requests-core-layer', true)
+    setVisibility('help-requests-label-layer', true)
     setVisibility('logistics-routes-food-layer', visibleLayers.logistics_food_routes)
     setVisibility('logistics-routes-water-layer', visibleLayers.logistics_water_routes)
     setVisibility('radius-fill', visibleLayers.radius)
@@ -1273,6 +1305,17 @@ function AdminPage({ onBack }) {
     }
     if (map.current.getLayer('municipalities-line') && map.current.getLayer('radius-line')) {
       map.current.moveLayer('municipalities-line', 'radius-line')
+    }
+
+    // Keep emergency markers above all other overlays so they remain visible.
+    if (map.current.getLayer('help-requests-glow-layer')) {
+      map.current.moveLayer('help-requests-glow-layer')
+    }
+    if (map.current.getLayer('help-requests-core-layer')) {
+      map.current.moveLayer('help-requests-core-layer')
+    }
+    if (map.current.getLayer('help-requests-label-layer')) {
+      map.current.moveLayer('help-requests-label-layer')
     }
   }
 
@@ -1610,10 +1653,289 @@ function AdminPage({ onBack }) {
     }
   }
 
+  const startHelpRequestPulseAnimation = () => {
+    if (!map.current || helpRequestPulseInterval.current) return
+
+    const tick = () => {
+      if (!map.current || !map.current.getLayer('help-requests-glow-layer')) return
+
+      const t = Date.now() / 1000
+      const pulse = (Math.sin(t * 3.2) + 1) / 2
+      const glowRadius = 16 + pulse * 14
+      const glowOpacity = 0.18 + pulse * 0.24
+      const coreRadius = 6 + pulse * 2.2
+
+      map.current.setPaintProperty('help-requests-glow-layer', 'circle-radius', glowRadius)
+      map.current.setPaintProperty('help-requests-glow-layer', 'circle-opacity', glowOpacity)
+      if (map.current.getLayer('help-requests-core-layer')) {
+        map.current.setPaintProperty('help-requests-core-layer', 'circle-radius', coreRadius)
+      }
+    }
+
+    tick()
+    helpRequestPulseInterval.current = setInterval(tick, 120)
+  }
+
+  const showHelpRequestPopup = (featureProperties, lngLat) => {
+    if (!map.current || !featureProperties) return
+
+    const requestId = Number(featureProperties.id)
+    const p = Number.isFinite(requestId)
+      ? (helpRequestDetailsByIdRef.current.get(requestId) || featureProperties)
+      : featureProperties
+
+    const textMessage = String(p.text_message || '')
+    const voiceTranscript = String(p.voice_transcript || '')
+    const readableMessage = voiceTranscript || textMessage || 'Ingen tekst mottatt'
+    const requestedUnit = p.requested_unit ? String(p.requested_unit) : 'Ikke spesifisert'
+    const createdAt = p.created_at ? new Date(p.created_at).toLocaleString() : '-'
+    const escapedReadableMessage = escapeHtml(readableMessage)
+    const escapedRequestedUnit = escapeHtml(requestedUnit)
+    const escapedUserId = escapeHtml(String(p.user_id || '-'))
+    const audioMarkup = p.audio_data_url
+      ? `<audio controls preload="none" style="width:100%;margin-top:8px;"><source src="${String(p.audio_data_url)}"/></audio>`
+      : '<div style="margin-top:8px;color:#6b7280;">Ingen talemelding lagt ved.</div>'
+
+    const html = `
+      <div style="font-size:12px;line-height:1.45;min-width:260px;">
+        <strong>🚨 Nødanrop fra bruker</strong><br/>
+        Bruker-ID: ${escapedUserId}<br/>
+        Tidspunkt: ${escapeHtml(createdAt)}<br/>
+        Ønsket enhet: ${escapedRequestedUnit}<br/>
+        <div style="margin-top:8px;padding:8px;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;white-space:pre-wrap;">${escapedReadableMessage}</div>
+        ${audioMarkup}
+        <button id="speak-help-message" style="margin-top:8px;padding:6px 8px;background:#0ea5e9;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;">🔊 Les opp melding</button>
+        <button id="dispatch-ambulance" style="margin-top:8px;padding:6px 8px;background:#2563eb;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;">Send ambulanse</button>
+        <button id="dispatch-firetruck" style="margin-top:8px;padding:6px 8px;background:#dc2626;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;">Send brannbil</button>
+      </div>
+    `
+
+    const popup = new maplibregl.Popup({ closeButton: true })
+      .setLngLat(lngLat)
+      .setHTML(html)
+      .addTo(map.current)
+
+    const popupElement = popup.getElement()
+    const speakBtn = popupElement?.querySelector('#speak-help-message')
+    const ambulanceBtn = popupElement?.querySelector('#dispatch-ambulance')
+    const firetruckBtn = popupElement?.querySelector('#dispatch-firetruck')
+
+    if (speakBtn) {
+      speakBtn.addEventListener('click', () => {
+        const textToRead = readableMessage.trim()
+        if (!textToRead || !window.speechSynthesis) return
+        window.speechSynthesis.cancel()
+        const utterance = new SpeechSynthesisUtterance(textToRead)
+        utterance.lang = 'nb-NO'
+        window.speechSynthesis.speak(utterance)
+      })
+    }
+
+    const dispatchUnit = async (unitType) => {
+      if (!Number.isFinite(requestId)) return
+      try {
+        await axios.patch(`${API_BASE}/api/admin/help-requests/${requestId}/dispatch`, { unitType })
+        popup.remove()
+        await loadHelpRequests()
+      } catch (error) {
+        console.error(`Error dispatching ${unitType}:`, error)
+        alert('Kunne ikke sende enhet for nødanropet.')
+      }
+    }
+
+    if (ambulanceBtn) {
+      ambulanceBtn.addEventListener('click', () => dispatchUnit('ambulance'))
+    }
+    if (firetruckBtn) {
+      firetruckBtn.addEventListener('click', () => dispatchUnit('firetruck'))
+    }
+  }
+
+  const syncHelpRequestDomMarkers = (features = []) => {
+    if (!map.current) return
+
+    const existingMarkers = helpRequestMarkersRef.current
+    const nextIds = new Set()
+
+    for (const feature of features) {
+      const id = Number(feature?.properties?.id)
+      const coords = feature?.geometry?.coordinates
+      if (!Number.isFinite(id) || !Array.isArray(coords) || coords.length < 2) continue
+
+      const lon = Number(coords[0])
+      const lat = Number(coords[1])
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue
+
+      nextIds.add(id)
+      const existingMarker = existingMarkers.get(id)
+      if (existingMarker) {
+        existingMarker.setLngLat([lon, lat])
+        continue
+      }
+
+      const markerElement = document.createElement('button')
+      markerElement.className = 'help-request-dom-marker'
+      markerElement.type = 'button'
+      markerElement.setAttribute('aria-label', 'SOS nødanrop')
+      markerElement.innerHTML = '<span class="help-request-dom-marker__label">!</span>'
+
+      markerElement.addEventListener('click', (event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        const details = helpRequestDetailsByIdRef.current.get(id) || feature.properties || {}
+        showHelpRequestPopup(details, [lon, lat])
+      })
+
+      const marker = new maplibregl.Marker({ element: markerElement, anchor: 'center' })
+        .setLngLat([lon, lat])
+        .addTo(map.current)
+
+      existingMarkers.set(id, marker)
+    }
+
+    for (const [id, marker] of existingMarkers.entries()) {
+      if (!nextIds.has(id)) {
+        marker.remove()
+        existingMarkers.delete(id)
+      }
+    }
+  }
+
+  const loadHelpRequests = async () => {
+    if (!map.current) return
+
+    try {
+      const res = await axios.get(`${API_BASE}/api/admin/help-requests`, {
+        params: { status: 'open' }
+      })
+      const rawFc = res.data?.type === 'FeatureCollection'
+        ? res.data
+        : { type: 'FeatureCollection', features: [] }
+
+      const rawFeatures = Array.isArray(rawFc.features) ? rawFc.features : []
+      const detailsById = new Map()
+      const mapFeatures = rawFeatures.map((feature) => {
+        const props = feature?.properties || {}
+        const id = Number(props.id)
+        if (Number.isFinite(id)) {
+          detailsById.set(id, props)
+        }
+
+        return {
+          type: 'Feature',
+          geometry: feature?.geometry,
+          properties: {
+            id: props.id,
+            user_id: props.user_id,
+            text_message: props.text_message,
+            voice_transcript: props.voice_transcript,
+            requested_unit: props.requested_unit,
+            dispatched_unit: props.dispatched_unit,
+            status: props.status,
+            created_at: props.created_at,
+            handled_at: props.handled_at,
+            has_audio: Boolean(props.audio_data_url),
+          }
+        }
+      })
+
+      const fc = {
+        type: 'FeatureCollection',
+        features: mapFeatures,
+      }
+
+      helpRequestsGeoJsonRef.current = fc
+      helpRequestDetailsByIdRef.current = detailsById
+      syncHelpRequestDomMarkers(mapFeatures)
+
+      if (!map.current.getSource('help-requests')) {
+        map.current.addSource('help-requests', { type: 'geojson', data: fc })
+        map.current.addLayer({
+          id: 'help-requests-glow-layer',
+          type: 'circle',
+          source: 'help-requests',
+          paint: {
+            'circle-radius': 20,
+            'circle-color': '#ef4444',
+            'circle-opacity': 0.25,
+            'circle-blur': 0.95
+          }
+        })
+        map.current.addLayer({
+          id: 'help-requests-core-layer',
+          type: 'circle',
+          source: 'help-requests',
+          paint: {
+            'circle-radius': 7,
+            'circle-color': '#dc2626',
+            'circle-stroke-width': 2,
+            'circle-stroke-color': '#ffffff'
+          }
+        })
+        map.current.addLayer({
+          id: 'help-requests-label-layer',
+          type: 'symbol',
+          source: 'help-requests',
+          layout: {
+            'text-field': '!',
+            'text-size': 14,
+            'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+            'text-allow-overlap': true,
+            'text-ignore-placement': true
+          },
+          paint: {
+            'text-color': '#ffffff',
+            'text-halo-color': '#7f1d1d',
+            'text-halo-width': 1.1
+          }
+        })
+      } else {
+        map.current.getSource('help-requests').setData(fc)
+      }
+
+      if (map.current.getLayer('help-requests-glow-layer')) {
+        map.current.moveLayer('help-requests-glow-layer')
+      }
+      if (map.current.getLayer('help-requests-core-layer')) {
+        map.current.moveLayer('help-requests-core-layer')
+      }
+      if (map.current.getLayer('help-requests-label-layer')) {
+        map.current.moveLayer('help-requests-label-layer')
+      }
+
+      const currentCount = mapFeatures.length
+      if (currentCount > lastHelpRequestCountRef.current && currentCount > 0) {
+        const newest = mapFeatures.reduce((latest, nextFeature) => {
+          const latestTs = Date.parse(String(latest?.properties?.created_at || '')) || 0
+          const nextTs = Date.parse(String(nextFeature?.properties?.created_at || '')) || 0
+          return nextTs > latestTs ? nextFeature : latest
+        }, mapFeatures[0])
+
+        const coords = newest?.geometry?.coordinates
+        if (Array.isArray(coords) && coords.length >= 2) {
+          const lon = Number(coords[0])
+          const lat = Number(coords[1])
+          if (Number.isFinite(lon) && Number.isFinite(lat)) {
+            map.current.flyTo({ center: [lon, lat], zoom: Math.max(13, map.current.getZoom()), duration: 900 })
+          }
+        }
+      }
+      lastHelpRequestCountRef.current = currentCount
+
+      startHelpRequestPulseAnimation()
+
+      applyAdminLayerVisibility()
+    } catch (error) {
+      console.warn('Failed to load help requests:', error.message)
+    }
+  }
+
   const initializeAdminMap = async () => {
     await loadStaticLayers()
     await loadCoverageAndRadius(radius)
     await loadLiveUsers()
+    await loadHelpRequests()
+    startHelpRequestPulseAnimation()
     await ensureLogisticsLayers()
     await loadPersistedLogisticsPlan()
 
@@ -1626,6 +1948,12 @@ function AdminPage({ onBack }) {
     if (!logisticsRefreshInterval.current) {
       logisticsRefreshInterval.current = setInterval(() => {
         loadPersistedLogisticsPlan()
+      }, 10000)
+    }
+
+    if (!helpRequestsInterval.current) {
+      helpRequestsInterval.current = setInterval(() => {
+        loadHelpRequests()
       }, 10000)
     }
 
@@ -1837,6 +2165,14 @@ function AdminPage({ onBack }) {
       map.current.on('mouseenter', 'live-users-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
       map.current.on('mouseleave', 'live-users-layer', () => { map.current.getCanvas().style.cursor = '' })
 
+      map.current.on('click', 'help-requests-core-layer', (e) => {
+        const f = e.features?.[0]
+        if (!f) return
+        showHelpRequestPopup(f.properties || {}, e.lngLat)
+      })
+      map.current.on('mouseenter', 'help-requests-core-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+      map.current.on('mouseleave', 'help-requests-core-layer', () => { map.current.getCanvas().style.cursor = '' })
+
       // Add click handler to map for creating new safe areas
       map.current.on('click', (e) => {
         const candidateLayers = [
@@ -1850,6 +2186,7 @@ function AdminPage({ onBack }) {
           'doctors-layer',
           'hospitals-layer',
           'live-users-layer',
+          'help-requests-core-layer',
           'safe-areas-layer'
         ]
         const layersToQuery = candidateLayers.filter((layerId) => map.current.getLayer(layerId))
@@ -2371,6 +2708,7 @@ function SimulatePage({ onBack }) {
       style: OSM_RASTER_STYLE,
       center: [8.0000, 58.1467],
       zoom: 10,
+      maxZoom: 19,
     })
 
     map.current.on('load', () => initializeSimulationMap())
@@ -3043,12 +3381,18 @@ function SimulatePage({ onBack }) {
 function UserPage({ userId, onBack }) {
   const mapContainer = useRef(null)
   const routeControlsRef = useRef(null)
+  const helpSheetRef = useRef(null)
   const map = useRef(null)
   const hasAutoFollowInitialized = useRef(false)
   const userPopupBound = useRef(false)
   const layerRefreshInterval = useRef(null)
   const routeModeRef = useRef('walk')
   const userLocationRef = useRef(null)
+  const mediaRecorderRef = useRef(null)
+  const mediaStreamRef = useRef(null)
+  const speechRecognitionRef = useRef(null)
+  const audioChunksRef = useRef([])
+  const recordingTimeoutRef = useRef(null)
   const [userLocation, setUserLocation] = useState(null)
   const [following, setFollowing] = useState(false)
   const [routeMode, setRouteMode] = useState('walk')
@@ -3057,6 +3401,14 @@ function UserPage({ userId, onBack }) {
   const [activeRoute, setActiveRoute] = useState(null)
   const [tracking, setTracking] = useState(false)
   const [routeMenuOpen, setRouteMenuOpen] = useState(false)
+  const [helpSheetOpen, setHelpSheetOpen] = useState(false)
+  const [helpRequestedUnit, setHelpRequestedUnit] = useState('')
+  const [helpText, setHelpText] = useState('')
+  const [voiceTranscript, setVoiceTranscript] = useState('')
+  const [recordedAudioDataUrl, setRecordedAudioDataUrl] = useState('')
+  const [isRecording, setIsRecording] = useState(false)
+  const [helpSubmitting, setHelpSubmitting] = useState(false)
+  const [helpFeedback, setHelpFeedback] = useState('')
 
   const startTracking = () => {
     if (!navigator.geolocation) {
@@ -3172,13 +3524,206 @@ function UserPage({ userId, onBack }) {
   }, [routeMenuOpen])
 
   useEffect(() => {
+    if (!helpSheetOpen) return
+
+    const handleOutsidePointer = (event) => {
+      if (helpSheetRef.current && !helpSheetRef.current.contains(event.target)) {
+        setHelpSheetOpen(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handleOutsidePointer)
+    document.addEventListener('touchstart', handleOutsidePointer)
+
+    return () => {
+      document.removeEventListener('mousedown', handleOutsidePointer)
+      document.removeEventListener('touchstart', handleOutsidePointer)
+    }
+  }, [helpSheetOpen])
+
+  const stopSpeechRecognition = () => {
+    if (speechRecognitionRef.current) {
+      try {
+        speechRecognitionRef.current.stop()
+      } catch (error) {
+        // Ignore stop errors from already closed recognizer.
+      }
+      speechRecognitionRef.current = null
+    }
+  }
+
+  const stopAudioCapture = () => {
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop())
+      mediaStreamRef.current = null
+    }
+  }
+
+  const stopRecording = () => {
+    if (recordingTimeoutRef.current) {
+      clearTimeout(recordingTimeoutRef.current)
+      recordingTimeoutRef.current = null
+    }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop()
+    }
+    stopSpeechRecognition()
+    stopAudioCapture()
+    setIsRecording(false)
+  }
+
+  const startRecording = async () => {
+    try {
+      setHelpFeedback('')
+      setVoiceTranscript('')
+      setRecordedAudioDataUrl('')
+      audioChunksRef.current = []
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      mediaStreamRef.current = stream
+
+      const recorder = new MediaRecorder(stream)
+      mediaRecorderRef.current = recorder
+
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          audioChunksRef.current.push(event.data)
+        }
+      }
+
+      recorder.onstop = () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: recorder.mimeType || 'audio/webm' })
+        const reader = new FileReader()
+        reader.onloadend = () => {
+          setRecordedAudioDataUrl(String(reader.result || ''))
+        }
+        reader.readAsDataURL(audioBlob)
+
+        stopAudioCapture()
+
+        if (!helpText.trim() && voiceTranscript.trim()) {
+          setHelpText(voiceTranscript.trim())
+        }
+      }
+
+      recorder.start(200)
+      setIsRecording(true)
+
+      // Keep voice payload bounded so uploads stay responsive.
+      recordingTimeoutRef.current = setTimeout(() => {
+        if (mediaRecorderRef.current?.state !== 'inactive') {
+          setHelpFeedback('Opptaket ble stoppet automatisk etter 20 sekunder.')
+          stopRecording()
+        }
+      }, 20000)
+
+      const SpeechRecognitionClass = window.SpeechRecognition || window.webkitSpeechRecognition
+      if (SpeechRecognitionClass) {
+        const recognition = new SpeechRecognitionClass()
+        recognition.lang = 'nb-NO'
+        recognition.continuous = true
+        recognition.interimResults = true
+
+        recognition.onresult = (event) => {
+          let transcript = ''
+          for (let index = 0; index < event.results.length; index += 1) {
+            transcript += event.results[index][0]?.transcript || ''
+          }
+          setVoiceTranscript(transcript)
+        }
+
+        recognition.onerror = () => {
+          // Speech recognition can fail per browser/language; recording still continues.
+        }
+
+        recognition.start()
+        speechRecognitionRef.current = recognition
+      }
+    } catch (error) {
+      console.error('Error starting recording:', error)
+      setHelpFeedback('Kunne ikke starte opptak. Sjekk mikrofontilgang.')
+      stopRecording()
+    }
+  }
+
+  const handleRecordPressStart = async (event) => {
+    if (helpSubmitting) return
+    if (isRecording) return
+    await startRecording()
+  }
+
+  const handleRecordPressEnd = (event) => {
+    if (!isRecording) return
+    stopRecording()
+  }
+
+  const submitHelpRequest = async () => {
+    const origin = userLocationRef.current
+    if (!origin) {
+      alert('Venligst tillat geolokalisering først')
+      return
+    }
+
+    const textMessage = helpText.trim()
+    const transcript = voiceTranscript.trim()
+    const MAX_AUDIO_DATA_URL_LENGTH = 1_000_000
+    const hasOversizedAudio = recordedAudioDataUrl.length > MAX_AUDIO_DATA_URL_LENGTH
+    const safeAudioDataUrl = hasOversizedAudio ? '' : recordedAudioDataUrl
+    if (!textMessage && !transcript && !safeAudioDataUrl) {
+      setHelpFeedback('Legg inn en tekst eller ta opp en talemelding før du sender.')
+      return
+    }
+
+    setHelpSubmitting(true)
+    setHelpFeedback('')
+
+    try {
+      await axios.post(`${API_BASE}/api/users/${userId}/help-requests`, {
+        lon: origin.lon,
+        lat: origin.lat,
+        text_message: textMessage || null,
+        voice_transcript: transcript || null,
+        audio_data_url: safeAudioDataUrl || null,
+        requested_unit: helpRequestedUnit || null,
+      })
+
+      setHelpFeedback('Nødanrop sendt til administrator.')
+      setHelpSheetOpen(false)
+      setHelpRequestedUnit('')
+      setHelpText('')
+      setVoiceTranscript('')
+      setRecordedAudioDataUrl('')
+    } catch (error) {
+      console.error('Error sending help request:', error)
+      if (Number(error?.response?.status) === 413) {
+        setHelpFeedback('Meldingen er for stor. Prøv kortere opptak eller bare tekst.')
+      } else if (hasOversizedAudio) {
+        setHelpFeedback('Talemeldingen var for stor. Sendte kun tekst/transkripsjon.')
+      } else {
+        setHelpFeedback('Kunne ikke sende nødanropet. Prøv igjen.')
+      }
+    } finally {
+      setHelpSubmitting(false)
+    }
+  }
+
+  useEffect(() => () => {
+    stopRecording()
+    if (recordingTimeoutRef.current) {
+      clearTimeout(recordingTimeoutRef.current)
+      recordingTimeoutRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
     if (!mapContainer.current) return
 
     map.current = new maplibregl.Map({
       container: mapContainer.current,
       style: OSM_RASTER_STYLE,
       center: [8.2707, 58.1456],
-      zoom: 11
+      zoom: 11,
+      maxZoom: 19
     })
 
     const disableFollowOnUserGesture = (event) => {
@@ -3650,6 +4195,90 @@ function UserPage({ userId, onBack }) {
         <button className="user-map-back-btn" onClick={onBack} aria-label="Tilbake">
           ←
         </button>
+
+        <button
+          className="user-help-btn"
+          onClick={() => {
+            setRouteMenuOpen(false)
+            setHelpSheetOpen(true)
+          }}
+          aria-label="Be om hjelp"
+          title="Be om hjelp"
+        >
+          🆘
+        </button>
+
+        <div className={`help-sheet-backdrop ${helpSheetOpen ? 'is-open' : ''}`} onClick={() => setHelpSheetOpen(false)} />
+        <div ref={helpSheetRef} className={`help-sheet ${helpSheetOpen ? 'is-open' : ''}`}>
+          <div className="help-sheet-header">
+            <strong>Be om hjelp</strong>
+            <button className="help-sheet-close" onClick={() => setHelpSheetOpen(false)} aria-label="Lukk">✕</button>
+          </div>
+
+          <div className="form-group">
+            <label>Ønsket enhet (valgfritt):</label>
+            <div className="help-unit-buttons">
+              <button
+                type="button"
+                className={`help-unit-btn ${helpRequestedUnit === 'ambulance' ? 'is-active' : ''}`}
+                onClick={() => setHelpRequestedUnit((prev) => (prev === 'ambulance' ? '' : 'ambulance'))}
+              >
+                Ambulanse
+              </button>
+              <button
+                type="button"
+                className={`help-unit-btn ${helpRequestedUnit === 'firetruck' ? 'is-active' : ''}`}
+                onClick={() => setHelpRequestedUnit((prev) => (prev === 'firetruck' ? '' : 'firetruck'))}
+              >
+                Brannbil
+              </button>
+            </div>
+          </div>
+
+          <button
+            className={`help-record-btn ${isRecording ? 'is-recording' : ''}`}
+            onMouseDown={handleRecordPressStart}
+            onMouseUp={handleRecordPressEnd}
+            onMouseLeave={handleRecordPressEnd}
+            onTouchStart={handleRecordPressStart}
+            onTouchEnd={handleRecordPressEnd}
+            onTouchCancel={handleRecordPressEnd}
+            disabled={helpSubmitting}
+          >
+            {isRecording ? '⏹️ Slipp for å stoppe' : '🎙️ Hold inne for opptak'}
+          </button>
+
+          {recordedAudioDataUrl && (
+            <audio controls preload="none" style={{ width: '100%', marginTop: '8px' }}>
+              <source src={recordedAudioDataUrl} />
+            </audio>
+          )}
+
+          <div className="form-group" style={{ marginTop: '10px' }}>
+            <label>Melding:</label>
+            <textarea
+              className="help-textarea"
+              value={helpText}
+              onChange={(e) => setHelpText(e.target.value)}
+              placeholder="Beskriv situasjonen din her..."
+              rows={4}
+            />
+          </div>
+
+          {voiceTranscript && (
+            <div className="help-transcript">
+              Transkribert tale: {voiceTranscript}
+            </div>
+          )}
+
+          {helpFeedback && <div className="help-feedback">{helpFeedback}</div>}
+
+          <div className="help-sheet-actions">
+            <button className="btn btn-primary" onClick={submitHelpRequest} disabled={helpSubmitting}>
+              {helpSubmitting ? 'Sender...' : 'Send nødanrop'}
+            </button>
+          </div>
+        </div>
 
         <div className="user-map-controls" aria-label="Rutingskontroller" ref={routeControlsRef}>
           <button

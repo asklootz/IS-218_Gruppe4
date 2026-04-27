@@ -20,7 +20,8 @@ const { execSync } = require('child_process');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
 function haversineMeters(lat1, lon1, lat2, lon2) {
   const R = 6371000;
@@ -497,6 +498,35 @@ async function ensureLogisticsStateTable() {
     INSERT INTO public.mock_logistics_state (id, plan, snapshot_key, settings)
     VALUES (1, '{}'::jsonb, NULL, '{}'::jsonb)
     ON CONFLICT (id) DO NOTHING
+  `);
+}
+
+async function ensureHelpRequestsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.help_requests (
+      id BIGSERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      location GEOMETRY(Point, 4326) NOT NULL,
+      text_message TEXT,
+      voice_transcript TEXT,
+      audio_data_url TEXT,
+      requested_unit VARCHAR(32),
+      dispatched_unit VARCHAR(32),
+      status VARCHAR(24) NOT NULL DEFAULT 'open',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      handled_at TIMESTAMP,
+      raw_payload JSONB
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_help_requests_location ON public.help_requests USING GIST(location)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_help_requests_status ON public.help_requests(status)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_help_requests_created_at ON public.help_requests(created_at DESC)
   `);
 }
 
@@ -2028,6 +2058,7 @@ async function initSchema() {
     `);
 
     await ensureLogisticsStateTable();
+    await ensureHelpRequestsTable();
     
     console.log('✓ Database schema initialized');
   } catch (error) {
@@ -3267,6 +3298,201 @@ app.post('/api/users/:userId/location', async (req, res) => {
     res.json({ ok: true });
   } catch (error) {
     console.error('Error saving user location:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/users/:userId/help-requests', async (req, res) => {
+  try {
+    await ensureHelpRequestsTable();
+
+    const { userId } = req.params;
+    const {
+      lon,
+      lat,
+      text_message,
+      voice_transcript,
+      audio_data_url,
+      requested_unit
+    } = req.body || {};
+
+    const lonNum = Number(lon);
+    const latNum = Number(lat);
+    if (!Number.isFinite(lonNum) || !Number.isFinite(latNum)) {
+      return res.status(400).json({ error: 'Missing or invalid lon/lat' });
+    }
+
+    const textMessage = String(text_message || '').trim();
+    const voiceTranscript = String(voice_transcript || '').trim();
+    const audioDataUrl = String(audio_data_url || '').trim();
+    const requestedUnit = String(requested_unit || '').trim().toLowerCase();
+    const normalizedRequestedUnit = ['firetruck', 'ambulance'].includes(requestedUnit) ? requestedUnit : null;
+
+    if (!textMessage && !voiceTranscript && !audioDataUrl) {
+      return res.status(400).json({ error: 'Provide text and/or audio message' });
+    }
+
+    const result = await pool.query(`
+      INSERT INTO public.help_requests (
+        user_id,
+        location,
+        text_message,
+        voice_transcript,
+        audio_data_url,
+        requested_unit,
+        raw_payload
+      )
+      VALUES (
+        $1,
+        ST_SetSRID(ST_MakePoint($2, $3), 4326),
+        $4,
+        $5,
+        $6,
+        $7,
+        $8::jsonb
+      )
+      RETURNING
+        id,
+        user_id,
+        ST_X(location) AS lon,
+        ST_Y(location) AS lat,
+        text_message,
+        voice_transcript,
+        audio_data_url,
+        requested_unit,
+        dispatched_unit,
+        status,
+        created_at,
+        handled_at
+    `, [
+      String(userId || '').trim(),
+      lonNum,
+      latNum,
+      textMessage || null,
+      voiceTranscript || null,
+      audioDataUrl || null,
+      normalizedRequestedUnit,
+      JSON.stringify(req.body || {})
+    ]);
+
+    res.json({ ok: true, request: result.rows[0] });
+  } catch (error) {
+    console.error('Error creating help request:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/help-requests', async (req, res) => {
+  try {
+    await ensureHelpRequestsTable();
+
+    const statusFilter = String(req.query.status || 'open').trim().toLowerCase();
+    const allowedStatuses = ['open', 'dispatched', 'closed', 'all'];
+    const effectiveStatus = allowedStatuses.includes(statusFilter) ? statusFilter : 'open';
+
+    const params = [];
+    const whereClause = effectiveStatus === 'all'
+      ? ''
+      : 'WHERE hr.status = $1';
+
+    if (effectiveStatus !== 'all') {
+      params.push(effectiveStatus);
+    }
+
+    const result = await pool.query(`
+      SELECT
+        hr.id,
+        hr.user_id,
+        ST_X(hr.location) AS lon,
+        ST_Y(hr.location) AS lat,
+        hr.text_message,
+        hr.voice_transcript,
+        hr.audio_data_url,
+        hr.requested_unit,
+        hr.dispatched_unit,
+        hr.status,
+        hr.created_at,
+        hr.handled_at
+      FROM public.help_requests hr
+      ${whereClause}
+      ORDER BY hr.created_at DESC
+    `, params);
+
+    const features = result.rows.map((row) => ({
+      type: 'Feature',
+      geometry: {
+        type: 'Point',
+        coordinates: [Number(row.lon), Number(row.lat)]
+      },
+      properties: {
+        id: Number(row.id),
+        user_id: row.user_id,
+        text_message: row.text_message,
+        voice_transcript: row.voice_transcript,
+        audio_data_url: row.audio_data_url,
+        requested_unit: row.requested_unit,
+        dispatched_unit: row.dispatched_unit,
+        status: row.status,
+        created_at: row.created_at,
+        handled_at: row.handled_at,
+      }
+    }));
+
+    res.json({
+      type: 'FeatureCollection',
+      features,
+      status: effectiveStatus,
+      count: features.length
+    });
+  } catch (error) {
+    console.error('Error loading help requests:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.patch('/api/admin/help-requests/:id/dispatch', async (req, res) => {
+  try {
+    await ensureHelpRequestsTable();
+
+    const requestId = Number(req.params.id);
+    const unitType = String(req.body?.unitType || '').trim().toLowerCase();
+
+    if (!Number.isFinite(requestId)) {
+      return res.status(400).json({ error: 'Invalid request id' });
+    }
+    if (!['firetruck', 'ambulance'].includes(unitType)) {
+      return res.status(400).json({ error: 'Invalid unit type' });
+    }
+
+    const result = await pool.query(`
+      UPDATE public.help_requests
+      SET
+        dispatched_unit = $2,
+        status = 'dispatched',
+        handled_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+      RETURNING
+        id,
+        user_id,
+        ST_X(location) AS lon,
+        ST_Y(location) AS lat,
+        text_message,
+        voice_transcript,
+        audio_data_url,
+        requested_unit,
+        dispatched_unit,
+        status,
+        created_at,
+        handled_at
+    `, [requestId, unitType]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Help request not found' });
+    }
+
+    res.json({ ok: true, request: result.rows[0] });
+  } catch (error) {
+    console.error('Error dispatching help request:', error);
     res.status(500).json({ error: error.message });
   }
 });
