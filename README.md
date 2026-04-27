@@ -20,9 +20,11 @@ Inneholder to sider:
 
 - React 18 + Vite
 - MapLibre GL
+- OpenStreetMap
 - Node.js + Express
 - PostgreSQL/PostGIS
 - Docker Compose
+- Valhalla API for rute-veiledning og sporing
 - GeoNorge Atom/WMS-kilder
 
 ## Datakatalog:
@@ -34,10 +36,10 @@ Inneholder to sider:
 | Fylker         | Geonorge | GeoJSON          | Cache + reprojisering |
 | Kommuner       | Geonorge | GeoJSON          | Cache + reprojisering |
 | Brannstasjoner | Geonorge | GML (ZIP)        | Nedlasting → GML parsing → lagring i PostGIS |
-| Farms          | Overture | Parquet (S3)     | Nedlasting → parsing → lagring i PostGIS |
-| Water Sources  | Overture | Parquet (S3)     | Nedlasting → parsing → lagring i PostGIS |
-| Doctors        | Overture | Parquet (S3)     | Nedlasting → parsing → lagring i PostGIS |
-| Hospitals      | Overture | Parquet (S3)     | Nedlasting → parsing → lagring i PostGIS |
+| Farms          | Overture | GeoJSON     | Nedlasting → parsing → lagring i PostGIS |
+| Water Sources  | Overture | GeoJSON     | Nedlasting → parsing → lagring i PostGIS |
+| Doctors        | Overture | GeoJSON     | Nedlasting → parsing → lagring i PostGIS |
+| Hospitals      | Overture | GeoJSON     | Nedlasting → parsing → lagring i PostGIS |
 
 ## Arkitekturskisse: 
 
