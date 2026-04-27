@@ -46,19 +46,7 @@ Inneholder to sider:
 | Hospitals      | Overture | GeoJSON     | Nedlasting → parsing → lagring i PostGIS |
 
 ## Arkitekturskisse: 
-
-[GeoNorge datasett]
-        ↓
- Backend (Node.js + Express)
-        ↓
- PostGIS (lagring + analyse)
-        ↓
- API-endepunkter
-        ↓
- Frontend (React + MapLibre)
-        ↓
- Bruker (kart + analyse)
-
+![Arkitektur](Arkitektur.png)
  ## Arkitektur:
 
 - `postgres`: `postgis/postgis:16-3.4-alpine`
@@ -79,7 +67,7 @@ Ved oppstart:
 ### Forside:
 
 - Valg mellom Administratorside og Brukerside
-- Egne URL-er: `/admin` og `/bruker`
+- Egne URL-er: `/admin`, `/bruker` og `/simulate`
 
 ### Administratorside:
 
@@ -98,6 +86,12 @@ Ved oppstart:
 - Transportvalg: gå/sykkel/bil
 - Mobil- og desktopvennlig layout
 
+### Simuleringside:
+
+- Oversikt over kart og alle punkter
+- Kan skape ny falske "live" -brukere
+- Live brukerne vil gi endring på antall ledige plasser i sikker sone og tilfuktsrom
+- Dette har effekt på rute for mat/vann fordeling og lar bruker se om det er ledig plass på forskjellige lokasjoner.
 ## API (utvalg):
 
 - `GET /health`
@@ -124,7 +118,7 @@ docker compose up -d --build
 ```
 
 Deretter:
-- Frontend: http://localhost
+- Frontend: http://localhost:443
 - Backend API: http://localhost:3000
 
 ## Google Collab Link for DEL A
