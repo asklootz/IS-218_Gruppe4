@@ -26,6 +26,7 @@ services:
       DATABASE_URL: "postgresql://postgres:password@postgres:5432/gis"
       NODE_ENV: production
       PORT: 3000
+      VALHALLA_URL: ${VALHALLA_URL:-https://valhalla1.openstreetmap.de/route}
     ports:
       - "3000:3000"
     depends_on:
@@ -44,8 +45,12 @@ services:
     container_name: beredskapskart-frontend
     environment:
       VITE_API_URL: http://localhost:3000
+      SSL_CERT_CN: ${SSL_CERT_CN:-localhost}
+      SSL_CERT_SAN: ${SSL_CERT_SAN:-DNS:localhost,IP:127.0.0.1}
+      SSL_CERT_EXTRA_IP: ${LAN_IP:-}
     ports:
       - "80:80"
+      - "443:443"
       - "5173:5173"
     depends_on:
       backend:

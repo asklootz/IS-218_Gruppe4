@@ -33,7 +33,11 @@ Inneholder to sider:
 | Befolkning     | Geonorge | GML/GeoJSON      | Parsing → filtrering → lagring i PostGIS |
 | Fylker         | Geonorge | GeoJSON          | Cache + reprojisering |
 | Kommuner       | Geonorge | GeoJSON          | Cache + reprojisering |
-| Brannstasjoner | Lokal DB | PostGIS          | Romlige spørringer (ST_Within) |
+| Brannstasjoner | Geonorge | GML (ZIP)        | Nedlasting → GML parsing → lagring i PostGIS |
+| Farms          | Overture | Parquet (S3)     | Nedlasting → parsing → lagring i PostGIS |
+| Water Sources  | Overture | Parquet (S3)     | Nedlasting → parsing → lagring i PostGIS |
+| Doctors        | Overture | Parquet (S3)     | Nedlasting → parsing → lagring i PostGIS |
+| Hospitals      | Overture | Parquet (S3)     | Nedlasting → parsing → lagring i PostGIS |
 
 ## Arkitekturskisse: 
 
@@ -95,9 +99,15 @@ Ved oppstart:
 - `GET /api/admin/export/csv?radius=1000`
 - `GET /api/admin/export/xlsx?radius=1000`
 - `GET /api/routing/nearest-shelters?lon=10.75&lat=59.91&strategy=nearest&mode=walk`
+- `GET /api/routing/route?originLon=8.00&originLat=58.15&destLon=8.12&destLat=58.16&mode=car`
 - `POST /api/users/:userId/location`
 - `GET /api/layers/shelters`
 - `GET /api/layers/population`
+
+Ruting:
+- Backend bruker Valhalla som primar motor for ruteforing (bade bruker og mock-trucker).
+- Hvis Valhalla ikke svarer, brukes OSRM fallback, deretter rett linje som siste fallback.
+- Du kan overstyre Valhalla-endepunktet med miljo-variabel: `VALHALLA_URL`.
 
 ## Oppstart:
 

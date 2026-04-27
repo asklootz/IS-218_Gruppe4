@@ -9,15 +9,19 @@ const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const axios = require('axios');
+const crypto = require('crypto');
 const AdmZip = require('adm-zip');
+const xml2js = require('xml2js');
 const { v4: uuidv4 } = require('uuid');
 const XLSX = require('xlsx');
 const fs = require('fs');
 const path = require('path');
+const { execSync } = require('child_process');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
 function haversineMeters(lat1, lon1, lat2, lon2) {
   const R = 6371000;
@@ -31,6 +35,828 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
+function toFiniteNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+const VALHALLA_ROUTE_URL = String(process.env.VALHALLA_URL || 'https://valhalla1.openstreetmap.de/route').trim();
+const ROUTER_TIMEOUT_MS = 15000;
+
+function waitMs(durationMs) {
+  return new Promise((resolve) => setTimeout(resolve, durationMs));
+}
+
+async function requestWithRetry(requestFn, { attempts = 3, baseDelayMs = 350 } = {}) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await requestFn();
+    } catch (error) {
+      lastError = error;
+      const status = Number(error?.response?.status || 0);
+      const shouldRetry = status === 429 || status >= 500;
+
+      if (!shouldRetry || attempt >= attempts) {
+        throw error;
+      }
+
+      await waitMs(baseDelayMs * attempt);
+    }
+  }
+
+  throw lastError || new Error('Request failed');
+}
+
+function logisticsJobKey(resourceType, targetType, targetId) {
+  return `${resourceType}:${targetType}:${targetId}`;
+}
+
+function clonePlanJobs(jobs = []) {
+  return jobs.map((job) => ({
+    ...job,
+    source: job.source ? { ...job.source } : job.source,
+    target: job.target ? { ...job.target } : job.target,
+    route: job.route ? { ...job.route, geometry: job.route.geometry ? { ...job.route.geometry } : job.route.geometry } : job.route,
+    outboundRoute: job.outboundRoute
+      ? { ...job.outboundRoute, geometry: job.outboundRoute.geometry ? { ...job.outboundRoute.geometry } : job.outboundRoute.geometry }
+      : job.outboundRoute,
+    returnRoute: job.returnRoute
+      ? { ...job.returnRoute, geometry: job.returnRoute.geometry ? { ...job.returnRoute.geometry } : job.returnRoute.geometry }
+      : job.returnRoute
+  }));
+}
+
+function hasRoadRouteGeometry(route) {
+  const coordinates = route?.geometry?.coordinates;
+  const hasGeometry = Array.isArray(coordinates) && coordinates.length >= 2;
+  const routeSource = String(route?.source || '').toLowerCase();
+  const hasRoadRoute = routeSource === 'valhalla' || routeSource === 'osrm';
+  return hasGeometry && hasRoadRoute;
+}
+
+function logisticsRouteSummary(route) {
+  const etaMinutes = Math.max(1, Math.round(Number(route?.duration_s || 0) / 60));
+  return {
+    etaMinutes,
+    distanceKm: (Number(route?.distance_m || 0) / 1000).toFixed(2),
+    etaLabel: `${etaMinutes} min`
+  };
+}
+
+function logisticsSnapshotHash(snapshot, settings) {
+  return crypto.createHash('sha1').update(JSON.stringify({ snapshot, settings })).digest('hex');
+}
+
+function interpolatePointAlongLine(coordinates, progress) {
+  if (!Array.isArray(coordinates) || coordinates.length === 0) return null;
+  if (coordinates.length === 1) return coordinates[0];
+
+  const clampedProgress = Math.min(1, Math.max(0, progress));
+  const segmentLengths = [];
+  let totalLength = 0;
+
+  for (let index = 0; index < coordinates.length - 1; index += 1) {
+    const start = coordinates[index];
+    const end = coordinates[index + 1];
+    const segmentLength = haversineMeters(start[1], start[0], end[1], end[0]);
+    segmentLengths.push(segmentLength);
+    totalLength += segmentLength;
+  }
+
+  if (totalLength <= 0) return coordinates[0];
+
+  const targetDistance = totalLength * clampedProgress;
+  let traversed = 0;
+
+  for (let index = 0; index < segmentLengths.length; index += 1) {
+    const start = coordinates[index];
+    const end = coordinates[index + 1];
+    const segmentLength = segmentLengths[index];
+
+    if (traversed + segmentLength >= targetDistance) {
+      const segmentProgress = segmentLength === 0 ? 0 : (targetDistance - traversed) / segmentLength;
+      return [
+        start[0] + (end[0] - start[0]) * segmentProgress,
+        start[1] + (end[1] - start[1]) * segmentProgress
+      ];
+    }
+
+    traversed += segmentLength;
+  }
+
+  return coordinates[coordinates.length - 1];
+}
+
+function getFeaturePoint(feature) {
+  const coordinates = feature?.geometry?.coordinates;
+  if (!Array.isArray(coordinates) || coordinates.length < 2) return null;
+  const lon = Number(coordinates[0]);
+  const lat = Number(coordinates[1]);
+  if (!Number.isFinite(lon) || !Number.isFinite(lat)) return null;
+  return { lon, lat };
+}
+
+function createLogisticsJobId() {
+  return uuidv4();
+}
+
+function buildTruckJobsFromDemand({ sinks, sources, resourceType, truckCapacity, settings }) {
+  const validSinks = (sinks || [])
+    .map((sink) => ({ ...sink, remainingDemand: toFiniteNumber(sink.remainingDemand, 0) }))
+    .filter((sink) => sink.remainingDemand > 0)
+    .sort((a, b) => b.remainingDemand - a.remainingDemand);
+
+  const validSources = (sources || [])
+    .map((source) => {
+      const point = getFeaturePoint(source);
+      if (point) {
+        return { ...source, lon: point.lon, lat: point.lat };
+      }
+
+      // Snapshot sources are plain objects ({ lon, lat }) rather than GeoJSON features.
+      const lon = toFiniteNumber(source?.lon, Number.NaN);
+      const lat = toFiniteNumber(source?.lat, Number.NaN);
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
+        return null;
+      }
+
+      return { ...source, lon, lat };
+    })
+    .filter(Boolean);
+
+  const sourceLoadCounts = new Map();
+  const jobs = [];
+
+  for (const sink of validSinks) {
+    let remainingDemand = sink.remainingDemand;
+
+    while (remainingDemand > 0 && validSources.length > 0) {
+      const loadAmount = Math.min(truckCapacity, remainingDemand);
+      let selectedSource = null;
+      let selectedScore = Number.POSITIVE_INFINITY;
+
+      for (const source of validSources) {
+        const sourceKey = String(source.id ?? source.name ?? `${source.lon},${source.lat}`);
+        const assignedLoads = sourceLoadCounts.get(sourceKey) || 0;
+        const distanceMeters = haversineMeters(source.lat, source.lon, sink.lat, sink.lon);
+        const score = distanceMeters + assignedLoads * 15000;
+
+        if (score < selectedScore) {
+          selectedScore = score;
+          selectedSource = source;
+        }
+      }
+
+      if (!selectedSource) break;
+
+      const sourceKey = String(selectedSource.id ?? selectedSource.name ?? `${selectedSource.lon},${selectedSource.lat}`);
+      sourceLoadCounts.set(sourceKey, (sourceLoadCounts.get(sourceKey) || 0) + 1);
+
+      jobs.push({
+        id: createLogisticsJobId(),
+        resourceType,
+        source: {
+          id: selectedSource.id,
+          name: selectedSource.name,
+          lon: selectedSource.lon,
+          lat: selectedSource.lat
+        },
+        target: {
+          id: sink.id,
+          name: sink.name,
+          kind: sink.kind,
+          lon: sink.lon,
+          lat: sink.lat,
+          live_users_count: sink.live_users_count
+        },
+        amount: loadAmount,
+        truckCapacity,
+        demand: sink.remainingDemand,
+        unitsPerPerson: settings[resourceType === 'water' ? 'waterUnitsPerPerson' : 'foodUnitsPerPerson'],
+        sourceScore: Math.round(selectedScore),
+        status: 'planned',
+        progress: 0,
+        startedAt: null,
+        completedAt: null,
+        route: null,
+        currentPosition: [selectedSource.lon, selectedSource.lat]
+      });
+
+      remainingDemand -= loadAmount;
+    }
+  }
+
+  return jobs;
+}
+
+function assignLiveUsersToNearestSinks(liveUsers, sinks) {
+  const sinkCounts = new Map();
+
+  for (const user of liveUsers || []) {
+    const userLon = toFiniteNumber(user.lon, Number.NaN);
+    const userLat = toFiniteNumber(user.lat, Number.NaN);
+
+    if (!Number.isFinite(userLon) || !Number.isFinite(userLat)) {
+      continue;
+    }
+
+    let nearestSink = null;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+
+    for (const sink of sinks || []) {
+      const sinkLon = toFiniteNumber(sink.lon, Number.NaN);
+      const sinkLat = toFiniteNumber(sink.lat, Number.NaN);
+
+      if (!Number.isFinite(sinkLon) || !Number.isFinite(sinkLat)) {
+        continue;
+      }
+
+      const distanceMeters = haversineMeters(userLat, userLon, sinkLat, sinkLon);
+
+      if (distanceMeters < nearestDistance) {
+        nearestDistance = distanceMeters;
+        nearestSink = sink;
+      }
+    }
+
+    if (!nearestSink) {
+      continue;
+    }
+
+    const sinkKey = logisticsJobKey('nearest', nearestSink.kind || 'sink', nearestSink.id);
+    sinkCounts.set(sinkKey, (sinkCounts.get(sinkKey) || 0) + 1);
+  }
+
+  return sinkCounts;
+}
+
+async function computeRouteBetweenPoints({ originLon, originLat, destLon, destLat, mode = 'walk' }) {
+  const valhallaCosting = mode === 'car' ? 'auto' : mode === 'bike' ? 'bicycle' : 'pedestrian';
+  const osrmProfile = mode === 'car' ? 'driving' : mode === 'bike' ? 'bike' : 'foot';
+
+  const decodePolyline = (encoded, precision = 6) => {
+    if (typeof encoded !== 'string' || !encoded.length) return [];
+
+    let index = 0;
+    let lat = 0;
+    let lon = 0;
+    const factor = Math.pow(10, precision);
+    const coordinates = [];
+
+    while (index < encoded.length) {
+      let result = 0;
+      let shift = 0;
+      let byte;
+
+      do {
+        byte = encoded.charCodeAt(index++) - 63;
+        result |= (byte & 0x1f) << shift;
+        shift += 5;
+      } while (byte >= 0x20 && index < encoded.length + 1);
+
+      const latDelta = (result & 1) ? ~(result >> 1) : (result >> 1);
+      lat += latDelta;
+
+      result = 0;
+      shift = 0;
+      do {
+        byte = encoded.charCodeAt(index++) - 63;
+        result |= (byte & 0x1f) << shift;
+        shift += 5;
+      } while (byte >= 0x20 && index < encoded.length + 1);
+
+      const lonDelta = (result & 1) ? ~(result >> 1) : (result >> 1);
+      lon += lonDelta;
+
+      coordinates.push([lon / factor, lat / factor]);
+    }
+
+    return coordinates;
+  };
+
+  const normalizeValhallaCoordinates = (shape) => {
+    if (Array.isArray(shape)) {
+      return shape
+        .map((point) => {
+          if (!Array.isArray(point) || point.length < 2) return null;
+          const lon = Number(point[0]);
+          const lat = Number(point[1]);
+          if (!Number.isFinite(lon) || !Number.isFinite(lat)) return null;
+          return [lon, lat];
+        })
+        .filter(Boolean);
+    }
+
+    if (shape && typeof shape === 'object' && Array.isArray(shape.coordinates)) {
+      return normalizeValhallaCoordinates(shape.coordinates);
+    }
+
+    if (typeof shape === 'string') {
+      return decodePolyline(shape, 6);
+    }
+
+    return [];
+  };
+
+  const mergeLegCoordinates = (legs) => {
+    const merged = [];
+    for (const leg of legs) {
+      const legCoordinates = normalizeValhallaCoordinates(leg?.shape);
+      if (!legCoordinates.length) continue;
+      if (!merged.length) {
+        merged.push(...legCoordinates);
+      } else {
+        merged.push(...legCoordinates.slice(1));
+      }
+    }
+    return merged;
+  };
+
+  const valhallaStepsFromLegs = (legs) => {
+    return legs
+      .flatMap((leg) => leg?.maneuvers || [])
+      .slice(0, 12)
+      .map((maneuver) => ({
+        distance_m: Math.round(toFiniteNumber(maneuver?.length, 0) * 1000),
+        duration_s: Math.round(toFiniteNumber(maneuver?.time, 0)),
+        instruction: maneuver?.instruction || 'Fortsett'
+      }));
+  };
+
+  const osrmUrl = `https://router.project-osrm.org/route/v1/${osrmProfile}/${originLon},${originLat};${destLon},${destLat}?overview=full&geometries=geojson&steps=true`;
+
+  try {
+    const response = await requestWithRetry(
+      () => axios.post(
+        VALHALLA_ROUTE_URL,
+        {
+          locations: [
+            { lon: originLon, lat: originLat, type: 'break' },
+            { lon: destLon, lat: destLat, type: 'break' }
+          ],
+          costing: valhallaCosting,
+          shape_format: 'geojson',
+          directions_options: {
+            units: 'kilometers',
+            language: 'nb-NO'
+          }
+        },
+        {
+          timeout: ROUTER_TIMEOUT_MS,
+          headers: { 'Content-Type': 'application/json' }
+        }
+      ),
+      { attempts: 3, baseDelayMs: 500 }
+    );
+
+    const trip = response.data?.trip;
+    const legs = Array.isArray(trip?.legs) ? trip.legs : [];
+    const summary = trip?.summary || {};
+    const coordinates = mergeLegCoordinates(legs);
+
+    if (coordinates.length < 2) throw new Error('No route geometry from Valhalla');
+
+    return {
+      mode,
+      source: 'valhalla',
+      distance_m: Math.round(toFiniteNumber(summary.length, 0) * 1000),
+      duration_s: Math.round(toFiniteNumber(summary.time, 0)),
+      geometry: {
+        type: 'LineString',
+        coordinates
+      },
+      steps: valhallaStepsFromLegs(legs)
+    };
+  } catch (valhallaError) {
+    console.warn(`Valhalla routing failed (${mode}):`, valhallaError.message);
+  }
+
+  try {
+    const response = await requestWithRetry(
+      () => axios.get(osrmUrl, { timeout: ROUTER_TIMEOUT_MS }),
+      { attempts: 3, baseDelayMs: 500 }
+    );
+    const route = response.data?.routes?.[0];
+    if (!route || !route.geometry?.coordinates) throw new Error('No route from OSRM');
+
+    const steps = (route.legs || [])
+      .flatMap((leg) => leg.steps || [])
+      .slice(0, 12)
+      .map((step) => ({
+        distance_m: Math.round(step.distance || 0),
+        duration_s: Math.round(step.duration || 0),
+        instruction: step.name || step.maneuver?.instruction || 'Fortsett'
+      }));
+
+    return {
+      mode,
+      source: 'osrm',
+      distance_m: Math.round(route.distance || 0),
+      duration_s: Math.round(route.duration || 0),
+      geometry: {
+        type: 'LineString',
+        coordinates: route.geometry.coordinates
+      },
+      steps
+    };
+  } catch (osrmError) {
+    console.warn(`OSRM routing failed (${mode}):`, osrmError.message);
+    const distance = haversineMeters(originLat, originLon, destLat, destLon);
+    const speedKmh = mode === 'car' ? 60 : mode === 'bike' ? 20 : 5;
+    const durationS = Math.round((distance / 1000) / speedKmh * 3600);
+
+    return {
+      mode,
+      source: 'fallback-straight-line',
+      distance_m: Math.round(distance),
+      duration_s: durationS,
+      geometry: {
+        type: 'LineString',
+        coordinates: [[originLon, originLat], [destLon, destLat]]
+      },
+      steps: [
+        { distance_m: Math.round(distance), duration_s: durationS, instruction: 'Gå mot valgt mål' }
+      ]
+    };
+  }
+}
+
+async function ensureLogisticsStateTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.mock_logistics_state (
+      id INT PRIMARY KEY DEFAULT 1,
+      plan JSONB NOT NULL DEFAULT '{}'::jsonb,
+      snapshot_key TEXT,
+      settings JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await pool.query(`
+    INSERT INTO public.mock_logistics_state (id, plan, snapshot_key, settings)
+    VALUES (1, '{}'::jsonb, NULL, '{}'::jsonb)
+    ON CONFLICT (id) DO NOTHING
+  `);
+}
+
+async function ensureHelpRequestsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.help_requests (
+      id BIGSERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      location GEOMETRY(Point, 4326) NOT NULL,
+      text_message TEXT,
+      voice_transcript TEXT,
+      audio_data_url TEXT,
+      requested_unit VARCHAR(32),
+      dispatched_unit VARCHAR(32),
+      status VARCHAR(24) NOT NULL DEFAULT 'open',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      handled_at TIMESTAMP,
+      raw_payload JSONB
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_help_requests_location ON public.help_requests USING GIST(location)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_help_requests_status ON public.help_requests(status)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_help_requests_created_at ON public.help_requests(created_at DESC)
+  `);
+}
+
+async function readLogisticsState() {
+  await ensureLogisticsStateTable();
+  const result = await pool.query(`
+    SELECT id, plan, snapshot_key, settings, updated_at
+    FROM public.mock_logistics_state
+    WHERE id = 1
+  `);
+
+  return result.rows[0] || {
+    id: 1,
+    plan: { jobs: [] },
+    snapshot_key: null,
+    settings: {},
+    updated_at: null
+  };
+}
+
+async function saveLogisticsState({ plan, snapshotKey, settings }) {
+  await ensureLogisticsStateTable();
+  await pool.query(`
+    UPDATE public.mock_logistics_state
+    SET plan = $1::jsonb,
+        snapshot_key = $2,
+        settings = $3::jsonb,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = 1
+  `, [JSON.stringify(plan), snapshotKey, JSON.stringify(settings)]);
+}
+
+async function fetchLogisticsSnapshot() {
+  const { latestUsersCte } = await buildLatestUsersSubquery();
+
+  const [shelterResult, safeAreaExistsResult, farmResult, waterResult, liveUsersResult] = await Promise.all([
+    pool.query(`
+      ${latestUsersCte}
+      SELECT
+        s.id,
+        s.shelter_id,
+        s.name,
+        ST_X(s.location) AS lon,
+        ST_Y(s.location) AS lat,
+        COUNT(lu.user_id)::int AS live_users_count
+      FROM tilfluktsromoffentlige.tilfluktsrom s
+      LEFT JOIN latest lu ON ST_DWithin(lu.location::geography, s.location::geography, 150)
+      GROUP BY s.id, s.shelter_id, s.name, s.location
+      ORDER BY s.id
+    `),
+    pool.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = 'safe_areas'
+      ) AS exists
+    `),
+    pool.query(`
+      SELECT id, name, ST_X(location) AS lon, ST_Y(location) AS lat
+      FROM overture.farms
+      ORDER BY id
+    `),
+    pool.query(`
+      SELECT id, name, ST_X(location) AS lon, ST_Y(location) AS lat
+      FROM overture.water_sources
+      ORDER BY id
+    `),
+    pool.query(`
+      ${latestUsersCte}
+      SELECT
+        user_id,
+        ST_X(location) AS lon,
+        ST_Y(location) AS lat
+      FROM latest
+    `)
+  ]);
+
+  let safeAreaRows = [];
+  if (safeAreaExistsResult.rows[0]?.exists) {
+    const safeAreaResult = await pool.query(`
+      ${latestUsersCte}
+      SELECT
+        sa.id,
+        sa.name,
+        ST_X(sa.location) AS lon,
+        ST_Y(sa.location) AS lat,
+        COUNT(lu.user_id)::int AS live_users_count
+      FROM public.safe_areas sa
+      LEFT JOIN latest lu ON ST_DWithin(lu.location::geography, sa.location::geography, 150)
+      GROUP BY sa.id, sa.name, sa.location
+      ORDER BY sa.id
+    `);
+    safeAreaRows = safeAreaResult.rows || [];
+  }
+
+  const sinks = [
+    ...(shelterResult.rows || []).map((row) => ({
+      id: Number(row.id),
+      name: row.name,
+      kind: 'shelter',
+      lon: Number(row.lon),
+      lat: Number(row.lat),
+      live_users_count: Number(row.live_users_count || 0)
+    })),
+    ...(safeAreaRows.map((row) => ({
+      id: Number(row.id),
+      name: row.name,
+      kind: 'safe_area',
+      lon: Number(row.lon),
+      lat: Number(row.lat),
+      live_users_count: Number(row.live_users_count || 0)
+    })))
+  ];
+
+  const foodSources = (farmResult.rows || []).map((row) => ({
+    id: String(row.id),
+    name: row.name,
+    lon: Number(row.lon),
+    lat: Number(row.lat)
+  }));
+
+  const waterSources = (waterResult.rows || []).map((row) => ({
+    id: String(row.id),
+    name: row.name,
+    lon: Number(row.lon),
+    lat: Number(row.lat)
+  }));
+
+  const liveUsers = (liveUsersResult.rows || []).map((row) => ({
+    user_id: String(row.user_id),
+    lon: Number(row.lon),
+    lat: Number(row.lat)
+  }));
+
+  return {
+    sinks,
+    foodSources,
+    waterSources,
+    liveUsers
+  };
+}
+
+async function buildOrRefreshLogisticsPlan(settingsOverride = {}) {
+  const storedState = await readLogisticsState();
+  const settings = {
+    foodUnitsPerPerson: 1,
+    waterUnitsPerPerson: 2,
+    foodTruckCapacity: 120,
+    waterTruckCapacity: 200,
+    routeMode: 'car',
+    ...(storedState.settings || {}),
+    ...settingsOverride
+  };
+
+  const snapshot = await fetchLogisticsSnapshot();
+  const snapshotKey = logisticsSnapshotHash(snapshot, settings);
+
+  const storedJobs = Array.isArray(storedState.plan?.jobs) ? storedState.plan.jobs : [];
+  const requiresRoadRouteRefresh = storedJobs.some((job) => {
+    // Only enforce road-route refresh for active trucks. Planned trucks are routed on dispatch.
+    if (!job || !['moving', 'arrived'].includes(job.status)) return false;
+    const coordinates = job.route?.geometry?.coordinates;
+    const hasGeometry = Array.isArray(coordinates) && coordinates.length >= 2;
+    const routeSource = String(job.route?.source || '').toLowerCase();
+    const hasRoadRoute = routeSource === 'valhalla' || routeSource === 'osrm';
+    return !hasGeometry || !hasRoadRoute;
+  });
+
+  if (storedState.snapshot_key === snapshotKey && Array.isArray(storedState.plan?.jobs) && !requiresRoadRouteRefresh) {
+    return {
+      plan: storedState.plan,
+      snapshotKey,
+      settings
+    };
+  }
+
+  const existingJobs = Array.isArray(storedState.plan?.jobs) ? clonePlanJobs(storedState.plan.jobs) : [];
+  const fixedJobs = existingJobs.filter((job) => ['moving', 'arrived'].includes(job.status));
+  const committedByKey = new Map();
+
+  for (const job of fixedJobs) {
+    const key = logisticsJobKey(job.resourceType, job.target?.kind || 'sink', job.target?.id);
+    committedByKey.set(key, (committedByKey.get(key) || 0) + toFiniteNumber(job.amount, 0));
+  }
+
+  const nearestSinkCounts = assignLiveUsersToNearestSinks(snapshot.liveUsers, snapshot.sinks);
+
+  const sinksForFood = snapshot.sinks.map((sink) => {
+    const nearestCount = nearestSinkCounts.get(logisticsJobKey('nearest', sink.kind, sink.id)) || 0;
+    const key = logisticsJobKey('food', sink.kind, sink.id);
+    const demand = Math.max(0, Math.round(toFiniteNumber(nearestCount, 0) * toFiniteNumber(settings.foodUnitsPerPerson, 1)));
+    const remainingDemand = Math.max(0, demand - (committedByKey.get(key) || 0));
+    return { ...sink, remainingDemand };
+  });
+
+  const sinksForWater = snapshot.sinks.map((sink) => {
+    const nearestCount = nearestSinkCounts.get(logisticsJobKey('nearest', sink.kind, sink.id)) || 0;
+    const key = logisticsJobKey('water', sink.kind, sink.id);
+    const demand = Math.max(0, Math.round(toFiniteNumber(nearestCount, 0) * toFiniteNumber(settings.waterUnitsPerPerson, 2)));
+    const remainingDemand = Math.max(0, demand - (committedByKey.get(key) || 0));
+    return { ...sink, remainingDemand };
+  });
+
+  const foodJobs = buildTruckJobsFromDemand({
+    sinks: sinksForFood,
+    sources: snapshot.foodSources,
+    resourceType: 'food',
+    truckCapacity: toFiniteNumber(settings.foodTruckCapacity, 120),
+    settings
+  });
+
+  const waterJobs = buildTruckJobsFromDemand({
+    sinks: sinksForWater,
+    sources: snapshot.waterSources,
+    resourceType: 'water',
+    truckCapacity: toFiniteNumber(settings.waterTruckCapacity, 200),
+    settings
+  });
+
+  const jobsToEnrich = [...fixedJobs, ...foodJobs, ...waterJobs];
+  const enrichedJobs = [];
+
+  for (const job of jobsToEnrich) {
+    const hasGeometry = Array.isArray(job.route?.geometry?.coordinates) && job.route.geometry.coordinates.length >= 2;
+    const routeSource = String(job.route?.source || '').toLowerCase();
+    const hasRoadRoute = routeSource === 'valhalla' || routeSource === 'osrm';
+
+    // Keep existing routes that are already road-network based, including planned preview routes.
+    if (hasGeometry && hasRoadRoute) {
+      enrichedJobs.push(job);
+      continue;
+    }
+
+    const shouldComputeRoute = job.status !== 'planned';
+    if (!shouldComputeRoute) {
+      enrichedJobs.push({
+        ...job,
+        route: null,
+        etaMinutes: null,
+        distanceKm: null,
+        etaLabel: null,
+        currentPosition: job.currentPosition || [job.source.lon, job.source.lat]
+      });
+      continue;
+    }
+
+    const route = await computeRouteBetweenPoints({
+      originLon: job.source.lon,
+      originLat: job.source.lat,
+      destLon: job.target.lon,
+      destLat: job.target.lat,
+      mode: settings.routeMode
+    });
+
+    enrichedJobs.push({
+      ...job,
+      route,
+      etaMinutes: Math.max(1, Math.round(Number(route.duration_s || 0) / 60)),
+      distanceKm: (Number(route.distance_m || 0) / 1000).toFixed(2),
+      etaLabel: `${Math.max(1, Math.round(Number(route.duration_s || 0) / 60))} min`,
+      currentPosition: job.currentPosition || [job.source.lon, job.source.lat]
+    });
+
+    // Throttle outbound router requests to avoid provider rate limits on large plans.
+    await waitMs(120);
+  }
+
+  const plan = {
+    version: snapshotKey,
+    generated_at: new Date().toISOString(),
+    settings,
+    jobs: enrichedJobs
+  };
+
+  await saveLogisticsState({ plan, snapshotKey, settings });
+
+  return { plan, snapshotKey, settings };
+}
+
+async function updateLogisticsTruck(truckId, update) {
+  const state = await readLogisticsState();
+  const jobs = Array.isArray(state.plan?.jobs) ? clonePlanJobs(state.plan.jobs) : [];
+  const nextJobs = jobs.map((job) => {
+    if (job.id !== truckId) return job;
+    return {
+      ...job,
+      ...update,
+      source: update.source ? { ...update.source } : job.source,
+      target: update.target ? { ...update.target } : job.target,
+      route: update.route ? { ...update.route, geometry: update.route.geometry ? { ...update.route.geometry } : update.route.geometry } : job.route
+    };
+  });
+
+  const plan = {
+    ...(state.plan || {}),
+    updated_at: new Date().toISOString(),
+    jobs: nextJobs
+  };
+
+  await saveLogisticsState({
+    plan,
+    snapshotKey: state.snapshot_key,
+    settings: state.settings || {}
+  });
+
+  return plan;
+}
+
+let logisticsRefreshInFlight = false;
+let logisticsRefreshQueued = false;
+
+async function queueLogisticsRefresh(reason = 'mutation') {
+  if (logisticsRefreshInFlight) {
+    logisticsRefreshQueued = true;
+    return;
+  }
+
+  logisticsRefreshInFlight = true;
+  try {
+    do {
+      logisticsRefreshQueued = false;
+      await buildOrRefreshLogisticsPlan();
+    } while (logisticsRefreshQueued);
+  } catch (error) {
+    console.warn(`Automatic logistics refresh failed (${reason}):`, error.message);
+  } finally {
+    logisticsRefreshInFlight = false;
+  }
+}
+
 // Database configuration
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgresql://postgres:password@postgres:5432/gis'
@@ -41,6 +867,27 @@ const CACHE_DIR = '/tmp/geonorge_cache';
 if (!fs.existsSync(CACHE_DIR)) {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
 }
+
+const TILFLUKTSROM_WFS_BASE_URL = 'https://wfs.geonorge.no/skwms1/wfs.tilfluktsrom_offentlige';
+const TILFLUKTSROM_WFS_TYPE_NAME = 'app:Tilfluktsrom';
+// BBOX limits the WFS request to the Agder region only, avoiding 504 timeouts from fetching all of Norway.
+const AGDER_WFS_BBOX_4326 = '7.0,57.8,9.5,59.0,EPSG:4326';
+const TILFLUKTSROM_WFS_GML_URL = `${TILFLUKTSROM_WFS_BASE_URL}?service=WFS&version=2.0.0&request=GetFeature&typeNames=${encodeURIComponent(TILFLUKTSROM_WFS_TYPE_NAME)}&srsName=EPSG:4326&outputFormat=${encodeURIComponent('application/gml+xml; version=3.2')}&BBOX=${AGDER_WFS_BBOX_4326}`;
+const TILFLUKTSROM_ZIP_FALLBACK_URL = 'https://nedlasting.geonorge.no/geonorge/Samfunnssikkerhet/TilfluktsromOffentlige/GeoJSON/Samfunnssikkerhet_0000_Norge_25833_TilfluktsromOffentlige_GeoJSON.zip';
+
+const POPULATION_WFS_BASE_URL = 'https://wfs.geonorge.no/skwms1/wfs.befolkningpagrunnkretsniva';
+const POPULATION_WFS_TYPE_NAME = 'app:BefolkningPåGrunnkrets';
+const POPULATION_WFS_GML_URL = `${POPULATION_WFS_BASE_URL}?service=WFS&version=2.0.0&request=GetFeature&typeNames=${encodeURIComponent(POPULATION_WFS_TYPE_NAME)}&srsName=EPSG:4326&outputFormat=${encodeURIComponent('text/xml; subtype=gml/3.2.1')}&BBOX=${AGDER_WFS_BBOX_4326}`;
+const POPULATION_ZIP_FALLBACK_URL = 'https://nedlasting.geonorge.no/geonorge/Befolkning/BefolkningPaGrunnkretsniva2025/GML/Befolkning_0000_Norge_25833_BefolkningPaGrunnkretsniva2025_GML.zip';
+
+const FIRESTATIONS_WFS_BASE_URL = 'https://wfs.geonorge.no/skwms1/wfs.brannstasjoner';
+const FIRESTATIONS_WFS_TYPE_NAME = 'app:Brannstasjon';
+const FIRESTATIONS_WFS_GML_URL = `${FIRESTATIONS_WFS_BASE_URL}?service=WFS&version=2.0.0&request=GetFeature&typeNames=${encodeURIComponent(FIRESTATIONS_WFS_TYPE_NAME)}&srsName=EPSG:4326&outputFormat=${encodeURIComponent('text/xml; subtype=gml/3.2.1')}&BBOX=${AGDER_WFS_BBOX_4326}`;
+const FIRESTATIONS_ZIP_FALLBACK_URL = 'https://nedlasting.geonorge.no/api/download/order/9e8cd748-a26f-4f93-8448-37a10fff8b35/ebba84f5-0e8c-4eb0-84e9-39e58cd40cf2';
+
+const KARTVERKET_API_BASE = 'https://api.kartverket.no/kommuneinfo/v1';
+const GEONORGE_COUNTIES_ZIP = 'https://nedlasting.geonorge.no/geonorge/Basisdata/Fylker/GeoJSON/Basisdata_0000_Norge_25833_Fylker_GeoJSON.zip';
+const GEONORGE_MUNICIPALITIES_ZIP = 'https://nedlasting.geonorge.no/geonorge/Basisdata/Kommuner/GeoJSON/Basisdata_0000_Norge_25833_Kommuner_GeoJSON.zip';
 
 // ========== DATA BOOTSTRAP UTILITIES ==========
 
@@ -135,6 +982,505 @@ async function extractGeoJsonFromZip(buffer, layerHint = '') {
   }
 }
 
+function asArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value === undefined || value === null) return [];
+  return [value];
+}
+
+function xmlValue(value) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  if (Array.isArray(value)) return xmlValue(value[0]);
+  if (typeof value === 'object') {
+    if (value._ !== undefined && value._ !== null) return String(value._);
+  }
+  return undefined;
+}
+
+function extractPrefixedFields(record, prefix) {
+  const out = {};
+  if (!record || typeof record !== 'object') return out;
+  for (const [key, raw] of Object.entries(record)) {
+    if (!String(key).startsWith(prefix)) continue;
+    const clean = String(key).slice(prefix.length);
+    const value = xmlValue(raw);
+    if (value !== undefined) {
+      out[clean] = value;
+    }
+  }
+  return out;
+}
+
+function extractSridFromSrsName(srsName) {
+  const match = String(srsName || '').match(/(?:EPSG[:/]{1,2}|EPSG::)(\d+)/i);
+  return match ? Number(match[1]) : null;
+}
+
+function normalizePointCoordinates(coords) {
+  if (!Array.isArray(coords) || coords.length < 2) return null;
+  const first = Number(coords[0]);
+  const second = Number(coords[1]);
+  if (!Number.isFinite(first) || !Number.isFinite(second)) return null;
+
+  if (Math.abs(first) > 180 || Math.abs(second) > 180) {
+    return [first, second];
+  }
+
+  // WFS/GML sources may emit geographic coordinates as lat lon. Normalize to lon lat.
+  if (first > 40 && second < 40) {
+    return [second, first];
+  }
+
+  return [first, second];
+}
+
+function findFirstObjectWithPointGeometry(node) {
+  if (!node) return null;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findFirstObjectWithPointGeometry(item);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  if (typeof node !== 'object') return null;
+
+  const directPointText = xmlValue(node['gml:pos']) || xmlValue(node['gml:coordinates']) || xmlValue(node['gml:posList']);
+  if (directPointText) return node;
+
+  if (node['gml:Point'] || node['gml32:Point']) return node;
+
+  for (const value of Object.values(node)) {
+    const found = findFirstObjectWithPointGeometry(value);
+    if (found) return found;
+  }
+
+  return null;
+}
+
+function extractPointFromGmlNode(node) {
+  if (!node || typeof node !== 'object') return null;
+
+  const pointNode = node['gml:Point'] || node['gml32:Point'] || node;
+  const posText =
+    xmlValue(pointNode['gml:pos']) ||
+    xmlValue(pointNode['gml:coordinates']) ||
+    xmlValue(pointNode['gml:posList']) ||
+    xmlValue(pointNode['pos']);
+
+  if (!posText) return null;
+
+  const coords = posText.split(/\s+/).map(Number).filter(Number.isFinite);
+  const normalized = normalizePointCoordinates(coords);
+  if (!normalized) return null;
+
+  return {
+    coordinates: normalized,
+    srid: extractSridFromSrsName(pointNode.srsName || node.srsName || pointNode['gml:srsName'] || node['gml:srsName'])
+  };
+}
+
+function findFirstObjectWithPolygonGeometry(node) {
+  if (!node) return null;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findFirstObjectWithPolygonGeometry(item);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  if (typeof node !== 'object') return null;
+
+  if (node['gml:Polygon'] || node['gml32:Polygon'] || node['gml:Surface'] || node['gml:MultiSurface']) {
+    return node;
+  }
+
+  for (const value of Object.values(node)) {
+    const found = findFirstObjectWithPolygonGeometry(value);
+    if (found) return found;
+  }
+
+  return null;
+}
+
+function parsePosListCoordinates(posText) {
+  if (!posText) return [];
+  const values = String(posText).trim().split(/\s+/).map(Number).filter(Number.isFinite);
+  const coordinates = [];
+
+  for (let i = 0; i + 1 < values.length; i += 2) {
+    const normalized = normalizePointCoordinates([values[i], values[i + 1]]);
+    if (normalized) coordinates.push(normalized);
+  }
+
+  return coordinates;
+}
+
+function extractLinearRingCoordinates(ringContainer) {
+  const ringNode = ringContainer?.['gml:LinearRing'] || ringContainer;
+  const posListText =
+    xmlValue(ringNode?.['gml:posList']) ||
+    xmlValue(ringNode?.['gml:coordinates']);
+  return parsePosListCoordinates(posListText);
+}
+
+function extractPolygonCoordinates(polygonNode) {
+  const exteriorContainer = polygonNode?.['gml:exterior'];
+  const exterior = extractLinearRingCoordinates(exteriorContainer);
+  if (!Array.isArray(exterior) || exterior.length < 4) return null;
+
+  const rings = [exterior];
+  for (const interior of asArray(polygonNode?.['gml:interior'])) {
+    const interiorRing = extractLinearRingCoordinates(interior);
+    if (Array.isArray(interiorRing) && interiorRing.length >= 4) {
+      rings.push(interiorRing);
+    }
+  }
+
+  return rings;
+}
+
+function extractPolygonFromGmlNode(node) {
+  if (!node || typeof node !== 'object') return null;
+
+  const srid = extractSridFromSrsName(
+    node?.srsName ||
+    node?.['gml:srsName'] ||
+    node?.['gml:Polygon']?.srsName ||
+    node?.['gml:Polygon']?.['gml:srsName'] ||
+    node?.['gml:Surface']?.srsName ||
+    node?.['gml:Surface']?.['gml:srsName'] ||
+    node?.['gml:MultiSurface']?.srsName ||
+    node?.['gml:MultiSurface']?.['gml:srsName']
+  );
+
+  const polygonNode = node['gml:Polygon'] || node['gml32:Polygon'] || node;
+  const polygonCoords = extractPolygonCoordinates(polygonNode);
+  if (polygonCoords) {
+    return {
+      geometry: { type: 'Polygon', coordinates: polygonCoords },
+      srid,
+    };
+  }
+
+  const surfaceNode = node['gml:Surface'];
+  if (surfaceNode) {
+    const patch = asArray(surfaceNode?.['gml:patches']?.['gml:PolygonPatch'])[0];
+    const patchCoords = extractPolygonCoordinates(patch);
+    if (patchCoords) {
+      return {
+        geometry: { type: 'Polygon', coordinates: patchCoords },
+        srid,
+      };
+    }
+  }
+
+  const multiSurfaceNode = node['gml:MultiSurface'];
+  if (multiSurfaceNode) {
+    const polygons = [];
+    const surfaceMembers = asArray(multiSurfaceNode?.['gml:surfaceMember']);
+    for (const member of surfaceMembers) {
+      const memberPolygon = extractPolygonFromGmlNode(member);
+      if (!memberPolygon?.geometry) continue;
+
+      if (memberPolygon.geometry.type === 'Polygon') {
+        polygons.push(memberPolygon.geometry.coordinates);
+      } else if (memberPolygon.geometry.type === 'MultiPolygon') {
+        polygons.push(...memberPolygon.geometry.coordinates);
+      }
+    }
+
+    if (polygons.length > 0) {
+      return {
+        geometry: { type: 'MultiPolygon', coordinates: polygons },
+        srid,
+      };
+    }
+  }
+
+  return null;
+}
+
+function collectGmlFeaturesByLocalName(node, localName, results = []) {
+  if (!node) return results;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      collectGmlFeaturesByLocalName(item, localName, results);
+    }
+    return results;
+  }
+
+  if (typeof node !== 'object') return results;
+
+  for (const [key, value] of Object.entries(node)) {
+    const suffix = String(key).split(':').pop();
+    if (suffix && suffix.toLowerCase() === String(localName).toLowerCase()) {
+      for (const item of asArray(value)) {
+        if (item && typeof item === 'object') {
+          results.push(item);
+        }
+      }
+    }
+
+    collectGmlFeaturesByLocalName(value, localName, results);
+  }
+
+  return results;
+}
+
+async function extractTilfluktsromFromGmlZip(buffer) {
+  try {
+    const zip = new AdmZip(buffer);
+    const entries = zip.getEntries();
+    const gmlEntry = entries.find((entry) => {
+      const lower = String(entry.name || '').toLowerCase();
+      return !entry.isDirectory && lower.endsWith('.gml');
+    });
+
+    if (!gmlEntry) return { type: 'FeatureCollection', features: [] };
+
+    const xml = gmlEntry.getData().toString('utf8').replace(/^\uFEFF/, '');
+    const parsed = await xml2js.parseStringPromise(xml, {
+      explicitArray: false,
+      mergeAttrs: true,
+      trim: true,
+    });
+
+    const stations = collectGmlFeaturesByLocalName(parsed, 'Tilfluktsrom');
+    const features = [];
+
+    for (const station of stations) {
+      const geometryNode = findFirstObjectWithPointGeometry(station);
+      const point = extractPointFromGmlNode(geometryNode);
+      if (!point || !point.coordinates) continue;
+
+      const properties = {
+        ...extractPrefixedFields(station, 'app:'),
+        gml_id: station?.['gml:id'] || undefined,
+      };
+
+      features.push({
+        type: 'Feature',
+        geometry: {
+          type: 'Point',
+          coordinates: point.coordinates,
+        },
+        properties,
+      });
+    }
+
+    return { type: 'FeatureCollection', features };
+  } catch (error) {
+    console.error('GML extraction error:', error.message);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
+async function extractTilfluktsromFromWfsGml(buffer) {
+  try {
+    const xml = buffer.toString('utf8').replace(/^﻿/, '');
+    const parsed = await xml2js.parseStringPromise(xml, {
+      explicitArray: false,
+      mergeAttrs: true,
+      trim: true,
+    });
+
+    const stations = collectGmlFeaturesByLocalName(parsed, 'Tilfluktsrom');
+    const features = [];
+
+    for (const station of stations) {
+      const geometryNode = findFirstObjectWithPointGeometry(station);
+      const point = extractPointFromGmlNode(geometryNode);
+      if (!point || !point.coordinates) continue;
+
+      const properties = {
+        ...extractPrefixedFields(station, 'app:'),
+        gml_id: station?.['gml:id'] || undefined,
+      };
+
+      features.push({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: point.coordinates },
+        properties,
+      });
+    }
+
+    return { type: 'FeatureCollection', features };
+  } catch (error) {
+    console.error('WFS GML extraction error:', error.message);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
+function extractPopulationFeatureCollectionFromParsedGml(parsed) {
+  const rows = collectGmlFeaturesByLocalName(parsed, 'BefolkningPåGrunnkrets');
+  const features = [];
+
+  for (const row of rows) {
+    const areaNode = row?.['app:område'] || row?.['område'];
+    const geometryNode = areaNode || findFirstObjectWithPolygonGeometry(row);
+    const polygon = extractPolygonFromGmlNode(geometryNode);
+    if (!polygon?.geometry) continue;
+
+    const properties = {
+      ...extractPrefixedFields(row, 'app:'),
+      gml_id: row?.['gml:id'] || undefined,
+    };
+
+    if (properties.totalBefolkning !== undefined && properties.population === undefined) {
+      properties.population = properties.totalBefolkning;
+    }
+
+    features.push({
+      type: 'Feature',
+      geometry: polygon.geometry,
+      properties,
+    });
+  }
+
+  return { type: 'FeatureCollection', features };
+}
+
+async function extractPopulationFromWfsGml(buffer) {
+  try {
+    const xml = buffer.toString('utf8').replace(/^﻿/, '');
+    const parsed = await xml2js.parseStringPromise(xml, {
+      explicitArray: false,
+      mergeAttrs: true,
+      trim: true,
+    });
+
+    return extractPopulationFeatureCollectionFromParsedGml(parsed);
+  } catch (error) {
+    console.error('Population WFS GML extraction error:', error.message);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
+async function extractPopulationFromGmlZip(buffer) {
+  try {
+    const zip = new AdmZip(buffer);
+    const entries = zip.getEntries();
+    const gmlEntry = entries.find((entry) => {
+      const lower = String(entry.name || '').toLowerCase();
+      return !entry.isDirectory && lower.endsWith('.gml');
+    });
+
+    if (!gmlEntry) return { type: 'FeatureCollection', features: [] };
+
+    const xml = gmlEntry.getData().toString('utf8').replace(/^\uFEFF/, '');
+    const parsed = await xml2js.parseStringPromise(xml, {
+      explicitArray: false,
+      mergeAttrs: true,
+      trim: true,
+    });
+
+    return extractPopulationFeatureCollectionFromParsedGml(parsed);
+  } catch (error) {
+    console.error('Population ZIP GML extraction error:', error.message);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
+async function extractFireStationsFromWfsGml(buffer) {
+  try {
+    const xml = buffer.toString('utf8').replace(/^﻿/, '');
+    const parsed = await xml2js.parseStringPromise(xml, {
+      explicitArray: false,
+      mergeAttrs: true,
+      trim: true,
+    });
+
+    const stations = collectGmlFeaturesByLocalName(parsed, 'Brannstasjon');
+    const features = [];
+
+    for (const station of stations) {
+      const geometryNode = station?.['app:posisjon'] || station?.['posisjon'] || findFirstObjectWithPointGeometry(station);
+      const point = extractPointFromGmlNode(geometryNode);
+      if (!point || !point.coordinates) continue;
+
+      const properties = {
+        ...extractPrefixedFields(station, 'app:'),
+        gml_id: station?.['gml:id'] || undefined,
+      };
+
+      features.push({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: point.coordinates },
+        properties,
+      });
+    }
+
+    return { type: 'FeatureCollection', features };
+  } catch (error) {
+    console.error('Fire stations WFS GML extraction error:', error.message);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
+async function extractFireStationsFromGmlZip(buffer) {
+  try {
+    const zip = new AdmZip(buffer);
+    const entries = zip.getEntries();
+    const gmlEntry = entries.find((entry) => {
+      const lower = String(entry.name || '').toLowerCase();
+      return !entry.isDirectory && lower.endsWith('.gml');
+    });
+
+    if (!gmlEntry) return { type: 'FeatureCollection', features: [] };
+
+    const xml = gmlEntry.getData().toString('utf8').replace(/^\uFEFF/, '');
+    const parsed = await xml2js.parseStringPromise(xml, {
+      explicitArray: false,
+      mergeAttrs: true,
+      trim: true,
+    });
+
+    const members = asArray(parsed?.['gml:FeatureCollection']?.['gml:featureMember']);
+    const features = [];
+
+    for (const member of members) {
+      const station = member?.['app:Brannstasjon'];
+      if (!station) continue;
+
+      const posText = xmlValue(station?.['app:posisjon']?.['gml:Point']?.['gml:pos']);
+      if (!posText) continue;
+
+      const coords = posText.split(/\s+/).map(Number).filter(Number.isFinite);
+      if (coords.length < 2) continue;
+
+      // In EPSG:4258 GML, positions are typically stored as lat lon.
+      const lat = coords[0];
+      const lon = coords[1];
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
+
+      const properties = {
+        ...extractPrefixedFields(station, 'app:'),
+        gml_id: station?.['gml:id'] || undefined,
+      };
+
+      features.push({
+        type: 'Feature',
+        geometry: {
+          type: 'Point',
+          coordinates: [lon, lat],
+        },
+        properties,
+      });
+    }
+
+    return { type: 'FeatureCollection', features };
+  } catch (error) {
+    console.error('GML extraction error:', error.message);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
 
 async function cacheGeoJsonFromZip(layer, url) {
   const cacheFile = path.join(CACHE_DIR, `${layer}.geojson`);
@@ -164,21 +1510,262 @@ async function cacheGeoJsonFromZip(layer, url) {
   }
 }
 
+async function cacheTilfluktsromGeoJson() {
+  const cacheFile = path.join(CACHE_DIR, 'shelters.geojson');
+
+  if (fs.existsSync(cacheFile)) {
+    try {
+      const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+      if (Array.isArray(cached?.features) && cached.features.length > 0) {
+        return cached;
+      }
+      fs.unlinkSync(cacheFile);
+    } catch (error) {
+      fs.unlinkSync(cacheFile);
+    }
+  }
+
+  try {
+    console.log('Downloading shelters from Geonorge WFS GML (Agder BBOX)...');
+    const wfsBuffer = await downloadBuffer(TILFLUKTSROM_WFS_GML_URL, 60000);
+    const wfsGeoJson = await extractTilfluktsromFromWfsGml(wfsBuffer);
+    const transformedWfsGeoJson = await transformProjectedFeatureCollection(wfsGeoJson);
+
+    if (Array.isArray(transformedWfsGeoJson.features) && transformedWfsGeoJson.features.length > 0) {
+      fs.writeFileSync(cacheFile, JSON.stringify(transformedWfsGeoJson));
+      console.log(`✓ Shelters loaded from WFS GML: ${transformedWfsGeoJson.features.length}`);
+      return transformedWfsGeoJson;
+    }
+
+    console.warn('WFS GML returned no shelter features, falling back to nedlasting.geonorge.no zip...');
+  } catch (error) {
+    console.warn(`WFS shelter download failed, falling back to zip: ${error.message}`);
+  }
+
+  const fallbackGeoJson = await cacheGeoJsonFromZip('shelters', TILFLUKTSROM_ZIP_FALLBACK_URL);
+  const transformedFallback = await transformProjectedFeatureCollection(fallbackGeoJson);
+  fs.writeFileSync(cacheFile, JSON.stringify(transformedFallback));
+  return transformedFallback;
+}
+
+async function cachePopulationGeoJson() {
+  const cacheFile = path.join(CACHE_DIR, 'population.geojson');
+
+  if (fs.existsSync(cacheFile)) {
+    try {
+      const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+      if (Array.isArray(cached?.features) && cached.features.length > 0) {
+        return cached;
+      }
+      fs.unlinkSync(cacheFile);
+    } catch (error) {
+      fs.unlinkSync(cacheFile);
+    }
+  }
+
+  try {
+    console.log('Downloading population from Geonorge WFS GML (Agder BBOX)...');
+    const wfsBuffer = await downloadBuffer(POPULATION_WFS_GML_URL, 90000);
+    const wfsGeoJson = await extractPopulationFromWfsGml(wfsBuffer);
+    const transformedWfsGeoJson = await transformProjectedFeatureCollection(wfsGeoJson);
+
+    if (Array.isArray(transformedWfsGeoJson.features) && transformedWfsGeoJson.features.length > 0) {
+      fs.writeFileSync(cacheFile, JSON.stringify(transformedWfsGeoJson));
+      console.log(`✓ Population loaded from WFS GML: ${transformedWfsGeoJson.features.length}`);
+      return transformedWfsGeoJson;
+    }
+
+    console.warn('WFS GML returned no population features, falling back to nedlasting.geonorge.no zip...');
+  } catch (error) {
+    console.warn(`WFS population download failed, falling back to zip: ${error.message}`);
+  }
+
+  try {
+    const fallbackBuffer = await downloadBuffer(POPULATION_ZIP_FALLBACK_URL);
+    const fallbackGeoJson = await extractPopulationFromGmlZip(fallbackBuffer);
+    const transformedFallback = await transformProjectedFeatureCollection(fallbackGeoJson);
+    fs.writeFileSync(cacheFile, JSON.stringify(transformedFallback));
+    return transformedFallback;
+  } catch (error) {
+    console.error('Population fallback failed:', error.message);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
+async function cacheFireStationsGeoJson() {
+  const cacheFile = path.join(CACHE_DIR, 'firestations.geojson');
+
+  if (fs.existsSync(cacheFile)) {
+    try {
+      const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+      if (Array.isArray(cached?.features) && cached.features.length > 0) {
+        return cached;
+      }
+      fs.unlinkSync(cacheFile);
+    } catch (error) {
+      fs.unlinkSync(cacheFile);
+    }
+  }
+
+  try {
+    console.log('Downloading fire stations from Geonorge WFS GML (Agder BBOX)...');
+    const wfsBuffer = await downloadBuffer(FIRESTATIONS_WFS_GML_URL, 90000);
+    const wfsGeoJson = await extractFireStationsFromWfsGml(wfsBuffer);
+    const transformedWfsGeoJson = await transformProjectedFeatureCollection(wfsGeoJson);
+
+    if (Array.isArray(transformedWfsGeoJson.features) && transformedWfsGeoJson.features.length > 0) {
+      fs.writeFileSync(cacheFile, JSON.stringify(transformedWfsGeoJson));
+      console.log(`✓ Fire stations loaded from WFS GML: ${transformedWfsGeoJson.features.length}`);
+      return transformedWfsGeoJson;
+    }
+
+    console.warn('WFS GML returned no fire station features, falling back to nedlasting.geonorge.no zip...');
+  } catch (error) {
+    console.warn(`WFS fire station download failed, falling back to zip: ${error.message}`);
+  }
+
+  try {
+    const fallbackBuffer = await downloadBuffer(FIRESTATIONS_ZIP_FALLBACK_URL);
+    const fallbackGeoJson = await extractFireStationsFromGmlZip(fallbackBuffer);
+    const transformedFallback = await transformProjectedFeatureCollection(fallbackGeoJson);
+    fs.writeFileSync(cacheFile, JSON.stringify(transformedFallback));
+    return transformedFallback;
+  } catch (error) {
+    console.error('Fire stations fallback failed:', error.message);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
+function kartverketOmradeToGeometry(omrade) {
+  if (!omrade || !omrade.type || !omrade.coordinates) return null;
+  return { type: omrade.type, coordinates: omrade.coordinates };
+}
+
+async function fetchFylkerFromKartverket() {
+  console.log('Fetching fylker from Kartverket API...');
+  const listResp = await axios.get(`${KARTVERKET_API_BASE}/fylkerkommuner`, { timeout: 30000 });
+  const fylkerData = Array.isArray(listResp.data) ? listResp.data : [];
+  if (fylkerData.length === 0) throw new Error('Kartverket API returned empty fylke list');
+
+  const features = [];
+  const batchSize = 5;
+  for (let i = 0; i < fylkerData.length; i += batchSize) {
+    const batch = fylkerData.slice(i, i + batchSize);
+    const results = await Promise.allSettled(
+      batch.map(async (fylke) => {
+        const resp = await axios.get(
+          `${KARTVERKET_API_BASE}/fylker/${fylke.fylkesnummer}/omrade`,
+          { timeout: 15000 }
+        );
+        const geometry = kartverketOmradeToGeometry(resp.data.omrade);
+        if (!geometry) throw new Error(`No omrade in response for fylke ${fylke.fylkesnummer}`);
+        return {
+          type: 'Feature',
+          properties: { fylkesnummer: fylke.fylkesnummer, fylkesnavn: fylke.fylkesnavn },
+          geometry
+        };
+      })
+    );
+    for (const r of results) {
+      if (r.status === 'fulfilled') features.push(r.value);
+      else console.warn(`Fylke omrade fetch failed: ${r.reason?.message}`);
+    }
+  }
+  if (features.length === 0) throw new Error('No fylker fetched from Kartverket API');
+  console.log(`✓ Fetched ${features.length} fylker from Kartverket API`);
+  return { type: 'FeatureCollection', features };
+}
+
+async function fetchKommunerFromKartverket() {
+  console.log('Fetching kommuner from Kartverket API...');
+  const listResp = await axios.get(`${KARTVERKET_API_BASE}/fylkerkommuner`, { timeout: 30000 });
+  const fylkerData = Array.isArray(listResp.data) ? listResp.data : [];
+
+  const kommuneList = [];
+  for (const fylke of fylkerData) {
+    for (const k of (fylke.kommuner || [])) {
+      kommuneList.push({
+        kommunenummer: k.kommunenummer,
+        kommunenavn: k.kommunenavnNorsk || k.kommunenavn,
+        fylkesnavn: fylke.fylkesnavn,
+        fylkesnummer: fylke.fylkesnummer
+      });
+    }
+  }
+  if (kommuneList.length === 0) throw new Error('Kartverket API returned no kommuner');
+
+  const features = [];
+  const batchSize = 10;
+  for (let i = 0; i < kommuneList.length; i += batchSize) {
+    const batch = kommuneList.slice(i, i + batchSize);
+    const results = await Promise.allSettled(
+      batch.map(async (k) => {
+        const resp = await axios.get(
+          `${KARTVERKET_API_BASE}/kommuner/${k.kommunenummer}/omrade`,
+          { timeout: 15000 }
+        );
+        const geometry = kartverketOmradeToGeometry(resp.data.omrade);
+        if (!geometry) throw new Error(`No omrade for kommune ${k.kommunenummer}`);
+        return {
+          type: 'Feature',
+          properties: {
+            kommunenummer: k.kommunenummer,
+            kommunenavn: k.kommunenavn,
+            fylkesnavn: k.fylkesnavn,
+            fylkesnummer: k.fylkesnummer
+          },
+          geometry
+        };
+      })
+    );
+    for (const r of results) {
+      if (r.status === 'fulfilled') features.push(r.value);
+      else console.warn(`Kommune omrade fetch failed: ${r.reason?.message}`);
+    }
+  }
+  if (features.length === 0) throw new Error('No kommuner fetched from Kartverket API');
+  console.log(`✓ Fetched ${features.length} kommuner from Kartverket API`);
+  return { type: 'FeatureCollection', features };
+}
+
 async function refreshBoundaryLayer(layer) {
-  const urlByLayer = {
-    counties:
-      'https://nedlasting.geonorge.no/geonorge/Basisdata/Fylker/GeoJSON/Basisdata_0000_Norge_25833_Fylker_GeoJSON.zip',
-    municipalities:
-      'https://nedlasting.geonorge.no/geonorge/Basisdata/Kommuner/GeoJSON/Basisdata_0000_Norge_25833_Kommuner_GeoJSON.zip'
-  };
+  if (layer !== 'counties' && layer !== 'municipalities') {
+    return { type: 'FeatureCollection', features: [] };
+  }
 
-  const url = urlByLayer[layer];
-  if (!url) return { type: 'FeatureCollection', features: [] };
+  // Primary: Kartverket API (ETRS89 ≈ WGS84, no reprojection needed)
+  try {
+    const geojson = layer === 'counties'
+      ? await fetchFylkerFromKartverket()
+      : await fetchKommunerFromKartverket();
+    if (geojson?.features?.length > 0) {
+      fs.writeFileSync(path.join(CACHE_DIR, `${layer}.geojson`), JSON.stringify(geojson));
+      return geojson;
+    }
+  } catch (error) {
+    console.warn(`Kartverket API unavailable for ${layer}: ${error.message}. Falling back to Geonorge ZIP.`);
+  }
 
-  const raw = await cacheGeoJsonFromZip(layer, url);
+  // Fallback: download ZIP from Geonorge and reproject from EPSG:25833
+  const fallbackUrl = layer === 'counties' ? GEONORGE_COUNTIES_ZIP : GEONORGE_MUNICIPALITIES_ZIP;
+  const rawCacheFile = path.join(CACHE_DIR, `${layer}_raw.geojson`);
+  let raw;
+  if (fs.existsSync(rawCacheFile)) {
+    try {
+      const cached = JSON.parse(fs.readFileSync(rawCacheFile, 'utf8'));
+      if (Array.isArray(cached?.features) && cached.features.length > 0) raw = cached;
+    } catch (e) {
+      fs.unlinkSync(rawCacheFile);
+    }
+  }
+  if (!raw) {
+    console.log(`Downloading ${layer} from Geonorge (${fallbackUrl.substring(0, 60)}...)...`);
+    const buffer = await downloadBuffer(fallbackUrl);
+    raw = await extractGeoJsonFromZip(buffer, layer);
+    fs.writeFileSync(rawCacheFile, JSON.stringify(raw));
+  }
   const transformed = await transformProjectedFeatureCollection(raw);
-  const cacheFile = path.join(CACHE_DIR, `${layer}.geojson`);
-  fs.writeFileSync(cacheFile, JSON.stringify(transformed));
+  fs.writeFileSync(path.join(CACHE_DIR, `${layer}.geojson`), JSON.stringify(transformed));
   return transformed;
 }
 
@@ -295,6 +1882,10 @@ function parseNumber(value, fallback = 0) {
 }
 
 async function transformProjectedFeatureCollection(geojson) {
+  return transformProjectedFeatureCollectionWithSrid(geojson, 25833);
+}
+
+async function transformProjectedFeatureCollectionWithSrid(geojson, sourceSrid = 25833) {
   if (!geojson.features || geojson.features.length === 0) return geojson;
   
   const firstCoord = firstCoordinate(geojson.features[0].geometry);
@@ -311,8 +1902,8 @@ async function transformProjectedFeatureCollection(geojson) {
       try {
         const geomJson = JSON.stringify(feature.geometry);
         const result = await pool.query(
-          `SELECT ST_AsGeoJSON(ST_Transform(ST_SetSRID(ST_GeomFromGeoJSON($1), 25833), 4326))::json AS geom`,
-          [geomJson]
+          `SELECT ST_AsGeoJSON(ST_Transform(ST_SetSRID(ST_GeomFromGeoJSON($1), $2), 4326))::json AS geom`,
+          [geomJson, sourceSrid]
         );
         
         if (result.rows[0] && result.rows[0].geom) {
@@ -342,6 +1933,8 @@ async function initSchema() {
     
     // Create schema if doesn't exist
     await pool.query('CREATE SCHEMA IF NOT EXISTS tilfluktsromoffentlige');
+    await pool.query('CREATE SCHEMA IF NOT EXISTS brannstasjoner');
+    await pool.query('CREATE SCHEMA IF NOT EXISTS overture');
     
     // Create shelters table (tilfluktsrom)
     await pool.query(`
@@ -358,6 +1951,74 @@ async function initSchema() {
     // Create spatial index
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_tilfluktsrom_location ON tilfluktsromoffentlige.tilfluktsrom USING GIST(location)
+    `);
+
+    // Fire stations used by analysis endpoints.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS brannstasjoner.brannstasjon (
+        id SERIAL PRIMARY KEY,
+        objid TEXT UNIQUE,
+        brannstasjon TEXT,
+        brannvesen TEXT,
+        stasjonstype TEXT,
+        kasernert TEXT,
+        opphav TEXT,
+        posisjon GEOMETRY(Point, 4326),
+        raw_properties JSONB
+      )
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_brannstasjon_posisjon ON brannstasjoner.brannstasjon USING GIST(posisjon)
+    `);
+
+    // Overture Maps data tables
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS overture.farms (
+        id TEXT PRIMARY KEY,
+        name VARCHAR(255),
+        location GEOMETRY(Point, 4326),
+        raw_properties JSONB
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_farms_location ON overture.farms USING GIST(location)
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS overture.water_sources (
+        id TEXT PRIMARY KEY,
+        name VARCHAR(255),
+        location GEOMETRY(Point, 4326),
+        raw_properties JSONB
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_water_sources_location ON overture.water_sources USING GIST(location)
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS overture.doctors (
+        id TEXT PRIMARY KEY,
+        name VARCHAR(255),
+        location GEOMETRY(Point, 4326),
+        raw_properties JSONB
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_doctors_location ON overture.doctors USING GIST(location)
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS overture.hospitals (
+        id TEXT PRIMARY KEY,
+        name VARCHAR(255),
+        location GEOMETRY(Point, 4326),
+        raw_properties JSONB
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_hospitals_location ON overture.hospitals USING GIST(location)
     `);
     
     // Create population grid table
@@ -395,6 +2056,9 @@ async function initSchema() {
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_user_locations_user_id ON public.user_locations(user_id)
     `);
+
+    await ensureLogisticsStateTable();
+    await ensureHelpRequestsTable();
     
     console.log('✓ Database schema initialized');
   } catch (error) {
@@ -485,6 +2149,182 @@ async function ingestPopulation(geojson) {
   return inserted;
 }
 
+async function ingestFireStations(geojson) {
+  if (!geojson.features) return 0;
+
+  let inserted = 0;
+  for (const feature of geojson.features) {
+    try {
+      const properties = feature.properties || {};
+      const coord = firstCoordinate(feature.geometry);
+      if (!coord || coord.length < 2) continue;
+
+      const lon = Number(coord[0]);
+      const lat = Number(coord[1]);
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
+
+      const fallbackId = `${lon.toFixed(6)}_${lat.toFixed(6)}`;
+      const objid = String(getPropIgnoreCase(properties, ['objid', 'anleggid', 'gml_id']) || fallbackId);
+      const brannstasjon = String(getPropIgnoreCase(properties, ['brannstasjon', 'name', 'navn']) || 'Brannstasjon');
+      const brannvesen = String(getPropIgnoreCase(properties, ['brannvesen']) || '');
+      const stasjonstype = String(getPropIgnoreCase(properties, ['stasjonstype']) || '');
+      const kasernert = String(getPropIgnoreCase(properties, ['kasernert']) || '');
+      const opphav = String(getPropIgnoreCase(properties, ['opphav']) || '');
+
+      await pool.query(`
+        INSERT INTO brannstasjoner.brannstasjon
+          (objid, brannstasjon, brannvesen, stasjonstype, kasernert, opphav, posisjon, raw_properties)
+        VALUES
+          ($1, $2, $3, $4, $5, $6, ST_SetSRID(ST_MakePoint($7, $8), 4326), $9)
+        ON CONFLICT (objid) DO UPDATE SET
+          brannstasjon = EXCLUDED.brannstasjon,
+          brannvesen = EXCLUDED.brannvesen,
+          stasjonstype = EXCLUDED.stasjonstype,
+          kasernert = EXCLUDED.kasernert,
+          opphav = EXCLUDED.opphav,
+          posisjon = EXCLUDED.posisjon,
+          raw_properties = EXCLUDED.raw_properties
+      `, [objid, brannstasjon, brannvesen, stasjonstype, kasernert, opphav, lon, lat, JSON.stringify(properties)]);
+
+      inserted++;
+    } catch (error) {
+      console.error('Ingest fire station error:', error.message);
+    }
+  }
+
+  return inserted;
+}
+
+async function ingestOvertureLayer(table, features) {
+  if (!features || features.length === 0) return 0;
+
+  let inserted = 0;
+  for (const feature of features) {
+    try {
+      const properties = feature.properties || {};
+      const geometry = feature.geometry;
+      if (!geometry || !geometry.coordinates) continue;
+
+      const id = String(properties.id || feature.id || `${geometry.coordinates[0]}_${geometry.coordinates[1]}`);
+      const name = String(properties.name || properties.names?.primary || 'Unknown');
+      const lon = Number(geometry.coordinates[0]);
+      const lat = Number(geometry.coordinates[1]);
+
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
+
+      await pool.query(`
+        INSERT INTO overture.${table}
+          (id, name, location, raw_properties)
+        VALUES
+          ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326), $5)
+        ON CONFLICT (id) DO UPDATE SET
+          name = EXCLUDED.name,
+          location = EXCLUDED.location,
+          raw_properties = EXCLUDED.raw_properties
+      `, [id, name, lon, lat, JSON.stringify(properties)]);
+
+      inserted++;
+    } catch (error) {
+      console.error(`Ingest ${table} error:`, error.message);
+    }
+  }
+
+  return inserted;
+}
+
+async function downloadAndIngestOvertureData() {
+  try {
+    const geoJsonFile = '/app/places_agder.geojson';
+    
+    // Download if not already present
+    if (!fs.existsSync(geoJsonFile)) {
+      console.log('Running Overture Maps download for Agder...');
+      try {
+        execSync('python3 /app/download_overture.py', { stdio: 'inherit', timeout: 300000 });
+      } catch (error) {
+        console.warn('Overture download warning:', error.message);
+        return 0;
+      }
+    }
+    
+    if (!fs.existsSync(geoJsonFile)) {
+      console.warn('Overture GeoJSON file not found');
+      return 0;
+    }
+    
+    // Parse GeoJSON and categorize by place type
+    const geojson = JSON.parse(fs.readFileSync(geoJsonFile, 'utf8'));
+    if (!geojson.features) return 0;
+    
+    console.log(`Processing ${geojson.features.length} Overture place features...`);
+    
+    let inserted = 0;
+    const typeMap = {
+      farms: [],
+      water_sources: [],
+      doctors: [],
+      hospitals: [],
+      other: []
+    };
+    
+    for (const feature of geojson.features) {
+      const props = feature.properties || {};
+      const geometry = feature.geometry;
+      if (!geometry || geometry.type !== 'Point') continue;
+      
+      const id = props.id || uuidv4();
+      const name = props.name || props.names?.primary || 'Unknown Place';
+      const lon = geometry.coordinates[0];
+      const lat = geometry.coordinates[1];
+      const categories = props.categories || {};
+      const categoryPrimary = (categories.primary || '').toLowerCase();
+      
+      // Categorize by primary category
+      let category = 'other';
+      if (categoryPrimary.includes('farm') || categoryPrimary.includes('agricultural')) {
+        category = 'farms';
+      } else if (categoryPrimary.includes('water')) {
+        category = 'water_sources';
+      } else if (categoryPrimary.includes('doctor') || categoryPrimary.includes('clinic') || categoryPrimary.includes('urgent_care')) {
+        category = 'doctors';
+      } else if (categoryPrimary.includes('hospital')) {
+        category = 'hospitals';
+      }
+      
+      if (category !== 'other') {
+        typeMap[category].push({ id, name, lon, lat, props });
+        inserted++;
+      }
+    }
+    
+    // Ingest categorized places
+    for (const [table, places] of Object.entries(typeMap)) {
+      if (table === 'other' || places.length === 0) continue;
+      
+      for (const place of places) {
+        try {
+          await pool.query(`
+            INSERT INTO overture.${table} (id, name, location, raw_properties)
+            VALUES ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326), $5)
+            ON CONFLICT (id) DO UPDATE SET
+              name = EXCLUDED.name,
+              location = EXCLUDED.location,
+              raw_properties = EXCLUDED.raw_properties
+          `, [place.id, place.name, place.lon, place.lat, JSON.stringify(place.props)]);
+        } catch (error) {
+          console.error(`Error ingesting ${table}:`, error.message);
+        }
+      }
+      console.log(`✓ Ingested ${places.length} places into ${table}`);
+    }
+    
+    return inserted;
+  } catch (error) {
+    console.error('Overture data ingestion error:', error.message);
+    return 0;
+  }
+}
+
 async function generateSyntheticPopulation() {
   try {
     // Reset fallback population to avoid accumulation across repeated bootstrap runs.
@@ -542,11 +2382,13 @@ async function bootstrap() {
     SELECT
       (SELECT COUNT(*)::int FROM tilfluktsromoffentlige.tilfluktsrom) AS shelters,
       (SELECT COUNT(*)::int FROM public.population_cells) AS population,
-      (SELECT COALESCE(SUM(population), 0)::bigint FROM public.population_cells) AS population_sum
+      (SELECT COALESCE(SUM(population), 0)::bigint FROM public.population_cells) AS population_sum,
+      (SELECT COUNT(*)::int FROM brannstasjoner.brannstasjon) AS fire_stations
   `);
   let existingShelters = Number(existing.rows[0]?.shelters || 0);
   let existingPopulation = Number(existing.rows[0]?.population || 0);
   let existingPopulationSum = Number(existing.rows[0]?.population_sum || 0);
+  const existingFireStations = Number(existing.rows[0]?.fire_stations || 0);
 
   // Self-heal old inflated fallback datasets from previous versions.
   if (existingPopulation > 50000 || existingPopulationSum > 6_500_000) {
@@ -564,19 +2406,12 @@ async function bootstrap() {
     console.log(`Population baseline repaired (rows=${existingPopulation}, sum=${existingPopulationSum}).`);
   }
 
-  if (existingShelters > 0 && existingPopulation > 0) {
-    console.log(`Data already in database (shelters=${existingShelters}, population=${existingPopulation}), skipping re-ingest.`);
-    return;
-  }
-  
   // Download and ingest shelters
   if (existingShelters === 0) {
     try {
       console.log('Downloading shelters...');
-      const sheltersGeo = await cacheGeoJsonFromZip('shelters', 
-        'https://nedlasting.geonorge.no/geonorge/Samfunnssikkerhet/TilfluktsromOffentlige/GeoJSON/Samfunnssikkerhet_0000_Norge_25833_TilfluktsromOffentlige_GeoJSON.zip');
-      const transformed = await transformProjectedFeatureCollection(sheltersGeo);
-      const count = await ingestShelters(transformed);
+      const sheltersGeo = await cacheTilfluktsromGeoJson();
+      const count = await ingestShelters(sheltersGeo);
       console.log(`✓ Shelters ingested: ${count}`);
     } catch (error) {
       console.error('Shelters bootstrap failed:', error.message);
@@ -590,10 +2425,8 @@ async function bootstrap() {
     try {
       console.log('Downloading population...');
       await pool.query('TRUNCATE public.population_cells');
-      const popGeo = await cacheGeoJsonFromZip('population',
-        'https://nedlasting.geonorge.no/geonorge/Befolkning/BefolkningPaGrunnkretsniva2025/GML/Befolkning_0000_Norge_25833_BefolkningPaGrunnkretsniva2025_GML.zip');
-      const transformed = await transformProjectedFeatureCollection(popGeo);
-      const count = await ingestPopulation(transformed);
+      const popGeo = await cachePopulationGeoJson();
+      const count = await ingestPopulation(popGeo);
       if (count > 0) {
         console.log(`✓ Population ingested: ${count}`);
       } else {
@@ -608,13 +2441,97 @@ async function bootstrap() {
     console.log(`Skipping population ingest (already ${existingPopulation} rows).`);
   }
 
-  // Cache counties and municipalities as GeoJSON layers for frontend toggles (Agder-filtered)
+  // Download and ingest fire stations from provided Geonorge GML ZIP.
+  if (existingFireStations === 0) {
+    try {
+      console.log('Downloading fire stations...');
+      const fireGeo = await cacheFireStationsGeoJson();
+      const fireCount = await ingestFireStations(fireGeo);
+      console.log(`✓ Fire stations ingested: ${fireCount}`);
+    } catch (error) {
+      console.error('Fire stations bootstrap failed:', error.message);
+    }
+  } else {
+    console.log(`Skipping fire station ingest (already ${existingFireStations} rows).`);
+  }
+
+  // Download and ingest real Overture Maps data for Agder
   try {
-    const counties = await cacheGeoJsonFromZip(
-      'counties',
-      'https://nedlasting.geonorge.no/geonorge/Basisdata/Fylker/GeoJSON/Basisdata_0000_Norge_25833_Fylker_GeoJSON.zip'
-    );
-    const countiesWgs84 = await transformProjectedFeatureCollection(counties);
+    const farmCountResult = await pool.query('SELECT COUNT(*) as count FROM overture.farms');
+    const farmCount = Number(farmCountResult.rows[0]?.count || 0);
+    if (farmCount === 0) {
+      console.log('Downloading real Overture Maps data for Agder...');
+      const count = await downloadAndIngestOvertureData();
+      if (count > 0) {
+        console.log(`✓ Overture data loaded: ${count} features across all categories`);
+      } else {
+        console.log('No Overture data ingested, using sample data fallback...');
+        // Sample farms in Agder region (fallback if download fails)
+        const farmSamples = [
+          { id: 'farm_1', name: 'Gård Kristiansand', lon: 8.767, lat: 58.015 },
+          { id: 'farm_2', name: 'Økogård Lillesand', lon: 8.376, lat: 58.267 },
+          { id: 'farm_3', name: 'Appelsinhagen', lon: 7.751, lat: 58.469 }
+        ];
+        for (const farm of farmSamples) {
+          await pool.query(`
+            INSERT INTO overture.farms (id, name, location, raw_properties)
+            VALUES ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326), $5)
+            ON CONFLICT (id) DO NOTHING
+          `, [farm.id, farm.name, farm.lon, farm.lat, JSON.stringify(farm)]);
+        }
+        
+        // Sample water sources
+        const waterSamples = [
+          { id: 'water_1', name: 'Vannverk Mandal', lon: 7.467, lat: 58.031 },
+          { id: 'water_2', name: 'Vannbehandling Arendal', lon: 8.769, lat: 58.460 }
+        ];
+        for (const water of waterSamples) {
+          await pool.query(`
+            INSERT INTO overture.water_sources (id, name, location, raw_properties)
+            VALUES ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326), $5)
+            ON CONFLICT (id) DO NOTHING
+          `, [water.id, water.name, water.lon, water.lat, JSON.stringify(water)]);
+        }
+        
+        // Sample doctors/urgent care
+        const doctorSamples = [
+          { id: 'doc_1', name: 'Legevakt Kristiansand', lon: 8.772, lat: 58.010 },
+          { id: 'doc_2', name: 'Legevakt Arendal', lon: 8.769, lat: 58.462 },
+          { id: 'doc_3', name: 'Legevakt Mandal', lon: 7.467, lat: 58.032 }
+        ];
+        for (const doctor of doctorSamples) {
+          await pool.query(`
+            INSERT INTO overture.doctors (id, name, location, raw_properties)
+            VALUES ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326), $5)
+            ON CONFLICT (id) DO NOTHING
+          `, [doctor.id, doctor.name, doctor.lon, doctor.lat, JSON.stringify(doctor)]);
+        }
+        
+        // Sample hospitals
+        const hospitalSamples = [
+          { id: 'hosp_1', name: 'Sykehuset i Kristiansand', lon: 8.767, lat: 58.015 },
+          { id: 'hosp_2', name: 'Sykehuset i Arendal', lon: 8.769, lat: 58.462 }
+        ];
+        for (const hospital of hospitalSamples) {
+          await pool.query(`
+            INSERT INTO overture.hospitals (id, name, location, raw_properties)
+            VALUES ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326), $5)
+            ON CONFLICT (id) DO NOTHING
+          `, [hospital.id, hospital.name, hospital.lon, hospital.lat, JSON.stringify(hospital)]);
+        }
+        console.log('✓ Sample Overture data loaded');
+      }
+    } else {
+      console.log(`Skipping Overture ingest (already ${farmCount} farm rows).`);
+    }
+  } catch (error) {
+    console.error('Overture data loading failed:', error.message);
+  }
+
+  // Cache counties and municipalities as GeoJSON layers for frontend toggles (Agder-filtered)
+  // Primary source: Kartverket API. Fallback: Geonorge ZIP download.
+  try {
+    await refreshBoundaryLayer('counties');
     const countiesFiltered = await getBoundaryLayerGeoJsonFiltered('counties');
     fs.writeFileSync(path.join(CACHE_DIR, 'counties.geojson'), JSON.stringify(countiesFiltered));
     console.log(`✓ Counties cached (Agder-filtered): ${(countiesFiltered.features || []).length}`);
@@ -623,16 +2540,19 @@ async function bootstrap() {
   }
 
   try {
-    const municipalities = await cacheGeoJsonFromZip(
-      'municipalities',
-      'https://nedlasting.geonorge.no/geonorge/Basisdata/Kommuner/GeoJSON/Basisdata_0000_Norge_25833_Kommuner_GeoJSON.zip'
-    );
-    const municipalitiesWgs84 = await transformProjectedFeatureCollection(municipalities);
+    await refreshBoundaryLayer('municipalities');
     const municipalitiesFiltered = await getBoundaryLayerGeoJsonFiltered('municipalities');
     fs.writeFileSync(path.join(CACHE_DIR, 'municipalities.geojson'), JSON.stringify(municipalitiesFiltered));
     console.log(`✓ Municipalities cached (Agder-filtered): ${(municipalitiesFiltered.features || []).length}`);
   } catch (error) {
     console.error('Municipalities cache failed:', error.message);
+  }
+
+  try {
+    await buildOrRefreshLogisticsPlan();
+    console.log('✓ Logistics plan initialized at startup');
+  } catch (error) {
+    console.warn('Startup logistics plan initialization failed:', error.message);
   }
   
   console.log('✓ Bootstrap complete');
@@ -909,31 +2829,81 @@ app.get('/api/routing/nearest-shelters', async (req, res) => {
     // Speed modes in km/h
     const speeds = { walk: 5, bike: 20, car: 60 };
     const speed = speeds[mode] || 5;
-    
-    const result = await pool.query(`
-      SELECT 
+
+    const { latestUsersCte } = await buildLatestUsersSubquery();
+    const safeAreaExistsResult = await pool.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = 'safe_areas'
+      ) AS exists
+    `);
+
+    const shelterResult = await pool.query(`
+      ${latestUsersCte}
+      SELECT
         s.id,
         s.shelter_id,
+        'shelter'::text AS kind,
         s.name,
-        s.capacity,
+        COALESCE(s.capacity, 0)::int AS capacity,
         ST_X(s.location) AS lon,
         ST_Y(s.location) AS lat,
         ST_DistanceSphere(ST_MakePoint($1::float, $2::float), s.location) AS distance_m,
-        COALESCE(SUM(p.population), 0) AS population_nearby,
-        s.capacity - COALESCE(SUM(p.population), 0) AS free_spots
+        COUNT(lu.user_id)::int AS live_users_count
       FROM tilfluktsromoffentlige.tilfluktsrom s
-      LEFT JOIN public.population_cells p ON ST_DWithin(s.location::geography, p.location::geography, 1000)
+      LEFT JOIN latest lu ON ST_DWithin(lu.location::geography, s.location::geography, 150)
       WHERE ST_Intersects(s.location, ${agderGeom})
       GROUP BY s.id, s.shelter_id, s.name, s.capacity, s.location
-      ORDER BY ${strategy === 'hasSpace' ? 'free_spots DESC, distance_m' : 'distance_m'}
-      LIMIT 20
     `, [parseFloat(lon), parseFloat(lat)]);
-    
-    const shelters = result.rows.map(s => ({
-      ...s,
-      distance_km: (s.distance_m / 1000).toFixed(2),
-      travel_time_minutes: Math.round((s.distance_m / 1000) / speed * 60)
-    }));
+
+    let safeAreaRows = [];
+    if (safeAreaExistsResult.rows[0]?.exists) {
+      const safeAreaResult = await pool.query(`
+        ${latestUsersCte}
+        SELECT
+          sa.id,
+          NULL::text AS shelter_id,
+          'safe_area'::text AS kind,
+          sa.name,
+          COALESCE(sa.capacity, 0)::int AS capacity,
+          ST_X(sa.location) AS lon,
+          ST_Y(sa.location) AS lat,
+          ST_DistanceSphere(ST_MakePoint($1::float, $2::float), sa.location) AS distance_m,
+          COUNT(lu.user_id)::int AS live_users_count
+        FROM public.safe_areas sa
+        LEFT JOIN latest lu ON ST_DWithin(lu.location::geography, sa.location::geography, 150)
+        WHERE ST_Intersects(sa.location, ${agderGeom})
+        GROUP BY sa.id, sa.name, sa.capacity, sa.location
+      `, [parseFloat(lon), parseFloat(lat)]);
+      safeAreaRows = safeAreaResult.rows || [];
+    }
+
+    const candidates = [...(shelterResult.rows || []), ...safeAreaRows]
+      .map((row) => {
+        const capacity = Number(row.capacity || 0);
+        const liveUsersCount = Number(row.live_users_count || 0);
+        const distanceMeters = Number(row.distance_m || 0);
+        const freeSpots = capacity - liveUsersCount;
+
+        return {
+          ...row,
+          distance_m: distanceMeters,
+          live_users_count: liveUsersCount,
+          free_spots: freeSpots,
+          has_space: liveUsersCount < capacity,
+          distance_km: (distanceMeters / 1000).toFixed(2),
+          travel_time_minutes: Math.max(1, Math.round((distanceMeters / 1000) / speed * 60))
+        };
+      });
+
+    const filtered = strategy === 'hasSpace'
+      ? candidates.filter((candidate) => candidate.has_space)
+      : candidates;
+
+    const shelters = filtered
+      .sort((a, b) => a.distance_m - b.distance_m)
+      .slice(0, 20);
     
     res.json({ mode, strategy, shelters });
   } catch (error) {
@@ -941,7 +2911,7 @@ app.get('/api/routing/nearest-shelters', async (req, res) => {
   }
 });
 
-// User: road-based route guidance (OSRM style)
+// User: road-based route guidance (Valhalla first, then OSRM fallback)
 app.get('/api/routing/route', async (req, res) => {
   try {
     const originLon = Number(req.query.originLon);
@@ -953,55 +2923,345 @@ app.get('/api/routing/route', async (req, res) => {
     if (![originLon, originLat, destLon, destLat].every(Number.isFinite)) {
       return res.status(400).json({ error: 'Missing or invalid coordinates' });
     }
-
-    const profile = mode === 'car' ? 'driving' : mode === 'bike' ? 'bike' : 'foot';
-    const osrmUrl = `https://router.project-osrm.org/route/v1/${profile}/${originLon},${originLat};${destLon},${destLat}?overview=full&geometries=geojson&steps=true`;
-
-    try {
-      const response = await axios.get(osrmUrl, { timeout: 15000 });
-      const route = response.data?.routes?.[0];
-      if (!route || !route.geometry?.coordinates) throw new Error('No route from OSRM');
-
-      const steps = (route.legs || [])
-        .flatMap((leg) => leg.steps || [])
-        .slice(0, 12)
-        .map((step) => ({
-          distance_m: Math.round(step.distance || 0),
-          duration_s: Math.round(step.duration || 0),
-          instruction: step.name || step.maneuver?.instruction || 'Fortsett'
-        }));
-
-      return res.json({
-        mode,
-        source: 'osrm',
-        distance_m: Math.round(route.distance || 0),
-        duration_s: Math.round(route.duration || 0),
-        geometry: {
-          type: 'LineString',
-          coordinates: route.geometry.coordinates
-        },
-        steps
-      });
-    } catch (proxyError) {
-      const distance = haversineMeters(originLat, originLon, destLat, destLon);
-      const speedKmh = mode === 'car' ? 60 : mode === 'bike' ? 20 : 5;
-      const durationS = Math.round((distance / 1000) / speedKmh * 3600);
-
-      return res.json({
-        mode,
-        source: 'fallback-straight-line',
-        distance_m: Math.round(distance),
-        duration_s: durationS,
-        geometry: {
-          type: 'LineString',
-          coordinates: [[originLon, originLat], [destLon, destLat]]
-        },
-        steps: [
-          { distance_m: Math.round(distance), duration_s: durationS, instruction: 'Gå mot valgt tilfluktsrom' }
-        ]
-      });
-    }
+    const route = await computeRouteBetweenPoints({ originLon, originLat, destLon, destLat, mode });
+    res.json(route);
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/logistics/plan', async (req, res) => {
+  try {
+    const state = await readLogisticsState();
+    const snapshot = await buildOrRefreshLogisticsPlan(state.settings || {});
+    res.json(snapshot.plan);
+  } catch (error) {
+    console.error('Error loading logistics plan:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/logistics/plan', async (req, res) => {
+  try {
+    const settings = req.body?.settings || req.body || {};
+    const snapshot = await buildOrRefreshLogisticsPlan(settings);
+    res.json(snapshot.plan);
+  } catch (error) {
+    console.error('Error building logistics plan:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/admin/logistics/plan', async (req, res) => {
+  try {
+    await ensureLogisticsStateTable();
+    await pool.query(`
+      UPDATE public.mock_logistics_state
+      SET plan = '{}'::jsonb,
+          snapshot_key = NULL,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+    `);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error clearing logistics plan:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/logistics/dispatch-all', async (req, res) => {
+  try {
+    const state = await readLogisticsState();
+    const jobs = Array.isArray(state.plan?.jobs) ? clonePlanJobs(state.plan.jobs) : [];
+    const startedAt = Date.now();
+    const routeMode = String(state.settings?.routeMode || 'car');
+    const nextJobs = [];
+
+    for (const job of jobs) {
+      if (job.status === 'arrived' || job.status === 'moving') {
+        nextJobs.push(job);
+        continue;
+      }
+
+      const outboundRoute = hasRoadRouteGeometry(job.outboundRoute)
+        ? job.outboundRoute
+        : hasRoadRouteGeometry(job.route)
+        ? job.route
+        : await computeRouteBetweenPoints({
+          originLon: job.source?.lon,
+          originLat: job.source?.lat,
+          destLon: job.target?.lon,
+          destLat: job.target?.lat,
+          mode: routeMode
+        });
+
+      const returnRoute = hasRoadRouteGeometry(job.returnRoute)
+        ? job.returnRoute
+        : await computeRouteBetweenPoints({
+          originLon: job.target?.lon,
+          originLat: job.target?.lat,
+          destLon: job.source?.lon,
+          destLat: job.source?.lat,
+          mode: routeMode
+        });
+
+      const routeInfo = logisticsRouteSummary(outboundRoute);
+
+      nextJobs.push({
+        ...job,
+        route: outboundRoute,
+        outboundRoute,
+        returnRoute,
+        leg: 'outbound',
+        etaMinutes: routeInfo.etaMinutes,
+        distanceKm: routeInfo.distanceKm,
+        etaLabel: routeInfo.etaLabel,
+        status: 'moving',
+        startedAt,
+        completedAt: null,
+        progress: 0,
+        currentPosition: [job.source?.lon, job.source?.lat]
+      });
+
+      await waitMs(120);
+    }
+
+    const plan = {
+      ...(state.plan || {}),
+      jobs: nextJobs,
+      updated_at: new Date().toISOString()
+    };
+
+    await saveLogisticsState({
+      plan,
+      snapshotKey: state.snapshot_key,
+      settings: state.settings || {}
+    });
+
+    res.json(plan);
+  } catch (error) {
+    console.error('Error dispatching all logistics trucks:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/logistics/trucks/:truckId/dispatch', async (req, res) => {
+  try {
+    const { truckId } = req.params;
+    const state = await readLogisticsState();
+    const jobs = Array.isArray(state.plan?.jobs) ? clonePlanJobs(state.plan.jobs) : [];
+    const currentJob = jobs.find((job) => job.id === truckId);
+
+    if (!currentJob) {
+      return res.status(404).json({ error: 'Truck not found' });
+    }
+
+    if (currentJob.status === 'moving' || currentJob.status === 'arrived') {
+      return res.json(state.plan);
+    }
+
+    const routeMode = String(state.settings?.routeMode || 'car');
+
+    const plan = {
+      ...(state.plan || {}),
+      updated_at: new Date().toISOString(),
+      jobs: await Promise.all(jobs.map(async (job) => {
+        if (job.id !== truckId) return job;
+
+        const outboundRoute = hasRoadRouteGeometry(job.outboundRoute)
+          ? job.outboundRoute
+          : hasRoadRouteGeometry(job.route)
+          ? job.route
+          : await computeRouteBetweenPoints({
+            originLon: job.source?.lon,
+            originLat: job.source?.lat,
+            destLon: job.target?.lon,
+            destLat: job.target?.lat,
+            mode: routeMode
+          });
+
+        const returnRoute = hasRoadRouteGeometry(job.returnRoute)
+          ? job.returnRoute
+          : await computeRouteBetweenPoints({
+            originLon: job.target?.lon,
+            originLat: job.target?.lat,
+            destLon: job.source?.lon,
+            destLat: job.source?.lat,
+            mode: routeMode
+          });
+
+        const routeInfo = logisticsRouteSummary(outboundRoute);
+
+        return {
+          ...job,
+          route: outboundRoute,
+          outboundRoute,
+          returnRoute,
+          leg: 'outbound',
+          etaMinutes: routeInfo.etaMinutes,
+          distanceKm: routeInfo.distanceKm,
+          etaLabel: routeInfo.etaLabel,
+          status: 'moving',
+          startedAt: Date.now(),
+          completedAt: null,
+          progress: 0,
+          currentPosition: [job.source?.lon, job.source?.lat]
+        };
+      }))
+    };
+
+    await saveLogisticsState({
+      plan,
+      snapshotKey: state.snapshot_key,
+      settings: state.settings || {}
+    });
+
+    res.json(plan);
+  } catch (error) {
+    console.error('Error dispatching logistics truck:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/logistics/trucks/:truckId/preview-route', async (req, res) => {
+  try {
+    const { truckId } = req.params;
+    const state = await readLogisticsState();
+    const jobs = Array.isArray(state.plan?.jobs) ? clonePlanJobs(state.plan.jobs) : [];
+    const currentJob = jobs.find((job) => job.id === truckId);
+
+    if (!currentJob) {
+      return res.status(404).json({ error: 'Truck not found' });
+    }
+
+    if (hasRoadRouteGeometry(currentJob.route)) {
+      return res.json(state.plan);
+    }
+
+    const routeMode = String(state.settings?.routeMode || 'car');
+    const route = await computeRouteBetweenPoints({
+      originLon: currentJob.source?.lon,
+      originLat: currentJob.source?.lat,
+      destLon: currentJob.target?.lon,
+      destLat: currentJob.target?.lat,
+      mode: routeMode
+    });
+    const routeInfo = logisticsRouteSummary(route);
+
+    const plan = {
+      ...(state.plan || {}),
+      updated_at: new Date().toISOString(),
+      jobs: jobs.map((job) => {
+        if (job.id !== truckId) return job;
+        return {
+          ...job,
+          route,
+          etaMinutes: routeInfo.etaMinutes,
+          distanceKm: routeInfo.distanceKm,
+          etaLabel: routeInfo.etaLabel,
+          currentPosition: job.currentPosition || [job.source?.lon, job.source?.lat]
+        };
+      })
+    };
+
+    await saveLogisticsState({
+      plan,
+      snapshotKey: state.snapshot_key,
+      settings: state.settings || {}
+    });
+
+    res.json(plan);
+  } catch (error) {
+    console.error('Error previewing logistics truck route:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.patch('/api/admin/logistics/trucks/:truckId', async (req, res) => {
+  try {
+    const { truckId } = req.params;
+    const { status, startedAt, completedAt } = req.body || {};
+    const state = await readLogisticsState();
+    const jobs = Array.isArray(state.plan?.jobs) ? clonePlanJobs(state.plan.jobs) : [];
+    const currentJob = jobs.find((job) => job.id === truckId);
+
+    if (!currentJob) {
+      return res.status(404).json({ error: 'Truck not found' });
+    }
+
+    const plan = {
+      ...(state.plan || {}),
+      updated_at: new Date().toISOString(),
+      jobs: await Promise.all(jobs.map(async (job) => {
+        if (job.id !== truckId) return job;
+
+        const requestedStatus = status || job.status;
+        const requestedLeg = String(req.body?.leg || job.leg || 'outbound');
+
+        if (requestedStatus === 'arrived' && requestedLeg === 'outbound') {
+          const routeMode = String(state.settings?.routeMode || 'car');
+          const returnRoute = hasRoadRouteGeometry(job.returnRoute)
+            ? job.returnRoute
+            : await computeRouteBetweenPoints({
+              originLon: job.target?.lon,
+              originLat: job.target?.lat,
+              destLon: job.source?.lon,
+              destLat: job.source?.lat,
+              mode: routeMode
+            });
+          const routeInfo = logisticsRouteSummary(returnRoute);
+
+          return {
+            ...job,
+            route: returnRoute,
+            returnRoute,
+            outboundRoute: job.outboundRoute || job.route || null,
+            leg: 'return',
+            status: 'moving',
+            startedAt: Date.now(),
+            completedAt: null,
+            progress: 0,
+            etaMinutes: routeInfo.etaMinutes,
+            distanceKm: routeInfo.distanceKm,
+            etaLabel: routeInfo.etaLabel,
+            currentPosition: [job.target?.lon, job.target?.lat]
+          };
+        }
+
+        if (requestedStatus === 'arrived' && requestedLeg === 'return') {
+          return {
+            ...job,
+            status: 'planned',
+            leg: 'outbound',
+            route: job.outboundRoute || null,
+            startedAt: null,
+            completedAt: null,
+            progress: 0,
+            currentPosition: [job.source?.lon, job.source?.lat]
+          };
+        }
+
+        return {
+          ...job,
+          status: requestedStatus,
+          leg: requestedLeg,
+          startedAt: startedAt || job.startedAt || null,
+          completedAt: completedAt || job.completedAt || null,
+          currentPosition: req.body?.currentPosition || job.currentPosition || [job.source?.lon, job.source?.lat],
+          progress: Number.isFinite(Number(req.body?.progress)) ? Number(req.body.progress) : job.progress || 0
+        };
+      }))
+    };
+
+    await saveLogisticsState({
+      plan,
+      snapshotKey: state.snapshot_key,
+      settings: state.settings || {}
+    });
+
+    res.json(plan);
+  } catch (error) {
+    console.error('Error updating logistics truck:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -1011,18 +3271,620 @@ app.post('/api/users/:userId/location', async (req, res) => {
   try {
     const { userId } = req.params;
     const { lon, lat } = req.body;
+    const lonNum = Number(lon);
+    const latNum = Number(lat);
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     
-    if (!lon || !lat) {
-      return res.status(400).json({ error: 'Missing lon/lat' });
+    if (!Number.isFinite(lonNum) || !Number.isFinite(latNum)) {
+      return res.status(400).json({ error: 'Missing or invalid lon/lat' });
+    }
+
+    // If this deployment uses UUID + FK schema, ensure user exists.
+    if (uuidRegex.test(userId)) {
+      await pool.query(`
+        INSERT INTO public.app_users (id, opt_tracking)
+        VALUES ($1::uuid, true)
+        ON CONFLICT (id) DO NOTHING
+      `, [userId]);
     }
     
     await pool.query(`
       INSERT INTO public.user_locations (user_id, location)
       VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 4326))
-    `, [userId, parseFloat(lon), parseFloat(lat)]);
+    `, [userId, lonNum, latNum]);
+
+    queueLogisticsRefresh('user-location');
     
     res.json({ ok: true });
   } catch (error) {
+    console.error('Error saving user location:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/users/:userId/help-requests', async (req, res) => {
+  try {
+    await ensureHelpRequestsTable();
+
+    const { userId } = req.params;
+    const {
+      lon,
+      lat,
+      text_message,
+      voice_transcript,
+      audio_data_url,
+      requested_unit
+    } = req.body || {};
+
+    const lonNum = Number(lon);
+    const latNum = Number(lat);
+    if (!Number.isFinite(lonNum) || !Number.isFinite(latNum)) {
+      return res.status(400).json({ error: 'Missing or invalid lon/lat' });
+    }
+
+    const textMessage = String(text_message || '').trim();
+    const voiceTranscript = String(voice_transcript || '').trim();
+    const audioDataUrl = String(audio_data_url || '').trim();
+    const requestedUnit = String(requested_unit || '').trim().toLowerCase();
+    const normalizedRequestedUnit = ['firetruck', 'ambulance'].includes(requestedUnit) ? requestedUnit : null;
+
+    if (!textMessage && !voiceTranscript && !audioDataUrl) {
+      return res.status(400).json({ error: 'Provide text and/or audio message' });
+    }
+
+    const result = await pool.query(`
+      INSERT INTO public.help_requests (
+        user_id,
+        location,
+        text_message,
+        voice_transcript,
+        audio_data_url,
+        requested_unit,
+        raw_payload
+      )
+      VALUES (
+        $1,
+        ST_SetSRID(ST_MakePoint($2, $3), 4326),
+        $4,
+        $5,
+        $6,
+        $7,
+        $8::jsonb
+      )
+      RETURNING
+        id,
+        user_id,
+        ST_X(location) AS lon,
+        ST_Y(location) AS lat,
+        text_message,
+        voice_transcript,
+        audio_data_url,
+        requested_unit,
+        dispatched_unit,
+        status,
+        created_at,
+        handled_at
+    `, [
+      String(userId || '').trim(),
+      lonNum,
+      latNum,
+      textMessage || null,
+      voiceTranscript || null,
+      audioDataUrl || null,
+      normalizedRequestedUnit,
+      JSON.stringify(req.body || {})
+    ]);
+
+    res.json({ ok: true, request: result.rows[0] });
+  } catch (error) {
+    console.error('Error creating help request:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/help-requests', async (req, res) => {
+  try {
+    await ensureHelpRequestsTable();
+
+    const statusFilter = String(req.query.status || 'open').trim().toLowerCase();
+    const allowedStatuses = ['open', 'dispatched', 'closed', 'all'];
+    const effectiveStatus = allowedStatuses.includes(statusFilter) ? statusFilter : 'open';
+
+    const params = [];
+    const whereClause = effectiveStatus === 'all'
+      ? ''
+      : 'WHERE hr.status = $1';
+
+    if (effectiveStatus !== 'all') {
+      params.push(effectiveStatus);
+    }
+
+    const result = await pool.query(`
+      SELECT
+        hr.id,
+        hr.user_id,
+        ST_X(hr.location) AS lon,
+        ST_Y(hr.location) AS lat,
+        hr.text_message,
+        hr.voice_transcript,
+        hr.audio_data_url,
+        hr.requested_unit,
+        hr.dispatched_unit,
+        hr.status,
+        hr.created_at,
+        hr.handled_at
+      FROM public.help_requests hr
+      ${whereClause}
+      ORDER BY hr.created_at DESC
+    `, params);
+
+    const features = result.rows.map((row) => ({
+      type: 'Feature',
+      geometry: {
+        type: 'Point',
+        coordinates: [Number(row.lon), Number(row.lat)]
+      },
+      properties: {
+        id: Number(row.id),
+        user_id: row.user_id,
+        text_message: row.text_message,
+        voice_transcript: row.voice_transcript,
+        audio_data_url: row.audio_data_url,
+        requested_unit: row.requested_unit,
+        dispatched_unit: row.dispatched_unit,
+        status: row.status,
+        created_at: row.created_at,
+        handled_at: row.handled_at,
+      }
+    }));
+
+    res.json({
+      type: 'FeatureCollection',
+      features,
+      status: effectiveStatus,
+      count: features.length
+    });
+  } catch (error) {
+    console.error('Error loading help requests:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.patch('/api/admin/help-requests/:id/dispatch', async (req, res) => {
+  try {
+    await ensureHelpRequestsTable();
+
+    const requestId = Number(req.params.id);
+    const unitType = String(req.body?.unitType || '').trim().toLowerCase();
+
+    if (!Number.isFinite(requestId)) {
+      return res.status(400).json({ error: 'Invalid request id' });
+    }
+    if (!['firetruck', 'ambulance'].includes(unitType)) {
+      return res.status(400).json({ error: 'Invalid unit type' });
+    }
+
+    const result = await pool.query(`
+      UPDATE public.help_requests
+      SET
+        dispatched_unit = $2,
+        status = 'dispatched',
+        handled_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+      RETURNING
+        id,
+        user_id,
+        ST_X(location) AS lon,
+        ST_Y(location) AS lat,
+        text_message,
+        voice_transcript,
+        audio_data_url,
+        requested_unit,
+        dispatched_unit,
+        status,
+        created_at,
+        handled_at
+    `, [requestId, unitType]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Help request not found' });
+    }
+
+    res.json({ ok: true, request: result.rows[0] });
+  } catch (error) {
+    console.error('Error dispatching help request:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/admin/mock-users', async (req, res) => {
+  try {
+    const { userIds } = req.body || {};
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const ids = Array.isArray(userIds)
+      ? userIds.map((id) => String(id).trim()).filter((id) => uuidRegex.test(id))
+      : [];
+
+    if (ids.length === 0) {
+      return res.json({ ok: true, deleted: 0 });
+    }
+
+    await pool.query(`
+      DELETE FROM public.user_locations
+      WHERE user_id::uuid = ANY($1::uuid[])
+    `, [ids]);
+
+    await pool.query(`
+      DELETE FROM public.app_users
+      WHERE id = ANY($1::uuid[])
+    `, [ids]);
+
+    queueLogisticsRefresh('mock-users-cleared');
+
+    res.json({ ok: true, deleted: ids.length });
+  } catch (error) {
+    console.error('Error deleting mock users:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: latest known position for each tracked user
+app.get('/api/admin/live-users', async (req, res) => {
+  try {
+    const columnCheck = await pool.query(`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'user_locations'
+        AND column_name IN ('timestamp', 'created_at')
+    `);
+
+    const columns = new Set(columnCheck.rows.map((r) => r.column_name));
+    const timeColumn = columns.has('timestamp')
+      ? 'timestamp'
+      : columns.has('created_at')
+        ? 'created_at'
+        : null;
+
+    const orderExpr = timeColumn ? `"${timeColumn}" DESC NULLS LAST, id DESC` : 'id DESC';
+    const selectTimeExpr = timeColumn ? `"${timeColumn}"` : 'NOW()';
+
+    const result = await pool.query(`
+      WITH latest AS (
+        SELECT DISTINCT ON (user_id)
+          user_id::text AS user_id,
+          location,
+          ${selectTimeExpr} AS last_seen
+        FROM public.user_locations
+        WHERE location IS NOT NULL
+        ORDER BY user_id, ${orderExpr}
+      )
+      SELECT
+        user_id,
+        ST_X(location) AS lon,
+        ST_Y(location) AS lat,
+        last_seen
+      FROM latest
+    `);
+
+    const features = result.rows.map((row) => ({
+      type: 'Feature',
+      geometry: {
+        type: 'Point',
+        coordinates: [Number(row.lon), Number(row.lat)]
+      },
+      properties: {
+        user_id: row.user_id,
+        last_seen: row.last_seen
+      }
+    }));
+
+    res.json({
+      type: 'FeatureCollection',
+      features
+    });
+  } catch (error) {
+    console.error('Error loading live users:', error);
+    res.json({
+      type: 'FeatureCollection',
+      features: []
+    });
+  }
+});
+
+async function buildLatestUsersSubquery() {
+  const columnCheck = await pool.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'user_locations'
+      AND column_name IN ('timestamp', 'created_at')
+  `);
+
+  const columns = new Set(columnCheck.rows.map((r) => r.column_name));
+  const timeColumn = columns.has('timestamp')
+    ? 'timestamp'
+    : columns.has('created_at')
+      ? 'created_at'
+      : null;
+
+  const orderExpr = timeColumn ? `"${timeColumn}" DESC NULLS LAST, id DESC` : 'id DESC';
+  const selectTimeExpr = timeColumn ? `"${timeColumn}"` : 'NOW()';
+
+  return {
+    latestUsersCte: `
+      WITH latest AS (
+        SELECT DISTINCT ON (user_id)
+          user_id::text AS user_id,
+          location,
+          ${selectTimeExpr} AS last_seen
+        FROM public.user_locations
+        WHERE location IS NOT NULL
+        ORDER BY user_id, ${orderExpr}
+      )
+    `,
+  };
+}
+
+app.get('/api/admin/shelters/:id/live-users', async (req, res) => {
+  try {
+    const shelterId = Number(req.params.id);
+    const radiusM = Number.parseInt(req.query.radius, 10) || 150;
+
+    if (!Number.isFinite(shelterId)) {
+      return res.status(400).json({ error: 'Invalid shelter id' });
+    }
+
+    const { latestUsersCte } = await buildLatestUsersSubquery();
+    const result = await pool.query(`
+      ${latestUsersCte}
+      SELECT
+        COUNT(*)::int AS live_users_count
+      FROM latest lu
+      JOIN tilfluktsromoffentlige.tilfluktsrom s ON s.id = $1
+      WHERE ST_DWithin(lu.location::geography, s.location::geography, $2)
+    `, [shelterId, radiusM]);
+
+    res.json({
+      id: shelterId,
+      radius_m: radiusM,
+      live_users_count: Number(result.rows[0]?.live_users_count || 0),
+      updated_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('Error counting live users near shelter:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/safe-areas/:id/live-users', async (req, res) => {
+  try {
+    const safeAreaId = Number(req.params.id);
+    const radiusM = Number.parseInt(req.query.radius, 10) || 150;
+
+    if (!Number.isFinite(safeAreaId)) {
+      return res.status(400).json({ error: 'Invalid safe area id' });
+    }
+
+    const { latestUsersCte } = await buildLatestUsersSubquery();
+    const result = await pool.query(`
+      ${latestUsersCte}
+      SELECT
+        COUNT(*)::int AS live_users_count
+      FROM latest lu
+      JOIN public.safe_areas sa ON sa.id = $1
+      WHERE ST_DWithin(lu.location::geography, sa.location::geography, $2)
+    `, [safeAreaId, radiusM]);
+
+    res.json({
+      id: safeAreaId,
+      radius_m: radiusM,
+      live_users_count: Number(result.rows[0]?.live_users_count || 0),
+      updated_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('Error counting live users near safe area:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/shelters/live-users', async (req, res) => {
+  try {
+    const radiusM = Number.parseInt(req.query.radius, 10) || 150;
+    const { latestUsersCte } = await buildLatestUsersSubquery();
+
+    const result = await pool.query(`
+      ${latestUsersCte}
+      SELECT
+        s.id,
+        COUNT(lu.user_id)::int AS live_users_count
+      FROM tilfluktsromoffentlige.tilfluktsrom s
+      LEFT JOIN latest lu ON ST_DWithin(lu.location::geography, s.location::geography, $1)
+      GROUP BY s.id
+      ORDER BY s.id
+    `, [radiusM]);
+
+    res.json({
+      radius_m: radiusM,
+      counts: result.rows.map((row) => ({
+        id: Number(row.id),
+        live_users_count: Number(row.live_users_count || 0),
+      })),
+      updated_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('Error counting live users near shelters:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/safe-areas/live-users', async (req, res) => {
+  try {
+    const radiusM = Number.parseInt(req.query.radius, 10) || 150;
+
+    const tableExists = await pool.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = 'safe_areas'
+      )
+    `);
+
+    if (!tableExists.rows[0]?.exists) {
+      return res.json({
+        radius_m: radiusM,
+        counts: [],
+        updated_at: new Date().toISOString(),
+      });
+    }
+
+    const { latestUsersCte } = await buildLatestUsersSubquery();
+    const result = await pool.query(`
+      ${latestUsersCte}
+      SELECT
+        sa.id,
+        COUNT(lu.user_id)::int AS live_users_count
+      FROM public.safe_areas sa
+      LEFT JOIN latest lu ON ST_DWithin(lu.location::geography, sa.location::geography, $1)
+      GROUP BY sa.id
+      ORDER BY sa.id
+    `, [radiusM]);
+
+    res.json({
+      radius_m: radiusM,
+      counts: result.rows.map((row) => ({
+        id: Number(row.id),
+        live_users_count: Number(row.live_users_count || 0),
+      })),
+      updated_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('Error counting live users near safe areas:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: create a new safe area
+app.post('/api/admin/safe-areas', async (req, res) => {
+  try {
+    const { name, lon, lat, capacity } = req.body;
+    
+    if (!name || lon === undefined || lat === undefined) {
+      return res.status(400).json({ error: 'Missing name, lon, or lat' });
+    }
+    
+    // Ensure table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS public.safe_areas (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        location GEOMETRY(Point, 4326) NOT NULL,
+        capacity INT DEFAULT 0,
+        created_by VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_safe_areas_location ON public.safe_areas USING GIST(location);
+    `);
+    
+    const result = await pool.query(`
+      INSERT INTO public.safe_areas (name, location, capacity)
+      VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 4326), $4)
+      RETURNING id, name, ST_X(location) as lon, ST_Y(location) as lat, capacity, created_at
+    `, [name, parseFloat(lon), parseFloat(lat), parseInt(capacity) || 0]);
+
+    queueLogisticsRefresh('safe-area-created');
+    
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error creating safe area:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all safe areas as GeoJSON
+app.get('/api/layers/safe-areas', async (req, res) => {
+  try {
+    // Check if table exists first
+    const tableExists = await pool.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name = 'safe_areas'
+      );
+    `);
+    
+    if (!tableExists.rows[0].exists) {
+      console.log('safe_areas table does not exist yet');
+      return res.json({
+        type: 'FeatureCollection',
+        features: []
+      });
+    }
+    
+    const result = await pool.query(`
+      SELECT 
+        id,
+        name,
+        capacity,
+        ST_X(location) as lon,
+        ST_Y(location) as lat
+      FROM public.safe_areas
+    `);
+    
+    const features = result.rows.map(row => ({
+      type: 'Feature',
+      geometry: {
+        type: 'Point',
+        coordinates: [parseFloat(row.lon), parseFloat(row.lat)]
+      },
+      properties: {
+        id: row.id,
+        name: row.name,
+        capacity: row.capacity
+      }
+    }));
+    
+    res.json({
+      type: 'FeatureCollection',
+      features: features
+    });
+  } catch (error) {
+    console.error('Error loading safe areas:', error);
+    // Return empty collection on error instead of 500
+    res.json({
+      type: 'FeatureCollection',
+      features: []
+    });
+  }
+});
+
+// Delete a safe area
+app.delete('/api/admin/safe-areas/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Ensure table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS public.safe_areas (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        location GEOMETRY(Point, 4326) NOT NULL,
+        capacity INT DEFAULT 0,
+        created_by VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_safe_areas_location ON public.safe_areas USING GIST(location);
+    `);
+    
+    await pool.query('DELETE FROM public.safe_areas WHERE id = $1', [id]);
+
+    queueLogisticsRefresh('safe-area-deleted');
+    
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error deleting safe area:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -1126,6 +3988,47 @@ app.get('/api/layers/:layer', async (req, res) => {
           ))
         ) AS geojson
         FROM (SELECT * FROM public.population_cells WHERE ST_Intersects(location, ${agderGeom}) LIMIT 3000) p
+      `;
+      result = await pool.query(query);
+    } else if (layer === 'fire_stations') {
+      query = `
+        SELECT json_build_object(
+          'type', 'FeatureCollection',
+          'features', COALESCE(json_agg(json_build_object(
+            'type', 'Feature',
+            'geometry', ST_AsGeoJSON(posisjon)::json,
+            'properties', json_build_object(
+              'objid', objid,
+              'brannstasjon', brannstasjon,
+              'brannvesen', brannvesen,
+              'stasjonstype', stasjonstype,
+              'kasernert', kasernert,
+              'opphav', opphav
+            )
+          )), '[]'::json)
+        ) AS geojson
+        FROM brannstasjoner.brannstasjon
+        WHERE ST_Intersects(posisjon, ${agderGeom})
+      `;
+      result = await pool.query(query);
+    } else if (layer === 'farms' || layer === 'water_sources' || layer === 'doctors' || layer === 'hospitals') {
+      // Overture Maps layers
+      query = `
+        SELECT json_build_object(
+          'type', 'FeatureCollection',
+          'features', COALESCE(json_agg(json_build_object(
+            'type', 'Feature',
+            'geometry', json_build_object('type', 'Point', 'coordinates', json_build_array(ST_X(location), ST_Y(location))),
+            'properties', json_build_object(
+              'id', id,
+              'name', name,
+              'type', '${layer}'
+            )
+          )), '[]'::json)
+        ) AS geojson
+        FROM overture.${layer}
+        WHERE ST_Intersects(location, ${agderGeom})
+        LIMIT 1000
       `;
       result = await pool.query(query);
     } else if (layer === 'counties' || layer === 'municipalities') {
