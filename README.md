@@ -1,8 +1,12 @@
 # Beredskapskart (Gruppe 4)
 
+## Problemstilling
+
+Hvordan kan et digitalt kartbasert system utvikles for å hjelpe befolkningen med å finne nødvendige ressurser i krisesituasjoner?
+
 ## Prosjektnavn & TLDR: 
 
-Dette systemet visualiserer tilfluktsrom, befolkning og beredskapsdata på kart for å støtte evakuering og krisehåndtering.
+2026 er utpekt som totalforsvarets år og dette systemet visualiserer tilfluktsrom, befolkning og beredskapsdata på kart for å støtte evakuering og krisehåndtering.
 Brukere kan analysere kapasitet, finne nærmeste tilfluktsrom og utforske geografiske data i sanntid.
 Applikasjonen bruker OpenStreetMap som basiskart, React i frontend og lokal PostGIS i Docker.
 
