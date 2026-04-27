@@ -967,9 +967,9 @@ map.on('load', () => {
         const response = await fetch(`${backendBase}feature/${encodeURIComponent(table)}/${encodeURIComponent(id)}`);
         const fullFeature = await response.json();
 
-        let popupHTML = '<h3>Feature Details</h3>';
+        let popupHTML = '<h3>Feature-detaljer</h3>';
         for (const [key, value] of Object.entries(fullFeature.properties || {})) {
-          popupHTML += `<p><strong>${key}:</strong> ${value ?? 'N/A'}</p>`;
+          popupHTML += `<p><strong>${key}:</strong> ${value ?? 'Ikke tilgjengelig'}</p>`;
         }
 
         new maplibregl.Popup()

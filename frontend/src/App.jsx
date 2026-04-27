@@ -445,7 +445,7 @@ function App() {
   return (
     <div className="home-container">
       <div className="home-content">
-        <h1>🗺️ Beredskapskart</h1>
+        <h1>🗺️ Beredskart</h1>
         <p>Evakueringsstøtte og tilfluktsromsplanlegging</p>
         <div className="home-buttons">
           <button className="btn btn-admin" onClick={() => navigate('admin')}>
@@ -869,17 +869,17 @@ function AdminPage({ onBack }) {
     const isMoving = job.status === 'moving'
     const isArrived = job.status === 'arrived'
     const isReturning = isMoving && job.leg === 'return'
-    const destinationLabel = isReturning ? (job.source?.name || 'Unknown source') : (job.target?.name || 'Unknown destination')
-    const statusLabel = isArrived ? 'Arrived' : isReturning ? 'Returning' : isMoving ? 'Moving' : 'Planned'
+    const destinationLabel = isReturning ? (job.source?.name || 'Ukjent avsender') : (job.target?.name || 'Ukjent destinasjon')
+    const statusLabel = isArrived ? 'Ankommet' : isReturning ? 'Returnerer' : isMoving ? 'På vei' : 'Planlagt'
     const html = `
-      <div style="font-size:12px;line-height:1.45;min-width:240px;">
-        <strong>${job.resourceType === 'water' ? '💧 Water truck' : '🍞 Food truck'}</strong><br/>
-        Fra: ${job.source?.name || 'Unknown source'}<br/>
+      <div style="font-size:12px;line-height:1.45;min-width:240px;max-width:260px;word-break:break-word;overflow-wrap:anywhere;">
+        <strong>${job.resourceType === 'water' ? '💧 Vannbil' : '🍞 Matbil'}</strong><br/>
+        Fra: ${job.source?.name || 'Ukjent avsender'}<br/>
         Til: ${destinationLabel}<br/>
-        Mengde: ${job.amount} units<br/>
-        ETA: ${job.etaMinutes ? `${job.etaMinutes} min` : 'Calculating...'}<br/>
+        Mengde: ${job.amount} enheter<br/>
+        Estimert ankomst: ${job.etaMinutes ? `${job.etaMinutes} min` : 'Beregner…'}<br/>
         Status: ${statusLabel}<br/>
-        <button id="dispatch-selected-truck" style="margin-top:8px;padding:6px 8px;background:${isMoving || isArrived ? '#9ca3af' : '#0ea5e9'};color:white;border:none;border-radius:4px;cursor:${isMoving || isArrived ? 'not-allowed' : 'pointer'};font-size:11px;width:100%;" ${isMoving || isArrived ? 'disabled' : ''}>${isMoving ? 'On route' : isArrived ? 'Completed' : 'Send truck'}</button>
+        <button id="dispatch-selected-truck" style="margin-top:8px;padding:6px 8px;background:${isMoving || isArrived ? '#9ca3af' : '#0ea5e9'};color:white;border:none;border-radius:4px;cursor:${isMoving || isArrived ? 'not-allowed' : 'pointer'};font-size:11px;width:100%;" ${isMoving || isArrived ? 'disabled' : ''}>${isMoving ? 'På vei' : isArrived ? 'Fullført' : 'Send lastebil'}</button>
       </div>
     `
     const popup = new maplibregl.Popup({ closeButton: true })
@@ -1858,33 +1858,39 @@ function AdminPage({ onBack }) {
       <div style="margin-top:8px;color:#374151;">Status: ${escapedStatusLabel}</div>
       ${escapedDispatchedUnit ? `<div style="color:#374151;">Enhet: ${escapedDispatchedUnit}</div>` : ''}
       ${escapedOriginName ? `<div style="color:#374151;">Fra: ${escapedOriginName}</div>` : ''}
-      ${remainingEtaMinutes ? `<div style="color:#374151;">ETA: ${remainingEtaMinutes} min</div>` : ''}
+      ${remainingEtaMinutes ? `<div style="color:#374151;">Est. ankomst: ${remainingEtaMinutes} min</div>` : ''}
     `
     const actionMarkup = isDispatchable
       ? `
-        <button id="dispatch-ambulance" style="margin-top:8px;padding:6px 8px;background:#2563eb;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;">Send ambulanse</button>
-        <button id="dispatch-firetruck" style="margin-top:8px;padding:6px 8px;background:#dc2626;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;">Send brannbil</button>
+        <button id="dispatch-ambulance" style="margin-top:8px;padding:6px 8px;background:#2563eb;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;max-width:100%;box-sizing:border-box;display:block;white-space:normal;">Send ambulanse</button>
+        <button id="dispatch-firetruck" style="margin-top:8px;padding:6px 8px;background:#dc2626;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;max-width:100%;box-sizing:border-box;display:block;white-space:normal;">Send brannbil</button>
       `
       : '<div style="margin-top:8px;color:#6b7280;">Enhet er allerede sendt.</div>'
 
     const html = `
-      <div style="font-size:12px;line-height:1.45;min-width:260px;">
+      <div style="font-size:12px;line-height:1.45;width:100%;max-width:100%;min-width:0;word-break:break-word;overflow-wrap:anywhere;display:flex;flex-direction:column;gap:8px;overflow:hidden;box-sizing:border-box;">
         <strong>🚨 Nødanrop fra bruker</strong><br/>
         Bruker-ID: ${escapedUserId}<br/>
         Tidspunkt: ${escapeHtml(createdAt)}<br/>
         Ønsket enhet: ${escapedRequestedUnit}<br/>
-        <div style="margin-top:8px;padding:8px;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;white-space:pre-wrap;">${escapedReadableMessage}</div>
+        <div style="margin-top:8px;padding:8px;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;white-space:pre-wrap;max-height:120px;overflow:auto;max-width:100%;box-sizing:border-box;">${escapedReadableMessage}</div>
         ${audioMarkup}
-        <button id="speak-help-message" style="margin-top:8px;padding:6px 8px;background:#0ea5e9;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;">🔊 Les opp melding</button>
+        <button id="speak-help-message" style="margin-top:8px;padding:6px 8px;background:#0ea5e9;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;max-width:100%;box-sizing:border-box;display:block;white-space:normal;">🔊 Les opp melding</button>
         ${statusMarkup}
         ${actionMarkup}
       </div>
     `
 
-    const popup = new maplibregl.Popup({ closeButton: true })
+    const popup = new maplibregl.Popup({ closeButton: true, maxWidth: '320px' })
       .setLngLat(lngLat)
       .setHTML(html)
       .addTo(map.current)
+
+    const popupContent = popup.getElement()?.querySelector('.maplibregl-popup-content')
+    if (popupContent) {
+      popupContent.style.overflow = 'hidden'
+      popupContent.style.boxSizing = 'border-box'
+    }
 
     const popupElement = popup.getElement()
     const speakBtn = popupElement?.querySelector('#speak-help-message')
@@ -2526,6 +2532,8 @@ function AdminPage({ onBack }) {
       map.current.on('mouseleave', 'help-requests-core-layer', () => { map.current.getCanvas().style.cursor = '' })
 
       // Add click handler to map for creating new safe areas
+      // Exclude help-request related layers so clicking a help-request route/unit
+      // does not open the safe-area creation popup.
       map.current.on('click', (e) => {
         const candidateLayers = [
           'shelters-layer',
@@ -2538,7 +2546,6 @@ function AdminPage({ onBack }) {
           'doctors-layer',
           'hospitals-layer',
           'live-users-layer',
-          'help-requests-core-layer',
           'safe-areas-layer'
         ]
         const layersToQuery = candidateLayers.filter((layerId) => map.current.getLayer(layerId))
@@ -2822,12 +2829,12 @@ function AdminPage({ onBack }) {
                 return (
                   <>
               <div className="truck-detail-title">
-                {selectedTruckJob.resourceType === 'water' ? '💧 Water truck' : '🍞 Food truck'}
+                {selectedTruckJob.resourceType === 'water' ? '💧 Vannbil' : '🍞 Matbil'}
               </div>
               <div className="truck-detail-row">Fra: {selectedTruckJob.source?.name || '-'}</div>
               <div className="truck-detail-row">Til: {selectedDestinationLabel}</div>
-              <div className="truck-detail-row">Mengde: {selectedTruckJob.amount} units</div>
-              <div className="truck-detail-row">ETA: {selectedTruckJob.etaLabel || '—'}</div>
+              <div className="truck-detail-row">Mengde: {selectedTruckJob.amount} enheter</div>
+              <div className="truck-detail-row">Est. ankomst: {selectedTruckJob.etaLabel || '—'}</div>
               <div className="truck-detail-row">
                 Status: {selectedStatusLabel}
               </div>
@@ -2840,7 +2847,7 @@ function AdminPage({ onBack }) {
                   onClick={() => dispatchTruck(selectedTruckJob.id)}
                   disabled={selectedTruckJob.status === 'moving' || selectedTruckJob.status === 'arrived'}
                 >
-                  {selectedTruckJob.status === 'moving' ? 'På vei' : selectedTruckJob.status === 'arrived' ? 'Fullført' : 'Send denne trucken'}
+                  {selectedTruckJob.status === 'moving' ? 'På vei' : selectedTruckJob.status === 'arrived' ? 'Fullført' : 'Send denne lastebilen'}
                 </button>
               </div>
                   </>
@@ -2877,13 +2884,13 @@ function AdminPage({ onBack }) {
                     }}
                   >
                     <div className="truck-route-header">
-                      <span>{job.resourceType === 'water' ? '💧 Water' : '🍞 Food'}</span>
+                      <span>{job.resourceType === 'water' ? '💧 Vann' : '🍞 Mat'}</span>
                       <span>{job.etaLabel || '—'}</span>
                     </div>
                     <div className="truck-route-body">
                       <div>Fra: {job.source?.name || '-'}</div>
                       <div>Til: {destinationLabel}</div>
-                      <div>Mengde: {job.amount} units</div>
+                      <div>Mengde: {job.amount} enheter</div>
                       <div>Status: {statusLabel}</div>
                     </div>
                     <div className="truck-progress small">
@@ -2899,7 +2906,7 @@ function AdminPage({ onBack }) {
                         }}
                         disabled={isMoving || isArrived}
                       >
-                        {isMoving ? 'Tracking' : isArrived ? 'Done' : 'Send'}
+                        {isMoving ? 'På vei' : isArrived ? 'Fullført' : 'Send'}
                       </button>
                     </div>
                   </div>
