@@ -1,5 +1,7 @@
 # Beredskapskart (Gruppe 4)
 
+<img width="1254" height="1254" alt="Bredeskart IS218" src="https://github.com/user-attachments/assets/409e465e-74aa-43bc-a04d-809bd75c4bd8" />
+
 ## Prosjektnavn & TLDR: 
 
 Dette systemet visualiserer tilfluktsrom, befolkning og beredskapsdata på kart for å støtte evakuering og krisehåndtering.
