@@ -1,5 +1,7 @@
 # Beredskapskart (Gruppe 4)
 
+<img width="1254" height="1254" alt="Bredeskart IS218" src="https://github.com/user-attachments/assets/dbccd2e6-07a7-4acb-90e6-77d6c96b23ec" />
+
 ## Problemstilling
 
 Hvordan kan et digitalt kartbasert system utvikles for å hjelpe befolkningen med å finne nødvendige ressurser i krisesituasjoner?
