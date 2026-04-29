@@ -42,6 +42,11 @@ function toFiniteNumber(value, fallback = 0) {
 
 const VALHALLA_ROUTE_URL = String(process.env.VALHALLA_URL || 'https://valhalla1.openstreetmap.de/route').trim();
 const ROUTER_TIMEOUT_MS = 15000;
+const AMBULANCE_DISPATCH_SOURCE = {
+  name: 'Kristiansand Emergency',
+  lon: 8.0728,
+  lat: 58.1442
+};
 
 function waitMs(durationMs) {
   return new Promise((resolve) => setTimeout(resolve, durationMs));
@@ -512,12 +517,29 @@ async function ensureHelpRequestsTable() {
       audio_data_url TEXT,
       requested_unit VARCHAR(32),
       dispatched_unit VARCHAR(32),
+      origin_name TEXT,
+      origin_lon DOUBLE PRECISION,
+      origin_lat DOUBLE PRECISION,
+      route JSONB,
       status VARCHAR(24) NOT NULL DEFAULT 'open',
+      progress DOUBLE PRECISION NOT NULL DEFAULT 0,
+      started_at TIMESTAMP,
+      completed_at TIMESTAMP,
+      current_position GEOMETRY(Point, 4326),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       handled_at TIMESTAMP,
       raw_payload JSONB
     )
   `);
+
+  await pool.query(`ALTER TABLE public.help_requests ADD COLUMN IF NOT EXISTS origin_name TEXT`);
+  await pool.query(`ALTER TABLE public.help_requests ADD COLUMN IF NOT EXISTS origin_lon DOUBLE PRECISION`);
+  await pool.query(`ALTER TABLE public.help_requests ADD COLUMN IF NOT EXISTS origin_lat DOUBLE PRECISION`);
+  await pool.query(`ALTER TABLE public.help_requests ADD COLUMN IF NOT EXISTS route JSONB`);
+  await pool.query(`ALTER TABLE public.help_requests ADD COLUMN IF NOT EXISTS progress DOUBLE PRECISION NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE public.help_requests ADD COLUMN IF NOT EXISTS started_at TIMESTAMP`);
+  await pool.query(`ALTER TABLE public.help_requests ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP`);
+  await pool.query(`ALTER TABLE public.help_requests ADD COLUMN IF NOT EXISTS current_position GEOMETRY(Point, 4326)`);
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_help_requests_location ON public.help_requests USING GIST(location)
@@ -528,6 +550,102 @@ async function ensureHelpRequestsTable() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_help_requests_created_at ON public.help_requests(created_at DESC)
   `);
+}
+
+async function getHelpRequestDispatchOrigin(unitType, destination = null) {
+  const destLon = Number(destination?.lon);
+  const destLat = Number(destination?.lat);
+  const hasDestination = Number.isFinite(destLon) && Number.isFinite(destLat);
+
+  if (unitType === 'ambulance') {
+    const kristiansandEmergency = await pool.query(`
+      SELECT name, lon, lat
+      FROM (
+        SELECT
+          COALESCE(NULLIF(TRIM(name), ''), 'Kristiansand Emergency') AS name,
+          ST_X(location) AS lon,
+          ST_Y(location) AS lat,
+          CASE
+            WHEN LOWER(COALESCE(name, '')) LIKE '%kristiansand%' AND LOWER(COALESCE(name, '')) LIKE '%legevakt%' THEN 0
+            WHEN LOWER(COALESCE(name, '')) LIKE '%kristiansand%' AND LOWER(COALESCE(name, '')) LIKE '%emergency%' THEN 1
+            WHEN LOWER(COALESCE(name, '')) LIKE '%kristiansand%' THEN 2
+            ELSE 3
+          END AS priority
+        FROM overture.doctors
+        WHERE location IS NOT NULL
+
+        UNION ALL
+
+        SELECT
+          COALESCE(NULLIF(TRIM(name), ''), 'Kristiansand Emergency') AS name,
+          ST_X(location) AS lon,
+          ST_Y(location) AS lat,
+          CASE
+            WHEN LOWER(COALESCE(name, '')) LIKE '%kristiansand%' AND LOWER(COALESCE(name, '')) LIKE '%hospital%' THEN 1
+            WHEN LOWER(COALESCE(name, '')) LIKE '%kristiansand%' THEN 2
+            ELSE 4
+          END AS priority
+        FROM overture.hospitals
+        WHERE location IS NOT NULL
+      ) candidates
+      ORDER BY priority,
+        CASE
+          WHEN $1::float8 IS NOT NULL AND $2::float8 IS NOT NULL
+          THEN ST_DistanceSphere(ST_SetSRID(ST_MakePoint(lon, lat), 4326), ST_SetSRID(ST_MakePoint($1, $2), 4326))
+          ELSE 0
+        END,
+        name
+      LIMIT 1
+    `, [hasDestination ? destLon : null, hasDestination ? destLat : null]);
+
+    if (kristiansandEmergency.rows[0]) {
+      return {
+        name: kristiansandEmergency.rows[0].name,
+        lon: Number(kristiansandEmergency.rows[0].lon),
+        lat: Number(kristiansandEmergency.rows[0].lat)
+      };
+    }
+
+    return { ...AMBULANCE_DISPATCH_SOURCE };
+  }
+
+  if (unitType === 'firetruck') {
+    const result = await pool.query(`
+      SELECT
+        COALESCE(NULLIF(TRIM(brannstasjon), ''), 'Brannstasjon') AS name,
+        ST_X(ST_Transform(posisjon, 4326)) AS lon,
+        ST_Y(ST_Transform(posisjon, 4326)) AS lat
+      FROM brannstasjoner.brannstasjon
+      WHERE posisjon IS NOT NULL
+      ORDER BY
+        CASE WHEN LOWER(COALESCE(brannstasjon, '')) = 'brannstasjon' THEN 0
+             WHEN COALESCE(brannstasjon, '') ILIKE '%Brannstasjon%' THEN 1
+             ELSE 2
+        END,
+        CASE
+          WHEN $1::float8 IS NOT NULL AND $2::float8 IS NOT NULL
+          THEN ST_Distance(
+            ST_Transform(posisjon, 4326)::geography,
+            ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography
+          )
+          ELSE 0
+        END,
+        brannstasjon
+      LIMIT 1
+    `, [hasDestination ? destLon : null, hasDestination ? destLat : null]);
+
+    if (result.rows[0]) {
+      return {
+        name: String(result.rows[0].name || 'Brannstasjon'),
+        lon: Number(result.rows[0].lon),
+        lat: Number(result.rows[0].lat)
+      };
+    }
+
+    return null;
+  }
+
+  return null;
 }
 
 async function readLogisticsState() {
@@ -3387,7 +3505,7 @@ app.get('/api/admin/help-requests', async (req, res) => {
     await ensureHelpRequestsTable();
 
     const statusFilter = String(req.query.status || 'open').trim().toLowerCase();
-    const allowedStatuses = ['open', 'dispatched', 'closed', 'all'];
+    const allowedStatuses = ['open', 'moving', 'arrived', 'dispatched', 'closed', 'all'];
     const effectiveStatus = allowedStatuses.includes(statusFilter) ? statusFilter : 'open';
 
     const params = [];
@@ -3410,7 +3528,16 @@ app.get('/api/admin/help-requests', async (req, res) => {
         hr.audio_data_url,
         hr.requested_unit,
         hr.dispatched_unit,
+        hr.origin_name,
+        hr.origin_lon,
+        hr.origin_lat,
+        hr.route,
         hr.status,
+        hr.progress,
+        hr.started_at,
+        hr.completed_at,
+        ST_X(hr.current_position) AS current_lon,
+        ST_Y(hr.current_position) AS current_lat,
         hr.created_at,
         hr.handled_at
       FROM public.help_requests hr
@@ -3432,7 +3559,17 @@ app.get('/api/admin/help-requests', async (req, res) => {
         audio_data_url: row.audio_data_url,
         requested_unit: row.requested_unit,
         dispatched_unit: row.dispatched_unit,
+        origin_name: row.origin_name,
+        origin_lon: row.origin_lon,
+        origin_lat: row.origin_lat,
+        route: row.route,
         status: row.status,
+        progress: Number(row.progress || 0),
+        started_at: row.started_at,
+        completed_at: row.completed_at,
+        current_position: Number.isFinite(Number(row.current_lon)) && Number.isFinite(Number(row.current_lat))
+          ? [Number(row.current_lon), Number(row.current_lat)]
+          : null,
         created_at: row.created_at,
         handled_at: row.handled_at,
       }
@@ -3456,6 +3593,8 @@ app.patch('/api/admin/help-requests/:id/dispatch', async (req, res) => {
 
     const requestId = Number(req.params.id);
     const unitType = String(req.body?.unitType || '').trim().toLowerCase();
+    const destinationLon = Number(req.body?.lon);
+    const destinationLat = Number(req.body?.lat);
 
     if (!Number.isFinite(requestId)) {
       return res.status(400).json({ error: 'Invalid request id' });
@@ -3463,12 +3602,40 @@ app.patch('/api/admin/help-requests/:id/dispatch', async (req, res) => {
     if (!['firetruck', 'ambulance'].includes(unitType)) {
       return res.status(400).json({ error: 'Invalid unit type' });
     }
+    if (!Number.isFinite(destinationLon) || !Number.isFinite(destinationLat)) {
+      return res.status(400).json({ error: 'Missing or invalid destination coordinates' });
+    }
+
+    const origin = await getHelpRequestDispatchOrigin(unitType, { lon: destinationLon, lat: destinationLat });
+    if (!origin || !Number.isFinite(origin.lon) || !Number.isFinite(origin.lat)) {
+      return res.status(400).json({ error: `Could not find dispatch origin for ${unitType}` });
+    }
+
+    const route = await computeRouteBetweenPoints({
+      originLon: origin.lon,
+      originLat: origin.lat,
+      destLon: destinationLon,
+      destLat: destinationLat,
+      mode: 'car'
+    });
+
+    if (!route?.geometry?.coordinates?.length) {
+      return res.status(400).json({ error: 'Could not compute dispatch route' });
+    }
 
     const result = await pool.query(`
       UPDATE public.help_requests
       SET
         dispatched_unit = $2,
-        status = 'dispatched',
+        origin_name = $3,
+        origin_lon = $4,
+        origin_lat = $5,
+        route = $6::jsonb,
+        status = 'moving',
+        progress = 0,
+        started_at = CURRENT_TIMESTAMP,
+        completed_at = NULL,
+        current_position = ST_SetSRID(ST_MakePoint($7, $8), 4326),
         handled_at = CURRENT_TIMESTAMP
       WHERE id = $1
       RETURNING
@@ -3481,10 +3648,28 @@ app.patch('/api/admin/help-requests/:id/dispatch', async (req, res) => {
         audio_data_url,
         requested_unit,
         dispatched_unit,
+        origin_name,
+        origin_lon,
+        origin_lat,
+        route,
         status,
+        progress,
+        started_at,
+        completed_at,
+        ST_X(current_position) AS current_lon,
+        ST_Y(current_position) AS current_lat,
         created_at,
         handled_at
-    `, [requestId, unitType]);
+    `, [
+      requestId,
+      unitType,
+      origin.name,
+      origin.lon,
+      origin.lat,
+      JSON.stringify(route),
+      origin.lon,
+      origin.lat
+    ]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Help request not found' });
@@ -3493,6 +3678,84 @@ app.patch('/api/admin/help-requests/:id/dispatch', async (req, res) => {
     res.json({ ok: true, request: result.rows[0] });
   } catch (error) {
     console.error('Error dispatching help request:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.patch('/api/admin/help-requests/:id', async (req, res) => {
+  try {
+    await ensureHelpRequestsTable();
+
+    const requestId = Number(req.params.id);
+    if (!Number.isFinite(requestId)) {
+      return res.status(400).json({ error: 'Invalid request id' });
+    }
+
+    const status = String(req.body?.status || '').trim().toLowerCase();
+    const validStatus = ['open', 'moving', 'arrived', 'dispatched'].includes(status) ? status : null;
+
+    const progressValue = Number(req.body?.progress);
+    const validProgress = Number.isFinite(progressValue) ? Math.min(1, Math.max(0, progressValue)) : null;
+
+    const currentPosition = Array.isArray(req.body?.currentPosition) ? req.body.currentPosition : [];
+    const currentLon = Number(currentPosition[0]);
+    const currentLat = Number(currentPosition[1]);
+    const hasCurrentPosition = Number.isFinite(currentLon) && Number.isFinite(currentLat);
+
+    const startedAt = req.body?.startedAt || null;
+    const completedAt = req.body?.completedAt || null;
+
+    const result = await pool.query(`
+      UPDATE public.help_requests
+      SET
+        status = COALESCE($2, status),
+        progress = COALESCE($3, progress),
+        current_position = CASE
+          WHEN $4::float8 IS NOT NULL AND $5::float8 IS NOT NULL THEN ST_SetSRID(ST_MakePoint($4, $5), 4326)
+          ELSE current_position
+        END,
+        started_at = COALESCE($6::timestamp, started_at),
+        completed_at = COALESCE($7::timestamp, completed_at)
+      WHERE id = $1
+      RETURNING
+        id,
+        user_id,
+        ST_X(location) AS lon,
+        ST_Y(location) AS lat,
+        text_message,
+        voice_transcript,
+        audio_data_url,
+        requested_unit,
+        dispatched_unit,
+        origin_name,
+        origin_lon,
+        origin_lat,
+        route,
+        status,
+        progress,
+        started_at,
+        completed_at,
+        ST_X(current_position) AS current_lon,
+        ST_Y(current_position) AS current_lat,
+        created_at,
+        handled_at
+    `, [
+      requestId,
+      validStatus,
+      validProgress,
+      hasCurrentPosition ? currentLon : null,
+      hasCurrentPosition ? currentLat : null,
+      startedAt,
+      completedAt
+    ]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Help request not found' });
+    }
+
+    res.json({ ok: true, request: result.rows[0] });
+  } catch (error) {
+    console.error('Error updating help request:', error);
     res.status(500).json({ error: error.message });
   }
 });

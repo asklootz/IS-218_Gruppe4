@@ -445,7 +445,7 @@ function App() {
   return (
     <div className="home-container">
       <div className="home-content">
-        <h1>🗺️ Beredskapskart</h1>
+        <h1>🗺️ Beredskart</h1>
         <p>Evakueringsstøtte og tilfluktsromsplanlegging</p>
         <div className="home-buttons">
           <button className="btn btn-admin" onClick={() => navigate('admin')}>
@@ -475,8 +475,13 @@ function AdminPage({ onBack }) {
   const sheltersGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
   const safeAreasGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
   const helpRequestsGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
+  const helpRequestRoutesGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
+  const helpRequestUnitsGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
   const helpRequestDetailsByIdRef = useRef(new Map())
   const helpRequestMarkersRef = useRef(new Map())
+  const helpRequestJobsRef = useRef([])
+  const helpRequestTrackingInterval = useRef(null)
+  const helpRequestTrackingBoundRef = useRef(false)
   const lastHelpRequestCountRef = useRef(0)
   const truckRoutesGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
   const truckPositionsGeoJsonRef = useRef({ type: 'FeatureCollection', features: [] })
@@ -864,17 +869,17 @@ function AdminPage({ onBack }) {
     const isMoving = job.status === 'moving'
     const isArrived = job.status === 'arrived'
     const isReturning = isMoving && job.leg === 'return'
-    const destinationLabel = isReturning ? (job.source?.name || 'Unknown source') : (job.target?.name || 'Unknown destination')
-    const statusLabel = isArrived ? 'Arrived' : isReturning ? 'Returning' : isMoving ? 'Moving' : 'Planned'
+    const destinationLabel = isReturning ? (job.source?.name || 'Ukjent avsender') : (job.target?.name || 'Ukjent destinasjon')
+    const statusLabel = isArrived ? 'Ankommet' : isReturning ? 'Returnerer' : isMoving ? 'På vei' : 'Planlagt'
     const html = `
-      <div style="font-size:12px;line-height:1.45;min-width:240px;">
-        <strong>${job.resourceType === 'water' ? '💧 Water truck' : '🍞 Food truck'}</strong><br/>
-        Fra: ${job.source?.name || 'Unknown source'}<br/>
+      <div style="font-size:12px;line-height:1.45;min-width:240px;max-width:260px;word-break:break-word;overflow-wrap:anywhere;">
+        <strong>${job.resourceType === 'water' ? '💧 Vannbil' : '🍞 Matbil'}</strong><br/>
+        Fra: ${job.source?.name || 'Ukjent avsender'}<br/>
         Til: ${destinationLabel}<br/>
-        Mengde: ${job.amount} units<br/>
-        ETA: ${job.etaMinutes ? `${job.etaMinutes} min` : 'Calculating...'}<br/>
+        Mengde: ${job.amount} enheter<br/>
+        Estimert ankomst: ${job.etaMinutes ? `${job.etaMinutes} min` : 'Beregner…'}<br/>
         Status: ${statusLabel}<br/>
-        <button id="dispatch-selected-truck" style="margin-top:8px;padding:6px 8px;background:${isMoving || isArrived ? '#9ca3af' : '#0ea5e9'};color:white;border:none;border-radius:4px;cursor:${isMoving || isArrived ? 'not-allowed' : 'pointer'};font-size:11px;width:100%;" ${isMoving || isArrived ? 'disabled' : ''}>${isMoving ? 'On route' : isArrived ? 'Completed' : 'Send truck'}</button>
+        <button id="dispatch-selected-truck" style="margin-top:8px;padding:6px 8px;background:${isMoving || isArrived ? '#9ca3af' : '#0ea5e9'};color:white;border:none;border-radius:4px;cursor:${isMoving || isArrived ? 'not-allowed' : 'pointer'};font-size:11px;width:100%;" ${isMoving || isArrived ? 'disabled' : ''}>${isMoving ? 'På vei' : isArrived ? 'Fullført' : 'Send lastebil'}</button>
       </div>
     `
     const popup = new maplibregl.Popup({ closeButton: true })
@@ -1184,6 +1189,10 @@ function AdminPage({ onBack }) {
         clearInterval(helpRequestsInterval.current)
         helpRequestsInterval.current = null
       }
+      if (helpRequestTrackingInterval.current) {
+        clearInterval(helpRequestTrackingInterval.current)
+        helpRequestTrackingInterval.current = null
+      }
       if (helpRequestPulseInterval.current) {
         clearInterval(helpRequestPulseInterval.current)
         helpRequestPulseInterval.current = null
@@ -1292,6 +1301,9 @@ function AdminPage({ onBack }) {
     setVisibility('help-requests-glow-layer', true)
     setVisibility('help-requests-core-layer', true)
     setVisibility('help-requests-label-layer', true)
+    setVisibility('help-request-ambulance-route-layer', true)
+    setVisibility('help-request-firetruck-route-layer', true)
+    setVisibility('help-request-units-layer', true)
     setVisibility('logistics-routes-food-layer', visibleLayers.logistics_food_routes)
     setVisibility('logistics-routes-water-layer', visibleLayers.logistics_water_routes)
     setVisibility('radius-fill', visibleLayers.radius)
@@ -1316,6 +1328,15 @@ function AdminPage({ onBack }) {
     }
     if (map.current.getLayer('help-requests-label-layer')) {
       map.current.moveLayer('help-requests-label-layer')
+    }
+    if (map.current.getLayer('help-request-ambulance-route-layer')) {
+      map.current.moveLayer('help-request-ambulance-route-layer')
+    }
+    if (map.current.getLayer('help-request-firetruck-route-layer')) {
+      map.current.moveLayer('help-request-firetruck-route-layer')
+    }
+    if (map.current.getLayer('help-request-units-layer')) {
+      map.current.moveLayer('help-request-units-layer')
     }
   }
 
@@ -1676,6 +1697,128 @@ function AdminPage({ onBack }) {
     helpRequestPulseInterval.current = setInterval(tick, 120)
   }
 
+  const updateHelpRequestTrackingSources = (jobs = []) => {
+    if (!map.current) return
+
+    const routeFeatures = []
+    const unitFeatures = []
+
+    for (const job of jobs || []) {
+      if (job.status !== 'moving' || !job.route?.geometry?.coordinates?.length) continue
+
+      const coordinates = job.route.geometry.coordinates
+      if (coordinates.length >= 2) {
+        routeFeatures.push({
+          type: 'Feature',
+          geometry: {
+            type: 'LineString',
+            coordinates
+          },
+          properties: {
+            requestId: job.id,
+            unitType: job.dispatched_unit,
+            status: job.status,
+            progress: Math.round((job.progress || 0) * 100),
+            origin_name: job.origin_name || 'Utrykning',
+            target_name: job.user_id || 'Bruker'
+          }
+        })
+      }
+
+      const currentPosition = job.current_position || [job.origin_lon, job.origin_lat]
+      if (Array.isArray(currentPosition) && currentPosition.length >= 2) {
+        unitFeatures.push({
+          type: 'Feature',
+          geometry: {
+            type: 'Point',
+            coordinates: currentPosition
+          },
+          properties: {
+            requestId: job.id,
+            unitType: job.dispatched_unit,
+            status: job.status,
+            progress: Math.round((job.progress || 0) * 100),
+            origin_name: job.origin_name || 'Utrykning',
+            target_name: job.user_id || 'Bruker'
+          }
+        })
+      }
+    }
+
+    const nextRoutes = { type: 'FeatureCollection', features: routeFeatures }
+    const nextUnits = { type: 'FeatureCollection', features: unitFeatures }
+
+    helpRequestRoutesGeoJsonRef.current = nextRoutes
+    helpRequestUnitsGeoJsonRef.current = nextUnits
+
+    if (map.current.getSource('help-request-routes')) {
+      map.current.getSource('help-request-routes').setData(nextRoutes)
+    }
+    if (map.current.getSource('help-request-units')) {
+      map.current.getSource('help-request-units').setData(nextUnits)
+    }
+  }
+
+  const syncHelpRequestProgressToBackend = async (jobs = []) => {
+    const movingJobs = (jobs || []).filter((job) => ['moving', 'arrived'].includes(job.status))
+    if (movingJobs.length === 0) return
+
+    try {
+      await Promise.all(movingJobs.map((job) => axios.patch(`${API_BASE}/api/admin/help-requests/${job.id}`, {
+        status: job.status,
+        progress: job.progress || 0,
+        currentPosition: job.current_position || [job.origin_lon, job.origin_lat],
+        startedAt: job.started_at || null,
+        completedAt: job.completed_at || null
+      })))
+    } catch (error) {
+      console.warn('Failed to sync help request progress:', error.message)
+    }
+  }
+
+  const startHelpRequestTracking = () => {
+    if (helpRequestTrackingInterval.current) return
+
+    helpRequestTrackingInterval.current = setInterval(() => {
+      const now = Date.now()
+      const nextJobs = helpRequestJobsRef.current.map((job) => {
+        if (job.status !== 'moving' || !job.route?.geometry?.coordinates?.length || !job.started_at) {
+          return job
+        }
+
+        const startedAtMs = Date.parse(job.started_at) || now
+        const durationMs = Math.max(1000, Number(job.route.duration_s || 0) * 1000)
+        const progress = Math.min(1, Math.max(0, (now - startedAtMs) / durationMs))
+        const currentPosition = interpolatePointAlongLine(job.route.geometry.coordinates, progress) || job.current_position || [job.origin_lon, job.origin_lat]
+
+        if (progress >= 1) {
+          return {
+            ...job,
+            progress: 1,
+            current_position: currentPosition,
+            status: 'arrived',
+            completed_at: new Date(now).toISOString()
+          }
+        }
+
+        return {
+          ...job,
+          progress,
+          current_position: currentPosition
+        }
+      })
+
+      helpRequestJobsRef.current = nextJobs
+      updateHelpRequestTrackingSources(nextJobs)
+      syncHelpRequestProgressToBackend(nextJobs)
+
+      if (!nextJobs.some((job) => job.status === 'moving')) {
+        clearInterval(helpRequestTrackingInterval.current)
+        helpRequestTrackingInterval.current = null
+      }
+    }, 1000)
+  }
+
   const showHelpRequestPopup = (featureProperties, lngLat) => {
     if (!map.current || !featureProperties) return
 
@@ -1688,32 +1831,66 @@ function AdminPage({ onBack }) {
     const voiceTranscript = String(p.voice_transcript || '')
     const readableMessage = voiceTranscript || textMessage || 'Ingen tekst mottatt'
     const requestedUnit = p.requested_unit ? String(p.requested_unit) : 'Ikke spesifisert'
+    const dispatchedUnit = p.dispatched_unit ? String(p.dispatched_unit) : ''
+    const originName = p.origin_name ? String(p.origin_name) : ''
+    const routeDurationSeconds = Number(p.route?.duration_s || 0)
+    const progressValue = Math.min(1, Math.max(0, Number(p.progress || 0)))
+    const remainingEtaMinutes = routeDurationSeconds > 0
+      ? Math.max(1, Math.round(((1 - progressValue) * routeDurationSeconds) / 60))
+      : null
+    const isDispatchable = !['moving', 'arrived', 'dispatched'].includes(String(p.status || '').toLowerCase())
+    const statusLabel = String(p.status || '').toLowerCase() === 'moving'
+      ? 'På vei'
+      : String(p.status || '').toLowerCase() === 'arrived'
+        ? 'Ankommet'
+        : 'Åpen'
     const createdAt = p.created_at ? new Date(p.created_at).toLocaleString() : '-'
     const escapedReadableMessage = escapeHtml(readableMessage)
     const escapedRequestedUnit = escapeHtml(requestedUnit)
     const escapedUserId = escapeHtml(String(p.user_id || '-'))
+    const escapedStatusLabel = escapeHtml(statusLabel)
+    const escapedDispatchedUnit = escapeHtml(dispatchedUnit)
+    const escapedOriginName = escapeHtml(originName)
     const audioMarkup = p.audio_data_url
       ? `<audio controls preload="none" style="width:100%;margin-top:8px;"><source src="${String(p.audio_data_url)}"/></audio>`
       : '<div style="margin-top:8px;color:#6b7280;">Ingen talemelding lagt ved.</div>'
+    const statusMarkup = `
+      <div style="margin-top:8px;color:#374151;">Status: ${escapedStatusLabel}</div>
+      ${escapedDispatchedUnit ? `<div style="color:#374151;">Enhet: ${escapedDispatchedUnit}</div>` : ''}
+      ${escapedOriginName ? `<div style="color:#374151;">Fra: ${escapedOriginName}</div>` : ''}
+      ${remainingEtaMinutes ? `<div style="color:#374151;">Est. ankomst: ${remainingEtaMinutes} min</div>` : ''}
+    `
+    const actionMarkup = isDispatchable
+      ? `
+        <button id="dispatch-ambulance" style="margin-top:8px;padding:6px 8px;background:#2563eb;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;max-width:100%;box-sizing:border-box;display:block;white-space:normal;">Send ambulanse</button>
+        <button id="dispatch-firetruck" style="margin-top:8px;padding:6px 8px;background:#dc2626;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;max-width:100%;box-sizing:border-box;display:block;white-space:normal;">Send brannbil</button>
+      `
+      : '<div style="margin-top:8px;color:#6b7280;">Enhet er allerede sendt.</div>'
 
     const html = `
-      <div style="font-size:12px;line-height:1.45;min-width:260px;">
+      <div style="font-size:12px;line-height:1.45;width:100%;max-width:100%;min-width:0;word-break:break-word;overflow-wrap:anywhere;display:flex;flex-direction:column;gap:8px;overflow:hidden;box-sizing:border-box;">
         <strong>🚨 Nødanrop fra bruker</strong><br/>
         Bruker-ID: ${escapedUserId}<br/>
         Tidspunkt: ${escapeHtml(createdAt)}<br/>
         Ønsket enhet: ${escapedRequestedUnit}<br/>
-        <div style="margin-top:8px;padding:8px;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;white-space:pre-wrap;">${escapedReadableMessage}</div>
+        <div style="margin-top:8px;padding:8px;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;white-space:pre-wrap;max-height:120px;overflow:auto;max-width:100%;box-sizing:border-box;">${escapedReadableMessage}</div>
         ${audioMarkup}
-        <button id="speak-help-message" style="margin-top:8px;padding:6px 8px;background:#0ea5e9;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;">🔊 Les opp melding</button>
-        <button id="dispatch-ambulance" style="margin-top:8px;padding:6px 8px;background:#2563eb;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;">Send ambulanse</button>
-        <button id="dispatch-firetruck" style="margin-top:8px;padding:6px 8px;background:#dc2626;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;">Send brannbil</button>
+        <button id="speak-help-message" style="margin-top:8px;padding:6px 8px;background:#0ea5e9;color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px;width:100%;max-width:100%;box-sizing:border-box;display:block;white-space:normal;">🔊 Les opp melding</button>
+        ${statusMarkup}
+        ${actionMarkup}
       </div>
     `
 
-    const popup = new maplibregl.Popup({ closeButton: true })
+    const popup = new maplibregl.Popup({ closeButton: true, maxWidth: '320px' })
       .setLngLat(lngLat)
       .setHTML(html)
       .addTo(map.current)
+
+    const popupContent = popup.getElement()?.querySelector('.maplibregl-popup-content')
+    if (popupContent) {
+      popupContent.style.overflow = 'hidden'
+      popupContent.style.boxSizing = 'border-box'
+    }
 
     const popupElement = popup.getElement()
     const speakBtn = popupElement?.querySelector('#speak-help-message')
@@ -1734,7 +1911,14 @@ function AdminPage({ onBack }) {
     const dispatchUnit = async (unitType) => {
       if (!Number.isFinite(requestId)) return
       try {
-        await axios.patch(`${API_BASE}/api/admin/help-requests/${requestId}/dispatch`, { unitType })
+        const destination = Array.isArray(lngLat)
+          ? { lon: Number(lngLat[0]), lat: Number(lngLat[1]) }
+          : { lon: Number(lngLat?.lng), lat: Number(lngLat?.lat) }
+        await axios.patch(`${API_BASE}/api/admin/help-requests/${requestId}/dispatch`, {
+          unitType,
+          lon: destination.lon,
+          lat: destination.lat
+        })
         popup.remove()
         await loadHelpRequests()
       } catch (error) {
@@ -1806,7 +1990,7 @@ function AdminPage({ onBack }) {
 
     try {
       const res = await axios.get(`${API_BASE}/api/admin/help-requests`, {
-        params: { status: 'open' }
+        params: { status: 'all' }
       })
       const rawFc = res.data?.type === 'FeatureCollection'
         ? res.data
@@ -1839,14 +2023,176 @@ function AdminPage({ onBack }) {
         }
       })
 
+      const activeMarkerFeatures = mapFeatures.filter((feature) => String(feature?.properties?.status || '').toLowerCase() !== 'arrived')
+      const helpRequestJobs = rawFeatures
+        .filter((feature) => String(feature?.properties?.status || '').toLowerCase() === 'moving')
+        .map((feature) => {
+          const props = feature.properties || {}
+          const route = props.route || null
+          const routeCoordinates = route?.geometry?.coordinates
+          const currentPosition = Array.isArray(props.current_position) && props.current_position.length >= 2
+            ? [Number(props.current_position[0]), Number(props.current_position[1])]
+            : Array.isArray(routeCoordinates) && routeCoordinates.length >= 1
+              ? routeCoordinates[0]
+              : [Number(feature.geometry?.coordinates?.[0]), Number(feature.geometry?.coordinates?.[1])]
+
+          return {
+            id: Number(props.id),
+            user_id: props.user_id,
+            text_message: props.text_message,
+            voice_transcript: props.voice_transcript,
+            audio_data_url: props.audio_data_url,
+            requested_unit: props.requested_unit,
+            dispatched_unit: props.dispatched_unit,
+            origin_name: props.origin_name,
+            origin_lon: Number(props.origin_lon),
+            origin_lat: Number(props.origin_lat),
+            route,
+            status: props.status,
+            progress: Number(props.progress || 0),
+            started_at: props.started_at,
+            completed_at: props.completed_at,
+            current_position: currentPosition,
+            created_at: props.created_at,
+            handled_at: props.handled_at,
+            geometry: feature.geometry
+          }
+        })
+
       const fc = {
         type: 'FeatureCollection',
-        features: mapFeatures,
+        features: activeMarkerFeatures,
       }
+
+      const routeFeatures = []
+      const vehicleFeatures = []
+
+      for (const job of helpRequestJobs) {
+        const routeCoordinates = job.route?.geometry?.coordinates
+        if (Array.isArray(routeCoordinates) && routeCoordinates.length >= 2) {
+          routeFeatures.push({
+            type: 'Feature',
+            geometry: {
+              type: 'LineString',
+              coordinates: routeCoordinates
+            },
+            properties: {
+              requestId: job.id,
+              unitType: job.dispatched_unit,
+              status: job.status,
+              progress: Math.round((job.progress || 0) * 100),
+              origin_name: job.origin_name || 'Utrykning',
+              target_name: job.user_id || 'Bruker'
+            }
+          })
+        }
+
+        if (Array.isArray(job.current_position) && job.current_position.length >= 2) {
+          vehicleFeatures.push({
+            type: 'Feature',
+            geometry: {
+              type: 'Point',
+              coordinates: job.current_position
+            },
+            properties: {
+              requestId: job.id,
+              unitType: job.dispatched_unit,
+              status: job.status,
+              progress: Math.round((job.progress || 0) * 100),
+              origin_name: job.origin_name || 'Utrykning',
+              target_name: job.user_id || 'Bruker'
+            }
+          })
+        }
+      }
+
+      helpRequestJobsRef.current = helpRequestJobs
+      helpRequestRoutesGeoJsonRef.current = { type: 'FeatureCollection', features: routeFeatures }
+      helpRequestUnitsGeoJsonRef.current = { type: 'FeatureCollection', features: vehicleFeatures }
 
       helpRequestsGeoJsonRef.current = fc
       helpRequestDetailsByIdRef.current = detailsById
-      syncHelpRequestDomMarkers(mapFeatures)
+
+      if (!map.current.getSource('help-request-routes')) {
+        map.current.addSource('help-request-routes', {
+          type: 'geojson',
+          data: helpRequestRoutesGeoJsonRef.current
+        })
+        map.current.addLayer({
+          id: 'help-request-ambulance-route-layer',
+          type: 'line',
+          source: 'help-request-routes',
+          filter: ['==', ['get', 'unitType'], 'ambulance'],
+          paint: {
+            'line-color': '#2563eb',
+            'line-width': 4,
+            'line-opacity': 0.9
+          }
+        })
+        map.current.addLayer({
+          id: 'help-request-firetruck-route-layer',
+          type: 'line',
+          source: 'help-request-routes',
+          filter: ['==', ['get', 'unitType'], 'firetruck'],
+          paint: {
+            'line-color': '#dc2626',
+            'line-width': 4,
+            'line-opacity': 0.9
+          }
+        })
+      } else {
+        map.current.getSource('help-request-routes').setData(helpRequestRoutesGeoJsonRef.current)
+      }
+
+      if (!map.current.getSource('help-request-units')) {
+        map.current.addSource('help-request-units', {
+          type: 'geojson',
+          data: helpRequestUnitsGeoJsonRef.current
+        })
+        map.current.addLayer({
+          id: 'help-request-units-layer',
+          type: 'circle',
+          source: 'help-request-units',
+          paint: {
+            'circle-radius': 8,
+            'circle-color': [
+              'case',
+              ['==', ['get', 'unitType'], 'ambulance'],
+              '#2563eb',
+              '#dc2626'
+            ],
+            'circle-stroke-width': 2,
+            'circle-stroke-color': '#ffffff',
+            'circle-opacity': 0.95
+          }
+        })
+      } else {
+        map.current.getSource('help-request-units').setData(helpRequestUnitsGeoJsonRef.current)
+      }
+
+      if (!helpRequestTrackingBoundRef.current) {
+        const handleHelpRequestTrackingClick = (e) => {
+          const f = e.features?.[0]
+          if (!f) return
+          const requestId = Number(f.properties?.requestId)
+          const request = helpRequestDetailsByIdRef.current.get(requestId)
+          if (!request) return
+          showHelpRequestPopup(request, e.lngLat)
+        }
+
+        map.current.on('click', 'help-request-ambulance-route-layer', handleHelpRequestTrackingClick)
+        map.current.on('click', 'help-request-firetruck-route-layer', handleHelpRequestTrackingClick)
+        map.current.on('click', 'help-request-units-layer', handleHelpRequestTrackingClick)
+        map.current.on('mouseenter', 'help-request-ambulance-route-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+        map.current.on('mouseleave', 'help-request-ambulance-route-layer', () => { map.current.getCanvas().style.cursor = '' })
+        map.current.on('mouseenter', 'help-request-firetruck-route-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+        map.current.on('mouseleave', 'help-request-firetruck-route-layer', () => { map.current.getCanvas().style.cursor = '' })
+        map.current.on('mouseenter', 'help-request-units-layer', () => { map.current.getCanvas().style.cursor = 'pointer' })
+        map.current.on('mouseleave', 'help-request-units-layer', () => { map.current.getCanvas().style.cursor = '' })
+        helpRequestTrackingBoundRef.current = true
+      }
+
+      syncHelpRequestDomMarkers(activeMarkerFeatures)
 
       if (!map.current.getSource('help-requests')) {
         map.current.addSource('help-requests', { type: 'geojson', data: fc })
@@ -1902,14 +2248,23 @@ function AdminPage({ onBack }) {
       if (map.current.getLayer('help-requests-label-layer')) {
         map.current.moveLayer('help-requests-label-layer')
       }
+      if (map.current.getLayer('help-request-ambulance-route-layer')) {
+        map.current.moveLayer('help-request-ambulance-route-layer')
+      }
+      if (map.current.getLayer('help-request-firetruck-route-layer')) {
+        map.current.moveLayer('help-request-firetruck-route-layer')
+      }
+      if (map.current.getLayer('help-request-units-layer')) {
+        map.current.moveLayer('help-request-units-layer')
+      }
 
-      const currentCount = mapFeatures.length
+      const currentCount = activeMarkerFeatures.length
       if (currentCount > lastHelpRequestCountRef.current && currentCount > 0) {
-        const newest = mapFeatures.reduce((latest, nextFeature) => {
+        const newest = activeMarkerFeatures.reduce((latest, nextFeature) => {
           const latestTs = Date.parse(String(latest?.properties?.created_at || '')) || 0
           const nextTs = Date.parse(String(nextFeature?.properties?.created_at || '')) || 0
           return nextTs > latestTs ? nextFeature : latest
-        }, mapFeatures[0])
+        }, activeMarkerFeatures[0])
 
         const coords = newest?.geometry?.coordinates
         if (Array.isArray(coords) && coords.length >= 2) {
@@ -1923,6 +2278,9 @@ function AdminPage({ onBack }) {
       lastHelpRequestCountRef.current = currentCount
 
       startHelpRequestPulseAnimation()
+      if (helpRequestJobs.some((job) => job.status === 'moving')) {
+        startHelpRequestTracking()
+      }
 
       applyAdminLayerVisibility()
     } catch (error) {
@@ -2174,6 +2532,8 @@ function AdminPage({ onBack }) {
       map.current.on('mouseleave', 'help-requests-core-layer', () => { map.current.getCanvas().style.cursor = '' })
 
       // Add click handler to map for creating new safe areas
+      // Exclude help-request related layers so clicking a help-request route/unit
+      // does not open the safe-area creation popup.
       map.current.on('click', (e) => {
         const candidateLayers = [
           'shelters-layer',
@@ -2186,7 +2546,6 @@ function AdminPage({ onBack }) {
           'doctors-layer',
           'hospitals-layer',
           'live-users-layer',
-          'help-requests-core-layer',
           'safe-areas-layer'
         ]
         const layersToQuery = candidateLayers.filter((layerId) => map.current.getLayer(layerId))
@@ -2470,12 +2829,12 @@ function AdminPage({ onBack }) {
                 return (
                   <>
               <div className="truck-detail-title">
-                {selectedTruckJob.resourceType === 'water' ? '💧 Water truck' : '🍞 Food truck'}
+                {selectedTruckJob.resourceType === 'water' ? '💧 Vannbil' : '🍞 Matbil'}
               </div>
               <div className="truck-detail-row">Fra: {selectedTruckJob.source?.name || '-'}</div>
               <div className="truck-detail-row">Til: {selectedDestinationLabel}</div>
-              <div className="truck-detail-row">Mengde: {selectedTruckJob.amount} units</div>
-              <div className="truck-detail-row">ETA: {selectedTruckJob.etaLabel || '—'}</div>
+              <div className="truck-detail-row">Mengde: {selectedTruckJob.amount} enheter</div>
+              <div className="truck-detail-row">Est. ankomst: {selectedTruckJob.etaLabel || '—'}</div>
               <div className="truck-detail-row">
                 Status: {selectedStatusLabel}
               </div>
@@ -2488,7 +2847,7 @@ function AdminPage({ onBack }) {
                   onClick={() => dispatchTruck(selectedTruckJob.id)}
                   disabled={selectedTruckJob.status === 'moving' || selectedTruckJob.status === 'arrived'}
                 >
-                  {selectedTruckJob.status === 'moving' ? 'På vei' : selectedTruckJob.status === 'arrived' ? 'Fullført' : 'Send denne trucken'}
+                  {selectedTruckJob.status === 'moving' ? 'På vei' : selectedTruckJob.status === 'arrived' ? 'Fullført' : 'Send denne lastebilen'}
                 </button>
               </div>
                   </>
@@ -2525,13 +2884,13 @@ function AdminPage({ onBack }) {
                     }}
                   >
                     <div className="truck-route-header">
-                      <span>{job.resourceType === 'water' ? '💧 Water' : '🍞 Food'}</span>
+                      <span>{job.resourceType === 'water' ? '💧 Vann' : '🍞 Mat'}</span>
                       <span>{job.etaLabel || '—'}</span>
                     </div>
                     <div className="truck-route-body">
                       <div>Fra: {job.source?.name || '-'}</div>
                       <div>Til: {destinationLabel}</div>
-                      <div>Mengde: {job.amount} units</div>
+                      <div>Mengde: {job.amount} enheter</div>
                       <div>Status: {statusLabel}</div>
                     </div>
                     <div className="truck-progress small">
@@ -2547,7 +2906,7 @@ function AdminPage({ onBack }) {
                         }}
                         disabled={isMoving || isArrived}
                       >
-                        {isMoving ? 'Tracking' : isArrived ? 'Done' : 'Send'}
+                        {isMoving ? 'På vei' : isArrived ? 'Fullført' : 'Send'}
                       </button>
                     </div>
                   </div>
