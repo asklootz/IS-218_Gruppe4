@@ -68,7 +68,7 @@ Ved oppstart:
 
 ### Forside:
 
-- Valg mellom Administratorside og Brukerside
+- Valg mellom Administratorside, Brukerside og Simuleringsside
 - Egne URL-er: `/admin`, `/bruker` og `/simulate`
 
 ### Administratorside:
