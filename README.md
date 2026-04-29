@@ -1,8 +1,14 @@
 # Beredskapskart (Gruppe 4)
 
+<img width="1254" height="1254" alt="Bredeskart IS218" src="https://github.com/user-attachments/assets/dbccd2e6-07a7-4acb-90e6-77d6c96b23ec" />
+
+## Problemstilling
+
+Hvordan kan et digitalt kartbasert system utvikles for å hjelpe befolkningen med å finne nødvendige ressurser i krisesituasjoner?
+
 ## Prosjektnavn & TLDR: 
 
-Dette systemet visualiserer tilfluktsrom, befolkning og beredskapsdata på kart for å støtte evakuering og krisehåndtering.
+2026 er utpekt som totalforsvarets år og dette systemet visualiserer tilfluktsrom, befolkning og beredskapsdata på kart for å støtte evakuering og krisehåndtering.
 Brukere kan analysere kapasitet, finne nærmeste tilfluktsrom og utforske geografiske data i sanntid.
 Applikasjonen bruker OpenStreetMap som basiskart, React i frontend og lokal PostGIS i Docker.
 
@@ -20,9 +26,11 @@ Inneholder to sider:
 
 - React 18 + Vite
 - MapLibre GL
+- OpenStreetMap
 - Node.js + Express
 - PostgreSQL/PostGIS
 - Docker Compose
+- Valhalla API for rute-veiledning og sporing
 - GeoNorge Atom/WMS-kilder
 
 ## Datakatalog:
@@ -34,25 +42,13 @@ Inneholder to sider:
 | Fylker         | Geonorge | GeoJSON          | Cache + reprojisering |
 | Kommuner       | Geonorge | GeoJSON          | Cache + reprojisering |
 | Brannstasjoner | Geonorge | GML (ZIP)        | Nedlasting → GML parsing → lagring i PostGIS |
-| Farms          | Overture | Parquet (S3)     | Nedlasting → parsing → lagring i PostGIS |
-| Water Sources  | Overture | Parquet (S3)     | Nedlasting → parsing → lagring i PostGIS |
-| Doctors        | Overture | Parquet (S3)     | Nedlasting → parsing → lagring i PostGIS |
-| Hospitals      | Overture | Parquet (S3)     | Nedlasting → parsing → lagring i PostGIS |
+| Farms          | Overture | GeoJSON     | Nedlasting → parsing → lagring i PostGIS |
+| Water Sources  | Overture | GeoJSON     | Nedlasting → parsing → lagring i PostGIS |
+| Doctors        | Overture | GeoJSON     | Nedlasting → parsing → lagring i PostGIS |
+| Hospitals      | Overture | GeoJSON     | Nedlasting → parsing → lagring i PostGIS |
 
 ## Arkitekturskisse: 
-
-[GeoNorge datasett]
-        ↓
- Backend (Node.js + Express)
-        ↓
- PostGIS (lagring + analyse)
-        ↓
- API-endepunkter
-        ↓
- Frontend (React + MapLibre)
-        ↓
- Bruker (kart + analyse)
-
+![Arkitektur](Arkitektur.png)
  ## Arkitektur:
 
 - `postgres`: `postgis/postgis:16-3.4-alpine`
@@ -72,8 +68,8 @@ Ved oppstart:
 
 ### Forside:
 
-- Valg mellom Administratorside og Brukerside
-- Egne URL-er: `/admin` og `/bruker`
+- Valg mellom Administratorside, Brukerside og Simuleringsside
+- Egne URL-er: `/admin`, `/bruker` og `/simulate`
 
 ### Administratorside:
 
@@ -92,6 +88,12 @@ Ved oppstart:
 - Transportvalg: gå/sykkel/bil
 - Mobil- og desktopvennlig layout
 
+### Simuleringside:
+
+- Oversikt over kart og alle punkter
+- Kan opprette nye falske «live»-brukere
+- «Live»-brukerne påvirker antall ledige plasser i sikker sone og tilfluktsrom
+- Dette påvirker ruter for mat- og vannfordeling og lar brukeren se om det er ledig plass på ulike lokasjoner.
 ## API (utvalg):
 
 - `GET /health`
@@ -118,7 +120,7 @@ docker compose up -d --build
 ```
 
 Deretter:
-- Frontend: http://localhost
+- Frontend: http://localhost:443
 - Backend API: http://localhost:3000
 
 ## Google Collab Link for DEL A
