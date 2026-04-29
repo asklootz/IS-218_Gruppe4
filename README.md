@@ -91,9 +91,9 @@ Ved oppstart:
 ### Simuleringside:
 
 - Oversikt over kart og alle punkter
-- Kan skape ny falske "live" -brukere
-- Live brukerne vil gi endring på antall ledige plasser i sikker sone og tilfuktsrom
-- Dette har effekt på rute for mat/vann fordeling og lar bruker se om det er ledig plass på forskjellige lokasjoner.
+- Kan opprette nye falske «live»-brukere
+- «Live»-brukerne påvirker antall ledige plasser i sikker sone og tilfluktsrom
+- Dette påvirker ruter for mat- og vannfordeling og lar brukeren se om det er ledig plass på ulike lokasjoner.
 ## API (utvalg):
 
 - `GET /health`
