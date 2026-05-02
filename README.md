@@ -1,6 +1,6 @@
 # Beredskapskart (Gruppe 4)
 
-<img width="1254" height="1254" alt="Bredeskart IS218" src="https://github.com/user-attachments/assets/dbccd2e6-07a7-4acb-90e6-77d6c96b23ec" />
+<img width="500" height="500" alt="Bredeskart IS218" src="https://github.com/user-attachments/assets/dbccd2e6-07a7-4acb-90e6-77d6c96b23ec" />
 
 ## Problemstilling
 
@@ -16,11 +16,9 @@ Inneholder to sider:
 - Administratorside for analyse, kapasitetsberegning, lagstyring og eksport
 - Brukerside for geolokasjon, nærmeste tilfluktsrom og ruteforslag
 
-## Demo av system:
+## Demo av system: 
 
-![Skjermopptak 2026-03-30 kl  20 42 17-2](https://github.com/user-attachments/assets/a5c99f2c-a112-4f37-9251-fd1e7dfd63f7)
-![Skjermopptak 2026-03-30 kl  20 41 12-2](https://github.com/user-attachments/assets/33e93f92-7ef7-4cca-bbaf-c1c1b5066623)
-
+https://www.youtube.com/watch?v=lBqW-gd-UqQ
 
 ## Teknisk Stack: 
 
@@ -48,7 +46,9 @@ Inneholder to sider:
 | Hospitals      | Overture | GeoJSON     | Nedlasting → parsing → lagring i PostGIS |
 
 ## Arkitekturskisse: 
-![Arkitektur](Arkitektur.png)
+
+<img width="500" height="600" alt="Arkitektur" src="https://github.com/user-attachments/assets/9c7fd836-fc70-4752-9344-605c6a157b63" />
+
  ## Arkitektur:
 
 - `postgres`: `postgis/postgis:16-3.4-alpine`
@@ -94,6 +94,7 @@ Ved oppstart:
 - Kan opprette nye falske «live»-brukere
 - «Live»-brukerne påvirker antall ledige plasser i sikker sone og tilfluktsrom
 - Dette påvirker ruter for mat- og vannfordeling og lar brukeren se om det er ledig plass på ulike lokasjoner.
+  
 ## API (utvalg):
 
 - `GET /health`
